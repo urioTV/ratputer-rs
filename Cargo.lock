@@ -4559,6 +4559,7 @@ dependencies = [
  "embassy-futures",
  "embassy-net",
  "embassy-time",
+ "embassy-time-queue-utils",
  "embedded-graphics",
  "embedded-hal 1.0.0",
  "embedded-hal-bus",

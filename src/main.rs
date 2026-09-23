@@ -679,7 +679,9 @@ fn main() -> ! {
         if last_battery_at
             .is_none_or(|at| now - at >= Duration::from_millis(BATTERY_EVERY_MS))
         {
-            ui.set_battery_percent(i32::from(battery.sample_percent()));
+            if let Some(percent) = battery.sample_percent() {
+                ui.set_battery_percent(i32::from(percent));
+            }
             last_battery_at = Some(now);
         }
 

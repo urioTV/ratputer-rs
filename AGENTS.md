@@ -156,7 +156,13 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   embassy-net's internal timers (DHCP, DNS, `with_timeout`) rely on. Without it, the
   link fails with `undefined reference to _embassy_time_now` / `_embassy_time_schedule_wake`.
 - There is still **no executor**: `Network::poll()` polls the stack runner and the
-  SNTP job once per loop with `Waker::noop()`. Never `block_on` network futures —
+  SNTP job once per loop with `Waker::noop()`. This REQUIRES
+  `embassy-time-queue-utils` with a `generic-queue-*` feature (set in `Cargo.toml`).
+  Otherwise esp-rtos gets the executor-integrated timer queue, whose `schedule_wake`
+  unwraps `try_task_from_waker` and panics ("Found waker not created by the Embassy
+  executor") on the first embassy-net timer, i.e. in the first loop iteration, before
+  anything is drawn: symptom = **backlight on, black screen**. Check with
+  `strings <elf> | grep "Found waker not created"` (must be empty). Never `block_on` network futures —
   DHCP/DNS take seconds and would freeze the UI. Stack resources and the runner are
   `Box::leak`ed to get `'static`.
 - Link state comes from esp-radio's `station_state() == Connected` via the driver, so

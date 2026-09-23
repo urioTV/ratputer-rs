@@ -7,6 +7,8 @@ use esp_hal::peripherals::{ADC1, GPIO10};
 use esp_hal::Blocking;
 
 const SAMPLES: u32 = 8;
+// A oneshot conversion takes microseconds; bail out rather than hang the UI loop.
+const MAX_POLLS_PER_SAMPLE: u32 = 100_000;
 const DIVIDER_RATIO: u32 = 2;
 
 // Resting-voltage discharge curve of a 1S Li-ion cell: (mV, %), descending.
@@ -43,10 +45,11 @@ impl<'d> Battery<'d> {
     }
 
     /// Take an averaged reading, smooth it, and return the charge estimate in percent.
-    pub fn sample_percent(&mut self) -> u8 {
+    /// `None` if the ADC did not deliver a conversion.
+    pub fn sample_percent(&mut self) -> Option<u8> {
         let mut sum = 0;
         for _ in 0..SAMPLES {
-            sum += u32::from(self.read_pin_mv());
+            sum += u32::from(self.read_pin_mv()?);
         }
         let battery_mv = sum / SAMPLES * DIVIDER_RATIO;
         // Exponential smoothing (1/4 weight) hides load-dependent sag from the radio.
@@ -55,17 +58,19 @@ impl<'d> Battery<'d> {
             None => battery_mv,
         };
         self.filtered_mv = Some(filtered);
-        percent_from_mv(filtered)
+        Some(percent_from_mv(filtered))
     }
 
-    fn read_pin_mv(&mut self) -> u16 {
-        loop {
+    fn read_pin_mv(&mut self) -> Option<u16> {
+        for _ in 0..MAX_POLLS_PER_SAMPLE {
             match self.adc.read_oneshot(&mut self.pin) {
-                Ok(millivolts) => return millivolts,
+                Ok(millivolts) => return Some(millivolts),
                 Err(nb::Error::WouldBlock) => {}
-                Err(nb::Error::Other(())) => return 0,
+                Err(nb::Error::Other(())) => return None,
             }
         }
+        log::warn!("Battery ADC conversion timed out");
+        None
     }
 }
 

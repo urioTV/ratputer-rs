@@ -27,6 +27,10 @@ embassy-futures = "0.1"
 # IPv4 stack over the Wi-Fi station interface: DHCP + DNS + UDP (SNTP clock sync)
 embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "log"] }
 embassy-time = "0.5"
+# REQUIRED: without a generic queue, esp-rtos uses the executor-integrated timer queue,
+# which panics ("Found waker not created by the Embassy executor") on the first
+# embassy-time timer, because we poll the stack with a no-op waker and no executor.
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-16"] }
 nb = "1"                        # non-blocking ADC reads (esp-hal oneshot API)
 
 # SD-card credential storage and TOML serialization (all no_std + alloc)
