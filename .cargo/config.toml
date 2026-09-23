@@ -1,0 +1,17 @@
+[build]
+target = "xtensa-esp32s3-none-elf"  # fork ESP: bez członu "unknown"
+
+# `cargo run` / `cargo flash` wgrywa firmware przez espflash (kabel USB-C)
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+rustflags = [
+  "-C", "link-arg=-nostartfiles",    # fork Xtensa: bez crt0 z GCC
+  "-C", "link-arg=-Tlinkall.x",      # layout sekcji esp-hal (ld/esp32s3 via -L OUT_DIR)
+  # device.x (aliase handlerów przerwań z PAC) podpina build.rs esp32s3 — nie dodawać ręcznie!
+]
+
+[env]
+ESP_LOG = "info"
+
+[unstable]
+build-std = ["core", "alloc"]  # alloc: esp-alloc (heap) — wymagany przez Slint

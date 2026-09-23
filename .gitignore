@@ -1,0 +1,15 @@
+# --- Rust / Cargo ---
+/target
+
+# --- Firmware artifacts & local toolchain shims ---
+ratputer-adv.bin
+export-esp.sh
+*.slintc
+
+# --- Nix local caches ---
+/.direnv/
+
+# --- Editor junk ---
+*.swp
+*.swo
+*~

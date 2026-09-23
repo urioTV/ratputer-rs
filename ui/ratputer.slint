@@ -1,0 +1,274 @@
+// ratputer.slint — RATPUTER dla M5Stack Cardputer ADV (240×135 px), no_std.
+// UI w konwencji pixel-art: font Press Start 2P (OFL, rozmiary 8/12 px —
+// krancie się zaokrąglają do pełnych pikseli 8×8, więc wszystko ostra).
+
+import "fonts/PressStart2P-Regular.ttf";
+
+export component MainWindow inherits Window {
+    default-font-family: "Press Start 2P";
+
+    // --- firmware steruje tymi własnościami ---
+    in property <bool> splash-done: false;
+    in-out property <int> frame-index: 0;
+
+    // --- stan widoku mainscreen (0 = MENU, 1 = SZCZUR, 2 = O PROJEKCIE) ---
+    in-out property <int> view-state: 0;
+    in-out property <int> menu-index: 0;
+
+    // Press Start 2P nie ma glifów poza podstawowym ASCII + wybranymi —
+    // etykiety trzymamy stricte ASCII (bez polskich znaków).
+    property <[string]> menu-labels: ["PODGLAD SZCZURA", "O PROJEKCIE"];
+
+    property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
+    property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
+
+    // Klatki pixel-art (pakowane do obrazu przez embed_resources)
+    property <[image]> frames: [
+        @image-url("images/rat0.png"),
+        @image-url("images/rat1.png"),
+        @image-url("images/rat2.png"),
+        @image-url("images/rat3.png"),
+    ];
+
+    // Klawiatura — wywoływane z firmware'u (nazwy: "tab" | "enter" | "back" | "space"
+    //   | "up" | "down" | "left" | "right")
+    callback key-pressed(string);
+    key-pressed(key) => {
+        if (key == "back") {
+            if (root.view-state != 0) { root.view-state = 0; }
+        } else if (key == "enter" || key == "space") {
+            if (root.view-state == 0) {
+                root.view-state = root.menu-index == 0 ? 1 : 2;
+            } else {
+                root.view-state = 0;    // select/enter w widoku = wyjście
+            }
+        } else if (key == "tab" || key == "down" || key == "right") {
+            if (root.view-state == 0) {
+                root.menu-index = Math.mod(root.menu-index + 1, menu-labels.length);
+            }
+        } else if (key == "up" || key == "left") {
+            if (root.view-state == 0) {
+                root.menu-index = Math.mod(
+                    root.menu-index + menu-labels.length - 1,
+                    menu-labels.length
+                );
+            }
+        }
+    }
+
+    // ============================================================
+    // SPLASH
+    // ============================================================
+    splash := Rectangle {
+        opacity: 1;
+        background: @linear-gradient(180deg, #05130b 0%, #020503 100%);
+
+        VerticalLayout {
+            padding: 3px;
+            spacing: 2px;
+
+            Rectangle {
+                height: 17px;
+                background: #0d2b16;
+                border-radius: 2px;
+
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+
+                    Text { text: "RATPUTER"; color: #7dffa9; font-size: 12px; vertical-alignment: center; }
+                    Text { text: "BOOT"; color: #3d8a5a; font-size: 8px; vertical-alignment: center; horizontal-alignment: right; }
+                }
+            }
+
+            Rectangle {
+                background: #030903;
+                border-radius: 3px;
+                border-width: 1px;
+                border-color: #143a20;
+
+                Image {
+                    source: frames[frame-index];
+                    x: (parent.width - 128px) / 2;
+                    y: (parent.height - 80px) / 2;
+                    width: 128px;
+                    height: 80px;
+                    image-rendering: pixelated;
+                }
+            }
+
+            HorizontalLayout {
+                height: 12px;
+                padding-left: 3px;
+                padding-right: 3px;
+
+                Text {
+                    text: statuses[frame-index] + dots;
+                    color: #46a06a;
+                    font-size: 8px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "240x135";
+                    color: #2b5c3b;
+                    font-size: 8px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // MAINSCREEN
+    // ============================================================
+    mainscreen := Rectangle {
+        opacity: 0;
+        background: @linear-gradient(180deg, #030a06 0%, #010402 100%);
+
+        // ---- view-state == 0: MENU ----
+        menu := Rectangle {
+            visible: view-state == 0;
+            x: 0; y: 0;
+            width: parent.width;
+            height: parent.height;
+
+            VerticalLayout {
+                padding: 5px;
+                spacing: 4px;
+
+                Rectangle {
+                    height: 18px;
+
+                    Text { text: "RATPUTER"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle { height: 1px; background: #0d2b16; }
+
+                for item[i] in menu-labels : Rectangle {
+                    border-radius: 2px;
+                    background: menu-index == i ? #0e2b17 : transparent;
+
+                    HorizontalLayout {
+                        padding-left: 6px;
+
+                        Text {
+                            text: (menu-index == i ? "> " : "  ") + item;
+                            color: menu-index == i ? #7dffa9 : #4a7a5a;
+                            font-size: 8px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: #0d2b16; }
+
+                Text {
+                    text: "^v wybor  Enter wejdz";
+                    color: #39684a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // ---- view-state == 1: SZCZUR ----
+        ratview := Rectangle {
+            visible: view-state == 1;
+            x: 0; y: 0;
+            width: parent.width;
+            height: parent.height;
+            background: @linear-gradient(180deg, #05130b 0%, #020503 100%);
+
+            VerticalLayout {
+                padding: 3px;
+                spacing: 2px;
+
+                Rectangle {
+                    height: 17px;
+                    background: #0d2b16;
+                    border-radius: 2px;
+
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+
+                        Text { text: "SZCZUR"; color: #7dffa9; font-size: 12px; vertical-alignment: center; }
+                        Text { text: "PX x4"; color: #3d8a5a; font-size: 8px; vertical-alignment: center; horizontal-alignment: right; }
+                    }
+                }
+
+                Rectangle {
+                    background: #030903;
+                    border-radius: 3px;
+                    border-width: 1px;
+                    border-color: #143a20;
+
+                    Image {
+                        source: frames[frame-index];
+                        x: (parent.width - 128px) / 2;
+                        y: (parent.height - 80px) / 2;
+                        width: 128px;
+                        height: 80px;
+                        image-rendering: pixelated;
+                    }
+                }
+
+                Text {
+                    text: "ENTER/BS = MENU";
+                    color: #46a06a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                    height: 12px;
+                }
+            }
+        }
+
+        // ---- view-state == 2: O PROJEKCIE ----
+        aboutview := Rectangle {
+            visible: view-state == 2;
+            x: 0; y: 0;
+            width: parent.width;
+            height: parent.height;
+
+            VerticalLayout {
+                padding: 5px;
+                spacing: 3px;
+
+                Text { text: "RATPUTER v0.1"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                Text {
+                    text: "SLINT 1.18 + ESP-HAL 1.2\nNO_STD  XTENSA LX7\nST7789 240x135 @40MHZ\nTCA8418 @0X34 (I2C)\nESP32-S3FN8  NO PSRAM";
+                    color: #46a06a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                Rectangle { height: 1px; background: #0d2b16; }
+                Text {
+                    text: "BS/ENTER = MENU";
+                    color: #39684a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                    height: 12px;
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // STATES: splash -> main (crossfade)
+    // ============================================================
+    states [
+        in-splash when !root.splash-done : {
+            splash.opacity: 1;
+            mainscreen.opacity: 0;
+        }
+        in-main when root.splash-done : {
+            splash.opacity: 0;
+            mainscreen.opacity: 1;
+            in {
+                animate splash.opacity { duration: 600ms; easing: ease-out; }
+                animate mainscreen.opacity { duration: 600ms; easing: ease-out; }
+            }
+        }
+    ]
+}

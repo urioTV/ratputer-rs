@@ -1,0 +1,6 @@
+[toolchain]
+# Channel "esp" instaluje `espup install` (fork Rust ze wsparciem Xtensa)
+channel = "esp"
+profile = "minimal"
+components = ["rust-src", "rustfmt"]
+targets = ["xtensa-esp32s3-none-elf"]  # fork ESP: bez członu "unknown"
