@@ -11,7 +11,10 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::rc::Rc;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
@@ -25,10 +28,14 @@ use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::{Duration, Instant, Rate};
+use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 
-mod keyboard;
-use keyboard::{Keyboard, NavKey};
+mod storage;
+mod wifi;
+
+use cardputer_adv_keyboard::{Arrow, KeyInput, Keyboard};
+use storage::{BuildTime, SavedNetwork, StorageError, WifiConfig};
 
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
@@ -36,6 +43,7 @@ use mipidsi::options::{ColorInversion, Orientation, Rotation};
 use mipidsi::Builder;
 
 use slint::platform::software_renderer::{LineBufferProvider, MinimalSoftwareWindow, Rgb565Pixel};
+use slint::{ModelRc, SharedString, VecModel};
 
 // ESP-IDF app descriptor (required by espflash save-image --merge)
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -89,8 +97,11 @@ impl<'a, Display> HardwareDrawBuffer<'a, Display> {
     }
 }
 
-impl<DI: mipidsi::interface::Interface<Word = u8>, RST: embedded_hal::digital::OutputPin<Error = core::convert::Infallible>>
-    LineBufferProvider for &mut HardwareDrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ST7789, RST>>
+impl<
+        DI: mipidsi::interface::Interface<Word = u8>,
+        RST: embedded_hal::digital::OutputPin<Error = core::convert::Infallible>,
+    > LineBufferProvider
+    for &mut HardwareDrawBuffer<'_, mipidsi::Display<DI, mipidsi::models::ST7789, RST>>
 {
     type TargetPixel = Rgb565Pixel;
 
@@ -111,6 +122,114 @@ impl<DI: mipidsi::interface::Interface<Word = u8>, RST: embedded_hal::digital::O
                 buf.iter().map(|x| RawU16::new(x.0).into()),
             )
             .unwrap();
+    }
+}
+
+fn string_model(values: Vec<String>) -> ModelRc<SharedString> {
+    let values = values
+        .into_iter()
+        .map(SharedString::from)
+        .collect::<Vec<_>>();
+    Rc::new(VecModel::from(values)).into()
+}
+
+fn saved_network_model(config: &WifiConfig) -> ModelRc<SharedString> {
+    string_model(
+        config
+            .networks
+            .iter()
+            .map(|network| display_ssid(&network.ssid))
+            .collect(),
+    )
+}
+
+fn scan_network_model(networks: &[wifi::ScanNetwork]) -> ModelRc<SharedString> {
+    string_model(
+        networks
+            .iter()
+            .map(|network| {
+                let security = if !network.supported {
+                    "!"
+                } else if network.auth == storage::AuthKind::Open {
+                    " "
+                } else {
+                    "*"
+                };
+                format!(
+                    "{} {} {}",
+                    display_ssid(&network.ssid),
+                    network.signal_strength,
+                    security
+                )
+            })
+            .collect(),
+    )
+}
+
+fn display_ssid(ssid: &str) -> String {
+    ssid.chars()
+        .take(18)
+        .map(|character| if character.is_ascii() { character } else { '?' })
+        .collect()
+}
+
+fn set_password(ui: &MainWindow, password: &str) {
+    // Password stays visible while typing — masked entry is impractical on this keyboard.
+    ui.set_wifi_password(password.into());
+}
+
+/// Blocking radio work split into steps (one scan pass / one connect attempt),
+/// so the UI keeps redrawing a spinner + progress between the steps.
+enum RadioStep {
+    Scan {
+        pass: usize,
+    },
+    Connect {
+        network: SavedNetwork,
+        attempt: usize,
+    },
+}
+
+fn busy_status(step: &RadioStep, frame_idx: u32) -> String {
+    let spinner = ["|", "/", "-", "+"][(frame_idx % 4) as usize];
+    match *step {
+        RadioStep::Scan { pass } => format!("SCANNING {pass}/{} {spinner}", wifi::SCAN_PASSES),
+        RadioStep::Connect { attempt, .. } => {
+            format!("CONNECTING {attempt}/{} {spinner}", wifi::CONNECT_ATTEMPTS)
+        }
+    }
+}
+
+/// Apply credentials and, on success, hand the connection to the step machine.
+fn begin_connect(
+    wifi: &mut Option<wifi::WifiManager>,
+    ui: &MainWindow,
+    network: SavedNetwork,
+    frame_idx: u32,
+) -> Option<RadioStep> {
+    match wifi
+        .as_mut()
+        .map(|manager| manager.configure(&network.ssid, &network.password, network.auth))
+    {
+        Some(Ok(())) => {
+            ui.set_wifi_selected_ssid(network.ssid.clone().into());
+            let step = RadioStep::Connect {
+                network,
+                attempt: 1,
+            };
+            ui.set_wifi_status(busy_status(&step, frame_idx).into());
+            ui.set_wifi_connecting(true);
+            Some(step)
+        }
+        Some(Err(error)) => {
+            log::error!("Wi-Fi configure failed: {error:?}");
+            ui.set_wifi_status("CONNECTION FAILED".into());
+            None
+        }
+        None => {
+            ui.set_wifi_status("WI-FI NOT AVAILABLE".into());
+            None
+        }
     }
 }
 
@@ -168,13 +287,52 @@ fn main() -> ! {
     .unwrap()
     .with_sda(peripherals.GPIO8)
     .with_scl(peripherals.GPIO9);
-    let mut keyboard = Keyboard::new(i2c);
+    let mut keyboard = Keyboard::new(i2c).expect("TCA8418 keyboard initialization failed");
+
+    // --- SD card on dedicated SPI3: SCLK=G40, MOSI=G14, MISO=G39, CS=G12 ---
+    // The fixed 400 kHz clock is deliberately conservative and valid during card startup.
+    // Credential files are tiny, so higher transfer speed is unnecessary here.
+    let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
+    let sd_spi = Spi::new(
+        peripherals.SPI3,
+        SpiConfig::default().with_frequency(Rate::from_khz(400)),
+    )
+    .unwrap()
+    .with_sck(peripherals.GPIO40)
+    .with_mosi(peripherals.GPIO14)
+    .with_miso(peripherals.GPIO39);
+    let sd_device = ExclusiveDevice::new(sd_spi, sd_cs, Delay::new()).unwrap();
+    let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
+    let storage = embedded_sdmmc::VolumeManager::new(sd_card, BuildTime);
+    let (mut wifi_config, storage_available) = match storage::load(&storage) {
+        Ok(config) => (config, true),
+        Err(StorageError::Missing) => (WifiConfig::default(), true),
+        Err(error) => {
+            log::warn!("Unable to load Wi-Fi credentials: {error:?}");
+            (WifiConfig::default(), false)
+        }
+    };
+
+    // esp-radio relies on esp-rtos for its internal Wi-Fi tasks and timers.
+    let timer_group = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timer_group.timer0, peripherals.FROM_CPU_INTR0);
+    let mut wifi = match wifi::WifiManager::new(peripherals.WIFI) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            log::error!("Unable to initialize Wi-Fi: {error:?}");
+            None
+        }
+    };
+    let mut scan_networks: Vec<wifi::ScanNetwork> = Vec::new();
 
     // --- Slint: minimal software window + platform ---
     let window = MinimalSoftwareWindow::new(
         slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
     );
-    window.set_size(slint::PhysicalSize::new(LCD_WIDTH as u32, LCD_HEIGHT as u32));
+    window.set_size(slint::PhysicalSize::new(
+        LCD_WIDTH as u32,
+        LCD_HEIGHT as u32,
+    ));
 
     let boot_micros = Instant::now().duration_since_epoch().as_micros();
     slint::platform::set_platform(Box::new(EspBackend {
@@ -184,6 +342,18 @@ fn main() -> ! {
     .expect("Slint platform already set");
 
     let ui = MainWindow::new().unwrap();
+    ui.set_saved_networks(saved_network_model(&wifi_config));
+    ui.set_scan_networks(string_model(Vec::new()));
+    ui.set_wifi_status(
+        if wifi.is_none() {
+            "WI-FI INIT ERROR"
+        } else if storage_available {
+            "READY"
+        } else {
+            "SD ERROR"
+        }
+        .into(),
+    );
 
     // Single-line buffer (ReusedBuffer) — 240 px RGB565
     let mut line_buffer: [Rgb565Pixel; LCD_WIDTH] = [Rgb565Pixel(0); LCD_WIDTH];
@@ -193,13 +363,9 @@ fn main() -> ! {
     let mut splash_done = false;
     let splash_start = Instant::now();
     let mut last_switch = splash_start;
+    let mut radio_pending: Option<RadioStep> = None;
     loop {
         slint::platform::update_timers_and_animations();
-
-        window.draw_if_needed(|renderer| {
-            renderer
-                .render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
-        });
 
         let now = Instant::now();
 
@@ -209,28 +375,235 @@ fn main() -> ! {
             splash_done = true;
         }
 
-        // --- Keyboard: dispatch raw nav events to the Slint callback ---
-        while let Some(nav) = keyboard.next_nav_key() {
-            match nav {
-                NavKey::Tab => { ui.invoke_key_pressed("tab".into()) }
-                NavKey::Enter => { ui.invoke_key_pressed("enter".into()) }
-                NavKey::Backspace => { ui.invoke_key_pressed("back".into()) }
-                NavKey::Space => { ui.invoke_key_pressed("space".into()) }
-                NavKey::ArrowUp => { ui.invoke_key_pressed("up".into()) }
-                NavKey::ArrowDown => { ui.invoke_key_pressed("down".into()) }
-                NavKey::ArrowLeft => { ui.invoke_key_pressed("left".into()) }
-                NavKey::ArrowRight => { ui.invoke_key_pressed("right".into()) }
-                NavKey::Other(_) => {}
+        // Full keyboard decoding includes printable characters and the Fn layer.
+        if let Ok(inputs) = keyboard.inputs() {
+            for input in inputs {
+                // Drain the FIFO but DISCARD input while the splash is up or a radio
+                // operation is in progress, so stray presses neither open views behind
+                // the animation nor replay all at once when the radio unblocks.
+                if !splash_done || radio_pending.is_some() {
+                    continue;
+                }
+                match input {
+                    KeyInput::Char(character) if ui.get_view_state() == 5 => {
+                        if character.is_ascii() && !character.is_ascii_control() {
+                            let mut password = ui.get_wifi_password().to_string();
+                            if password.len() < 64 {
+                                password.push(character);
+                                set_password(&ui, &password);
+                            }
+                        }
+                    }
+                    KeyInput::Char(' ') => ui.invoke_key_pressed("space".into()),
+                    // Legacy ADV behavior: outside text entry the bare `,` `;` `.` `/`
+                    // keys act as arrows (directions match the Fn layer in the crate).
+                    KeyInput::Char(',') => ui.invoke_key_pressed("left".into()),
+                    KeyInput::Char(';') => ui.invoke_key_pressed("up".into()),
+                    KeyInput::Char('.') => ui.invoke_key_pressed("down".into()),
+                    KeyInput::Char('/') => ui.invoke_key_pressed("right".into()),
+                    KeyInput::Char(_) | KeyInput::Modifier(_) => {}
+                    KeyInput::Enter => ui.invoke_key_pressed("enter".into()),
+                    KeyInput::Backspace if ui.get_view_state() == 5 => {
+                        let mut password = ui.get_wifi_password().to_string();
+                        password.pop();
+                        set_password(&ui, &password);
+                    }
+                    KeyInput::Backspace | KeyInput::Escape => ui.invoke_key_pressed("back".into()),
+                    KeyInput::Delete => ui.invoke_key_pressed("delete".into()),
+                    KeyInput::Tab => ui.invoke_key_pressed("tab".into()),
+                    KeyInput::Arrow(Arrow::Up) => ui.invoke_key_pressed("up".into()),
+                    KeyInput::Arrow(Arrow::Down) => ui.invoke_key_pressed("down".into()),
+                    KeyInput::Arrow(Arrow::Left) => ui.invoke_key_pressed("left".into()),
+                    KeyInput::Arrow(Arrow::Right) => ui.invoke_key_pressed("right".into()),
+                }
             }
         }
 
-        // Rat animation: in the splash AND when the mainscreen shows the rat view
-        let animate_rat = !splash_done || ui.get_view_state() == 1;
-        if animate_rat && now - last_switch >= Duration::from_millis(FRAME_MS) {
+        // Execute one radio step. Its status (spinner + progress) was rendered in
+        // previous iterations; only the current step blocks below.
+        if let Some(step) = radio_pending.take() {
+            ui.set_wifi_status(busy_status(&step, frame_idx).into());
+            radio_pending = match step {
+                RadioStep::Scan { pass } => {
+                    match wifi.as_mut().map(|manager| manager.scan_pass()) {
+                        Some(Ok(results)) => {
+                            wifi::merge_scan_results(&mut scan_networks, results);
+                            ui.set_scan_networks(scan_network_model(&scan_networks));
+                            if pass < wifi::SCAN_PASSES {
+                                Some(RadioStep::Scan { pass: pass + 1 })
+                            } else {
+                                ui.set_wifi_status(
+                                    if scan_networks.is_empty() {
+                                        "NO NETWORKS FOUND"
+                                    } else {
+                                        "* = PASSWORD  ! = UNSUPPORTED"
+                                    }
+                                    .into(),
+                                );
+                                None
+                            }
+                        }
+                        Some(Err(error)) => {
+                            log::warn!("Wi-Fi scan pass {pass} failed: {error:?}");
+                            ui.set_wifi_connecting(false);
+                            ui.set_wifi_status(
+                                if scan_networks.is_empty() {
+                                    "SCAN FAILED"
+                                } else {
+                                    "SCAN PARTIAL - SHOWING WHAT WE HAVE"
+                                }
+                                .into(),
+                            );
+                            None
+                        }
+                        None => {
+                            ui.set_wifi_status("WI-FI NOT AVAILABLE".into());
+                            None
+                        }
+                    }
+                }
+                RadioStep::Connect { network, attempt } => {
+                    match wifi.as_mut().map(|manager| manager.connect_attempt()) {
+                        Some(Ok(())) => {
+                            let ssid = network.ssid.clone();
+                            wifi_config.upsert(network);
+                            ui.set_saved_networks(saved_network_model(&wifi_config));
+                            if storage::save(&storage, &wifi_config).is_err() {
+                                ui.set_wifi_status("CONNECTED - SD SAVE FAILED".into());
+                            } else {
+                                ui.set_wifi_status(
+                                    format!("CONNECTED: {}", display_ssid(&ssid)).into(),
+                                );
+                            }
+                            if ui.get_view_state() == 5 {
+                                set_password(&ui, "");
+                                ui.set_view_state(2);
+                            }
+                            ui.set_wifi_connecting(false);
+                            None
+                        }
+                        Some(Err(_)) if attempt < wifi::CONNECT_ATTEMPTS => {
+                            Some(RadioStep::Connect {
+                                network,
+                                attempt: attempt + 1,
+                            })
+                        }
+                        Some(Err(_)) => {
+                            ui.set_wifi_connecting(false);
+                            ui.set_wifi_status("CONNECTION FAILED".into());
+                            None
+                        }
+                        None => {
+                            ui.set_wifi_connecting(false);
+                            ui.set_wifi_status("WI-FI NOT AVAILABLE".into());
+                            None
+                        }
+                    }
+                }
+            };
+        }
+
+        // Slint commands only SCHEDULE radio work. Each step runs below, one per
+        // loop iteration, so the status/spinner keeps rendering between them.
+        let wifi_action = ui.get_wifi_action();
+        if wifi_action != 0 {
+            ui.set_wifi_action(0);
+            ui.set_wifi_connecting(false);
+            match wifi_action {
+                1 if radio_pending.is_none() => {
+                    if wifi.is_none() {
+                        ui.set_wifi_status("WI-FI NOT AVAILABLE".into());
+                    } else {
+                        scan_networks.clear();
+                        ui.set_scan_networks(string_model(Vec::new()));
+                        ui.set_scan_index(0);
+                        let step = RadioStep::Scan { pass: 1 };
+                        ui.set_wifi_status(busy_status(&step, frame_idx).into());
+                        ui.set_wifi_connecting(true);
+                        radio_pending = Some(step);
+                    }
+                }
+                2 if radio_pending.is_none() => {
+                    let index = ui.get_wifi_action_index() as usize;
+                    if let Some(network) = wifi_config.networks.get(index).cloned() {
+                        radio_pending = begin_connect(&mut wifi, &ui, network, frame_idx);
+                    }
+                }
+                3 if radio_pending.is_none() => {
+                    let index = ui.get_wifi_action_index() as usize;
+                    if let Some(network) = scan_networks.get(index).cloned() {
+                        if !network.supported {
+                            ui.set_wifi_status("SECURITY NOT SUPPORTED".into());
+                        } else if network.auth == storage::AuthKind::Open {
+                            radio_pending = begin_connect(
+                                &mut wifi,
+                                &ui,
+                                SavedNetwork {
+                                    ssid: network.ssid.clone(),
+                                    password: String::new(),
+                                    auth: network.auth,
+                                },
+                                frame_idx,
+                            );
+                        } else {
+                            ui.set_wifi_selected_ssid(network.ssid.into());
+                            set_password(&ui, "");
+                            ui.set_wifi_status("TYPE PASSWORD".into());
+                            ui.set_view_state(5);
+                        }
+                    }
+                }
+                4 if radio_pending.is_none() => {
+                    let selected_ssid = ui.get_wifi_selected_ssid().to_string();
+                    let password = ui.get_wifi_password().to_string();
+                    if let Some(network) = scan_networks
+                        .iter()
+                        .find(|network| network.ssid == selected_ssid)
+                        .cloned()
+                    {
+                        radio_pending = begin_connect(
+                            &mut wifi,
+                            &ui,
+                            SavedNetwork {
+                                ssid: network.ssid.clone(),
+                                password,
+                                auth: network.auth,
+                            },
+                            frame_idx,
+                        );
+                    }
+                }
+                5 => {
+                    let index = ui.get_wifi_action_index() as usize;
+                    if wifi_config.remove(index) {
+                        ui.set_saved_index(0);
+                        ui.set_saved_networks(saved_network_model(&wifi_config));
+                        if storage::save(&storage, &wifi_config).is_err() {
+                            ui.set_wifi_status("SD SAVE FAILED".into());
+                        } else {
+                            ui.set_wifi_status("NETWORK FORGOTTEN".into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Frame ticker: splash and rat view animate the rat; while the radio is busy
+        // the same ticker spins the Wi-Fi progress indicator.
+        let animate_frame = !splash_done || ui.get_view_state() == 1 || radio_pending.is_some();
+        if animate_frame && now - last_switch >= Duration::from_millis(FRAME_MS) {
             frame_idx = (frame_idx + 1) % 4;
             ui.set_frame_index(frame_idx as i32);
+            if let Some(step) = radio_pending.as_ref() {
+                ui.set_wifi_status(busy_status(step, frame_idx).into());
+            }
             last_switch = now;
         }
+
+        window.draw_if_needed(|renderer| {
+            renderer.render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
+        });
 
         delay.delay_millis(10);
     }

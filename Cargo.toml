@@ -5,6 +5,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Rust firmware for the M5Stack Cardputer ADV (ESP32-S3)"
 
+[workspace]
+members = ["xtask"]
+default-members = ["."]
+resolver = "2"
+
 [dependencies]
 # HAL (no_std, bare-metal) — ESP32-S3 = Xtensa
 esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }  # unstable: delay module
@@ -12,6 +17,19 @@ esp-backtrace = { version = "0.20", features = ["esp32s3", "panic-handler", "pri
 esp-println = { version = "0.18", features = ["esp32s3", "log-04"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }  # app descriptor (required for merged .bin)
 log = "0.4"
+
+# Wi-Fi radio and its bare-metal scheduler
+esp-radio = { version = "1.0.0-beta.1", features = ["esp32s3", "wifi", "log-04"] }
+esp-rtos = { version = "0.4", features = ["esp32s3", "esp-radio", "esp-alloc"] }
+embassy-futures = "0.1"
+
+# SD-card credential storage and TOML serialization (all no_std + alloc)
+embedded-sdmmc = { version = "0.10", default-features = false, features = ["log"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+toml = { version = "0.9", default-features = false, features = ["display", "parse", "serde"] }
+
+# Complete Cardputer ADV keyboard matrix/Fn-layer decoder
+cardputer-adv-keyboard = "0.2.6"
 
 # Display graphics
 embedded-graphics = "0.8"

@@ -1,27 +1,39 @@
 // ratputer.slint — RATPUTER for M5Stack Cardputer ADV (240×135 px), no_std.
-// Pixel-art style UI: Press Start 2P font (OFL), sizes 8/12 px — snapping to
-// the full 8x8 grid keeps everything crisp.
+// Press Start 2P contains basic ASCII only, so every UI label stays ASCII.
 
 import "fonts/PressStart2P-Regular.ttf";
 
 export component MainWindow inherits Window {
     default-font-family: "Press Start 2P";
 
-    // --- properties driven by the firmware ---
     in property <bool> splash-done: false;
     in-out property <int> frame-index: 0;
 
-    // --- mainscreen view state (0 = MENU, 1 = RAT VIEW, 2 = ABOUT) ---
+    // 0 menu, 1 rat, 2 Wi-Fi menu, 3 saved, 4 scan, 5 password, 6 about.
     in-out property <int> view-state: 0;
     in-out property <int> menu-index: 0;
+    in-out property <int> wifi-menu-index: 0;
+    in-out property <int> saved-index: 0;
+    in-out property <int> scan-index: 0;
 
-    // Press Start 2P has no glyphs outside basic ASCII — labels stay strict ASCII.
-    property <[string]> menu-labels: ["PODGLAD SZCZURA", "O PROJEKCIE"];
+    in property <[string]> saved-networks;
+    in property <[string]> scan-networks;
+    in-out property <string> wifi-status: "SD: CHECKING";
+    in-out property <string> wifi-selected-ssid: "";
+    in-out property <string> wifi-password: "";
 
+    // Firmware polls and clears this command: 1 scan, 2 connect saved,
+    // 3 select scan result, 4 connect with password, 5 forget saved.
+    in-out property <int> wifi-action: 0;
+    in-out property <int> wifi-action-index: 0;
+    // Spinner popup shown over the current view while the radio is busy.
+    in-out property <bool> wifi-connecting: false;
+
+    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "ABOUT"];
+    property <[string]> wifi-menu-labels: ["SAVED NETWORKS", "SCAN NETWORKS"];
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
 
-    // Pixel-art frames (packed into the image by embed_resources)
     property <[image]> frames: [
         @image-url("images/rat0.png"),
         @image-url("images/rat1.png"),
@@ -29,63 +41,92 @@ export component MainWindow inherits Window {
         @image-url("images/rat3.png"),
     ];
 
-    // Keyboard — invoked from the firmware (nazwy: "tab" | "enter" | "back" | "space"
-    //   | "up" | "down" | "left" | "right")
     callback key-pressed(string);
     key-pressed(key) => {
         if (key == "back") {
-            if (root.view-state != 0) { root.view-state = 0; }
+            if (root.view-state == 5) {
+                root.wifi-password = "";
+                root.view-state = 4;
+            } else if (root.view-state == 3 || root.view-state == 4) {
+                root.view-state = 2;
+            } else if (root.view-state != 0) {
+                root.view-state = 0;
+            }
+        } else if (key == "backspace") {
+            // Password editing itself is handled in Rust.
+        } else if (key == "delete" && root.view-state == 3 && root.saved-networks.length > 0) {
+            root.wifi-action-index = root.saved-index;
+            root.wifi-action = 5;
         } else if (key == "enter" || key == "space") {
             if (root.view-state == 0) {
-                root.view-state = root.menu-index == 0 ? 1 : 2;
-            } else {
-                root.view-state = 0;    // select/enter inside a view = exit
+                root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : 6;
+            } else if (root.view-state == 1 || root.view-state == 6) {
+                root.view-state = 0;
+            } else if (root.view-state == 2) {
+                if (root.wifi-menu-index == 0) {
+                    root.view-state = 3;
+                } else {
+                    root.wifi-status = "SCANNING... 2 PASSES";
+                    root.wifi-connecting = true;
+                    root.wifi-action = 1;
+                    root.view-state = 4;
+                }
+            } else if (root.view-state == 3 && root.saved-networks.length > 0) {
+                root.wifi-action-index = root.saved-index;
+                root.wifi-connecting = true;
+                root.wifi-action = 2;
+            } else if (root.view-state == 4 && root.scan-networks.length > 0) {
+                root.wifi-action-index = root.scan-index;
+                root.wifi-action = 3;
+            } else if (root.view-state == 5) {
+                root.wifi-connecting = true;
+                root.wifi-action = 4;
             }
         } else if (key == "tab" || key == "down" || key == "right") {
             if (root.view-state == 0) {
-                root.menu-index = Math.mod(root.menu-index + 1, menu-labels.length);
+                root.menu-index = Math.mod(root.menu-index + 1, root.menu-labels.length);
+            } else if (root.view-state == 2) {
+                root.wifi-menu-index = Math.mod(root.wifi-menu-index + 1, root.wifi-menu-labels.length);
+            } else if (root.view-state == 3 && root.saved-networks.length > 0) {
+                root.saved-index = Math.mod(root.saved-index + 1, root.saved-networks.length);
+            } else if (root.view-state == 4 && root.scan-networks.length > 0) {
+                root.scan-index = Math.mod(root.scan-index + 1, root.scan-networks.length);
             }
         } else if (key == "up" || key == "left") {
             if (root.view-state == 0) {
-                root.menu-index = Math.mod(
-                    root.menu-index + menu-labels.length - 1,
-                    menu-labels.length
-                );
+                root.menu-index = Math.mod(root.menu-index + root.menu-labels.length - 1, root.menu-labels.length);
+            } else if (root.view-state == 2) {
+                root.wifi-menu-index = Math.mod(root.wifi-menu-index + root.wifi-menu-labels.length - 1, root.wifi-menu-labels.length);
+            } else if (root.view-state == 3 && root.saved-networks.length > 0) {
+                root.saved-index = Math.mod(root.saved-index + root.saved-networks.length - 1, root.saved-networks.length);
+            } else if (root.view-state == 4 && root.scan-networks.length > 0) {
+                root.scan-index = Math.mod(root.scan-index + root.scan-networks.length - 1, root.scan-networks.length);
             }
         }
     }
 
-    // ============================================================
-    // SPLASH
-    // ============================================================
     splash := Rectangle {
         opacity: 1;
         background: @linear-gradient(180deg, #05130b 0%, #020503 100%);
-
         VerticalLayout {
             padding: 3px;
             spacing: 2px;
-
             Rectangle {
                 height: 17px;
                 background: #0d2b16;
                 border-radius: 2px;
-
                 HorizontalLayout {
                     padding-left: 6px;
                     padding-right: 6px;
-
                     Text { text: "RATPUTER"; color: #7dffa9; font-size: 12px; vertical-alignment: center; }
                     Text { text: "BOOT"; color: #3d8a5a; font-size: 8px; vertical-alignment: center; horizontal-alignment: right; }
                 }
             }
-
             Rectangle {
                 background: #030903;
                 border-radius: 3px;
                 border-width: 1px;
                 border-color: #143a20;
-
                 Image {
                     source: frames[frame-index];
                     x: (parent.width - 128px) / 2;
@@ -95,112 +136,65 @@ export component MainWindow inherits Window {
                     image-rendering: pixelated;
                 }
             }
-
             HorizontalLayout {
                 height: 12px;
                 padding-left: 3px;
                 padding-right: 3px;
-
-                Text {
-                    text: statuses[frame-index] + dots;
-                    color: #46a06a;
-                    font-size: 8px;
-                    vertical-alignment: center;
-                }
-                Text {
-                    text: "240x135";
-                    color: #2b5c3b;
-                    font-size: 8px;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                }
+                Text { text: statuses[frame-index] + dots; color: #46a06a; font-size: 8px; vertical-alignment: center; }
+                Text { text: "240x135"; color: #2b5c3b; font-size: 8px; vertical-alignment: center; horizontal-alignment: right; }
             }
         }
     }
 
-    // ============================================================
-    // MAINSCREEN
-    // ============================================================
     mainscreen := Rectangle {
         opacity: 0;
         background: @linear-gradient(180deg, #030a06 0%, #010402 100%);
 
-        // ---- view-state == 0: MENU ----
         menu := Rectangle {
             visible: view-state == 0;
-            x: 0; y: 0;
-            width: parent.width;
-            height: parent.height;
-
             VerticalLayout {
                 padding: 5px;
                 spacing: 4px;
-
-                Rectangle {
-                    height: 18px;
-
-                    Text { text: "RATPUTER"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
-                }
+                Text { text: "RATPUTER"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
                 Rectangle { height: 1px; background: #0d2b16; }
-
                 for item[i] in menu-labels : Rectangle {
                     border-radius: 2px;
                     background: menu-index == i ? #0e2b17 : transparent;
-
-                    HorizontalLayout {
-                        padding-left: 6px;
-
-                        Text {
-                            text: (menu-index == i ? "> " : "  ") + item;
-                            color: menu-index == i ? #7dffa9 : #4a7a5a;
-                            font-size: 8px;
-                            vertical-alignment: center;
-                        }
+                    Text {
+                        text: (menu-index == i ? "> " : "  ") + item;
+                        x: 6px;
+                        color: menu-index == i ? #7dffa9 : #4a7a5a;
+                        font-size: 8px;
+                        vertical-alignment: center;
                     }
                 }
                 Rectangle { height: 1px; background: #0d2b16; }
-
-                Text {
-                    text: "^v wybor  Enter wejdz";
-                    color: #39684a;
-                    font-size: 8px;
-                    horizontal-alignment: center;
-                }
+                Text { text: "^v SELECT  ENTER OPEN"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
             }
         }
 
-        // ---- view-state == 1: SZCZUR ----
         ratview := Rectangle {
             visible: view-state == 1;
-            x: 0; y: 0;
-            width: parent.width;
-            height: parent.height;
             background: @linear-gradient(180deg, #05130b 0%, #020503 100%);
-
             VerticalLayout {
                 padding: 3px;
                 spacing: 2px;
-
                 Rectangle {
                     height: 17px;
                     background: #0d2b16;
                     border-radius: 2px;
-
                     HorizontalLayout {
                         padding-left: 6px;
                         padding-right: 6px;
-
-                        Text { text: "SZCZUR"; color: #7dffa9; font-size: 12px; vertical-alignment: center; }
+                        Text { text: "RAT"; color: #7dffa9; font-size: 12px; vertical-alignment: center; }
                         Text { text: "PX x4"; color: #3d8a5a; font-size: 8px; vertical-alignment: center; horizontal-alignment: right; }
                     }
                 }
-
                 Rectangle {
                     background: #030903;
                     border-radius: 3px;
                     border-width: 1px;
                     border-color: #143a20;
-
                     Image {
                         source: frames[frame-index];
                         x: (parent.width - 128px) / 2;
@@ -210,52 +204,181 @@ export component MainWindow inherits Window {
                         image-rendering: pixelated;
                     }
                 }
-
-                Text {
-                    text: "ENTER/BS = MENU";
-                    color: #46a06a;
-                    font-size: 8px;
-                    horizontal-alignment: center;
-                    height: 12px;
-                }
+                Text { text: "ENTER/BS = MENU"; color: #46a06a; font-size: 8px; horizontal-alignment: center; height: 12px; }
             }
         }
 
-        // ---- view-state == 2: O PROJEKCIE ----
-        aboutview := Rectangle {
+        wifi-menu := Rectangle {
             visible: view-state == 2;
-            x: 0; y: 0;
-            width: parent.width;
-            height: parent.height;
+            VerticalLayout {
+                padding: 5px;
+                spacing: 4px;
+                Text { text: "WI-FI"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                for item[i] in wifi-menu-labels : Rectangle {
+                    border-radius: 2px;
+                    background: wifi-menu-index == i ? #0e2b17 : transparent;
+                    Text {
+                        text: (wifi-menu-index == i ? "> " : "  ") + item;
+                        x: 6px;
+                        color: wifi-menu-index == i ? #7dffa9 : #4a7a5a;
+                        font-size: 8px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text { text: wifi-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                Text { text: "BS MENU  ENTER OPEN"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
+            }
+        }
 
+        saved-view := Rectangle {
+            visible: view-state == 3;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 1px;
+                Text { text: "SAVED NETWORKS"; color: #7dffa9; font-size: 8px; horizontal-alignment: center; height: 14px; vertical-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                if saved-networks.length == 0 : Text {
+                    text: "NO SAVED NETWORKS";
+                    color: #4a7a5a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                for item[i] in saved-networks : Rectangle {
+                    height: 10px;
+                    background: saved-index == i ? #0e2b17 : transparent;
+                    Text {
+                        text: (saved-index == i ? "> " : "  ") + item;
+                        x: 3px;
+                        color: saved-index == i ? #7dffa9 : #4a7a5a;
+                        font-size: 8px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text { text: wifi-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; height: 11px; }
+                Text { text: "ENTER CONNECT  DEL FORGET"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 11px; }
+            }
+        }
+
+        scan-view := Rectangle {
+            visible: view-state == 4;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 1px;
+                Text { text: "SCAN RESULTS"; color: #7dffa9; font-size: 8px; horizontal-alignment: center; height: 14px; vertical-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                if scan-networks.length == 0 : Text {
+                    text: "NO NETWORKS";
+                    color: #4a7a5a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                for item[i] in scan-networks : Rectangle {
+                    height: 10px;
+                    background: scan-index == i ? #0e2b17 : transparent;
+                    Text {
+                        text: (scan-index == i ? "> " : "  ") + item;
+                        x: 3px;
+                        color: scan-index == i ? #7dffa9 : #4a7a5a;
+                        font-size: 8px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text { text: wifi-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; height: 11px; }
+                Text { text: "ENTER SELECT  BS BACK"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 11px; }
+            }
+        }
+
+        password-view := Rectangle {
+            visible: view-state == 5;
+            VerticalLayout {
+                padding: 6px;
+                spacing: 5px;
+                Text { text: "WI-FI PASSWORD"; color: #7dffa9; font-size: 8px; horizontal-alignment: center; height: 14px; }
+                Text { text: wifi-selected-ssid; color: #46a06a; font-size: 8px; horizontal-alignment: center; height: 15px; }
+                Rectangle {
+                    height: 24px;
+                    border-width: 1px;
+                    border-color: #2b5c3b;
+                    background: #030903;
+                    Text {
+                        text: wifi-password + "_";
+                        x: 4px;
+                        width: parent.width - 8px;
+                        color: #7dffa9;
+                        font-size: 8px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                Text { text: wifi-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
+                Rectangle { height: 1px; background: #0d2b16; }
+                Text { text: "TYPE  ENTER CONNECT  ESC BACK"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
+            }
+        }
+
+        aboutview := Rectangle {
+            visible: view-state == 6;
             VerticalLayout {
                 padding: 5px;
                 spacing: 3px;
-
-                Text { text: "RATPUTER v0.1"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
+                Text { text: "RATPUTER v0.2"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
                 Rectangle { height: 1px; background: #0d2b16; }
                 Text {
-                    text: "SLINT 1.18 + ESP-HAL 1.2\nNO_STD  XTENSA LX7\nST7789 240x135 @40MHZ\nTCA8418 @0X34 (I2C)\nESP32-S3FN8  NO PSRAM";
+                    text: "SLINT 1.18 + ESP-HAL 1.2\nNO_STD  XTENSA LX7\nST7789 240x135 @40MHZ\nTCA8418 + SD + WI-FI\nESP32-S3FN8  NO PSRAM";
                     color: #46a06a;
                     font-size: 8px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
                 Rectangle { height: 1px; background: #0d2b16; }
-                Text {
-                    text: "BS/ENTER = MENU";
-                    color: #39684a;
-                    font-size: 8px;
-                    horizontal-alignment: center;
-                    height: 12px;
-                }
+                Text { text: "BS/ENTER = MENU"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 12px; }
             }
         }
     }
 
     // ============================================================
-    // STATES: splash -> main (crossfade)
+    // BUSY POPUP (over every main view while the radio works)
     // ============================================================
+    busy-overlay := Rectangle {
+        visible: root.splash-done && root.wifi-connecting;
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+
+        Rectangle {
+            x: (parent.width - 110px) / 2;
+            y: (parent.height - 58px) / 2;
+            width: 110px;
+            height: 58px;
+            background: #05130b;
+            border-width: 1px;
+            border-color: #2b5c3b;
+            border-radius: 3px;
+
+            VerticalLayout {
+                padding: 6px;
+                spacing: 3px;
+                Text {
+                    text: frame-index == 0 ? "|" : frame-index == 1 ? "/" : frame-index == 2 ? "-" : "+";
+                    color: #7dffa9;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: wifi-status;
+                    color: #46a06a;
+                    font-size: 8px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+
     states [
         in-splash when !root.splash-done : {
             splash.opacity: 1;
