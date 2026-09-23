@@ -2,7 +2,8 @@
 
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
 Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
-a nav-menu UI, full keyboard support, everything in **Slint (no_std)**. 🐀
+a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, and SD-backed
+credentials, everything in **Slint (no_std)**. 🐀
 
 ## Stack
 
@@ -13,8 +14,11 @@ a nav-menu UI, full keyboard support, everything in **Slint (no_std)**. 🐀
 | UI | **Slint 1.18** (`renderer-software`, `unsafe-single-threaded`, `libm`) |
 | Memory | `esp-alloc` 0.11 — 150 KB heap in **internal SRAM** (the ADV has no PSRAM!) |
 | Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
+| Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
+| Storage | `embedded-sdmmc`, FAT card on SPI3, TOML credentials |
+| Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
-| Toolchain | **"esp"** Rust fork (installed once via `espup`) |
+| Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
 
 > Previous font picks were DejaVu Sans/Mono — weak readability at 6–8 px; the pixel font fits the art natively.
 
@@ -23,9 +27,9 @@ a nav-menu UI, full keyboard support, everything in **Slint (no_std)**. 🐀
 - `build.rs` compiles `ui/ratputer.slint` with `EmbedForSoftwareRenderer`: font
   files and images land in flash;
 - The template defines **two top-level screens** driven by the `splash-done` property
-  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus **three
-  mainscreen views** (`in-out property <int> view-state`: 0=menu, 1=rat view,
-  2=about) and a **`key-pressed(string)`** callback:
+  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus seven
+  mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
+  4=scan results, 5=password, 6=about) and a **`key-pressed(string)`** callback:
   - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
     128×80 px; frames: bob / step / blink / tail-up) + header `RATPUTER · BOOTING`
     + footer `MODE STALKING/SNIFFING/HUNTING/LOITERING` with a spinner;
@@ -34,23 +38,63 @@ a nav-menu UI, full keyboard support, everything in **Slint (no_std)**. 🐀
     **Backspace** = back;
   - **rat view** (`view-state == 1`) — the same animated pixel-art as the splash
     (frames keep cycling while the view is active);
-  - **about view** (`view-state == 2`) — technical info;
-- The firmware (`src/main.rs`) polls the TCA8418 FIFO and sends readable key names
-  (`"tab" | "enter" | "back" | "space" | "up" | "down" | "left" | "right"`); the nav
-  logic lives entirely in the .slint callback, so a state change is a one-liner from
-  Rust (`set_splash_done`, `view-state`, `menu-index`);
+  - **Wi-Fi views** — saved-network list, scan results, masked password entry,
+    connection status, and forgetting credentials;
+  - **about view** (`view-state == 6`) — technical info;
+- The firmware (`src/main.rs`) polls the TCA8418 FIFO. Navigation keys are sent to
+  Slint while printable characters are appended to the password in Rust. Wi-Fi
+  commands are emitted by Slint and processed on the next main-loop iteration;
 - Main loop: `update_timers_and_animations()` → `draw_if_needed(render_by_line)` →
   every **250 ms** `ui.set_frame_index(i)` (in the splash **and** in the rat view),
   after `SPLASH_AFTER_MS` → `ui.set_splash_done(true)`;
 
 ### Keyboard — TCA8418RTWR via I2C0
 
-`src/keyboard.rs` — pops events from the FIFO (read event count from
-`KEY_LCK_EC`=0x03, pop with `KEY_EVENT_A`=0x04), decodes bit7 as "pressed" and maps
-the 1-based TCA8418 code to the 7×8 matrix index used by the ADV (Tab=1,
-Backspace=52, Enter=54, Space=55, **arrows ←=43 / ↑=46 / ↓=47 / →=51**; the Fn layer
-that turns those into `,` `;` `.` `/` is software-level and not used here). Register
-set and sequence follow the `cardputer` 0.2 crate (cardputer-adv).
+The `cardputer-adv-keyboard` crate drains the TCA8418 FIFO and resolves the full
+Cardputer ADV keymap, including Shift/Fn layers. In password entry, printable ASCII,
+Space and Backspace edit the value; Enter connects; Escape (Fn+backtick) returns.
+Navigation uses the bare `,` / `;` / `.` / `/` keys for left/up/down/right (Fn+those
+keys yields the same arrows). Delete (Fn+Backspace) forgets the selected saved network.
+
+### Wi-Fi credentials on SD
+
+The SD card must contain a FAT volume. Credentials are stored at
+`/RATPUTER/WIFI.CFG` (FAT paths are case-insensitive) as TOML:
+
+```toml
+version = 1
+
+[[networks]]
+ssid = "example"
+password = "secret"
+auth = "wpa2"
+```
+
+The file can hold up to 12 networks. The firmware never connects automatically:
+open **WI-FI → SAVED NETWORKS** and select one, or use **SCAN NETWORKS** to add a
+network after a successful connection. Only scan-visible SSIDs are supported.
+Passwords are plain text on the removable card; TOML is a portable configuration
+format, not encrypted storage. The current radio API supports open, WEP, WPA, WPA2,
+and WPA/WPA2 networks; unsupported scan results are marked `!`.
+
+SD wiring uses the ADV's dedicated SPI3 bus:
+
+| GPIO | SD function |
+|---|---|
+| G40 | SCLK |
+| G14 | MOSI |
+| G39 | MISO |
+| G12 | CS |
+
+The bus stays at 400 kHz for standards-compliant card initialization and because
+the credential file is only a few kilobytes.
+
+### Scan + connect reliability
+
+The default active scan dwells only 10–20 ms per channel and visibly misses APs,
+so the firmware uses a 50–250 ms dwell and merges **two scan passes** (status:
+`SCANNING... 2 PASSES`, a few seconds). Association attempts are retried up to
+3 times; per-attempt failures are logged over UART (`Wi-Fi connect attempt N failed`).
 
 ### Memory (ADV has no PSRAM!)
 
@@ -62,25 +106,15 @@ set and sequence follow the `cardputer` 0.2 crate (cardputer-adv).
 - Fonts and images are packaged into flash by `build.rs` (embed resources);
 - Previous version: 4 ASCII-art frames (by Gio) — in git history.
 
-## Setup (once)
+## Development environment
 
-The Nix devshell provides `rustup`, `espup`, `espflash` and sources `export-esp.sh`
-(paths to the forked Xtensa GCC).
+`nix develop` downloads the pinned Xtensa Rust fork, `rust-src`, LLVM, GCC, and
+`espflash`. The toolchain stays in the Nix store; no global `espup install` or
+`~/export-esp.sh` is required. The exact `esp-rs-nix` revision is recorded in
+`flake.lock`.
 
-The Xtensa toolchain is installed once, globally (the fork is not in nixpkgs):
-
-```bash
-nix develop
-espup install          # ~1.2 GB into ~/.rustup/toolchains/esp
-```
-
-> **NixOS:** the espup-forked rustc needs a dynamic linker — add
-> `programs.nix-ld.enable = true;` to your NixOS config (already enabled on
-> the original dev host).
-
-> The build is verified: `cargo build --release` passes
-> (ELF in `target/xtensa-esp32s3-none-elf/release/`; app image ~467 KB —
-  mostly the Slint software renderer + the bundled font).
+> The build is verified: `cargo build --release` passes. The ELF is written to
+> `target/xtensa-esp32s3-none-elf/release/`.
 
 ## Build & flash
 
@@ -88,16 +122,26 @@ espup install          # ~1.2 GB into ~/.rustup/toolchains/esp
 
 ```bash
 nix develop
-./build-bin.sh                      # build + merged ratputer-adv.bin (~520 KB)
+build                               # build + merged ratputer-adv.bin
 ```
 
-The image contains everything: bootloader @0x0 + partition table @0x8000 + app @0x10000.
-Header per the M5Stack StampS3A module spec: **8 MB, QIO, 80 MHz** (verified byte-wise).
+The `build` devshell command runs the host-side `cargo xtask build`, which builds
+the release firmware, invokes `espflash save-image`, and verifies all three image
+headers. The image contains everything: bootloader @0x0 + partition table @0x8000
++ app @0x10000. The image uses **8 MB, DIO, 80 MHz**. DIO is required for
+reliable ROM loading on the Cardputer ADV; a QIO bootloader header causes an early
+`ets_loader.c 78` watchdog-reset loop before the second-stage bootloader starts.
+
+To build and immediately flash the connected device with verification:
 
 ```bash
-espflash write-bin 0x0 ratputer-adv.bin --verify
-# or esptool:
-esptool --chip esp32s3 write_flash 0x0 ratputer-adv.bin
+flash
+```
+
+For manual flashing of an existing image (espflash verifies writes by default):
+
+```bash
+espflash write-bin 0x0 ratputer-adv.bin
 ```
 
 ### Dev-loop flash (with UART monitor)
@@ -148,11 +192,19 @@ The landscape (240×135) rotation is done by MADCTL — mipidsi transforms the o
 itself (for `Deg90` it produces native `(40, 53)`, matching the `st7789_pico1`
 variant from mipidsi 0.7 for the same panel).
 
-## Keyboard (details)
+## Hardware test checklist
 
-Cardputer ADV's keyboard hangs off a **TCA8418** over I²C (G8=SDA, G9=SCL, G11=INT —
-not used; we poll the FIFO). Reference driver: `cardputer` crate 0.2 (`src/adv/keyboard.rs`),
-also `cardputer-adv-keyboard` (LarsBollmann) — embedded-hal 1.0 compatible.
+1. Format an SD card as FAT32, insert it, then run `flash`.
+2. Confirm the splash, main menu, rat animation, and full keyboard navigation.
+3. Open **WI-FI → SCAN NETWORKS** and confirm visible SSIDs and RSSI values appear.
+4. Select a WPA/WPA2 network, type its password, and press Enter.
+5. Confirm `CONNECTED: <SSID>` and `/RATPUTER/WIFI.CFG` on the SD card.
+6. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
+7. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
+8. Test an incorrect password, an open network, no SD card, and an empty scan.
+
+A successful host build verifies compilation and image headers, but radio, antenna,
+SD-card compatibility, and internal-SRAM headroom require this physical test.
 
 ## Resources
 

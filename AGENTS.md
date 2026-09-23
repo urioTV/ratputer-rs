@@ -1,18 +1,20 @@
 # AGENTS.md — Guide for LLM agents working on ratputer-rs
 
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A): a **no_std** Rust
-firmware with a **Slint 1.18** UI (software renderer), pixel-art animation, and a TCA8418
-keyboard driver. This file documents hard-won, project-specific knowledge so that future
-work does not rediscover the same pitfalls.
+firmware with a **Slint 1.18** UI (software renderer), pixel-art animation, a TCA8418
+keyboard, Wi-Fi (esp-radio), and an SD card (embedded-sdmmc) for credentials. This file
+documents hard-won, project-specific knowledge so that future work does not rediscover
+the same pitfalls.
 
 ---
 
 ## Golden rules
 
 1. **Build & flash are the only verification you have.** There is no emulator. After any
-   UI change, run `nix develop -c bash -c './build-bin.sh'`, then have the user flash
-   with `espflash write-bin 0x0 ratputer-adv.bin --verify`. Always verify the merged
-   image headers afterwards: `0x0` = `e9`, `0x8000` = `aa 50`, `0x10000` = `e9`.
+   UI change, run `nix develop -c build`, then have the user flash with
+   `espflash write-bin 0x0 ratputer-adv.bin` (writes are verified by default). The
+   xtask verifies the merged image headers automatically: `0x0` = `e9`, `0x2` = `02`
+   (DIO), `0x8000` = `aa 50`, `0x10000` = `e9`, `0x10002` = `02` (DIO).
 2. **Never raise SPI above 40 MHz.** See "LCD quirks" — 80 MHz visibly scrambles the
    picture.
 3. **The ADV has no PSRAM.** All heap lives in internal RAM. Before touching allocation,
@@ -23,32 +25,31 @@ work does not rediscover the same pitfalls.
 ## Repository layout
 
 ```
-src/main.rs        esp-hal init, LCD (ST7789), Slint platform, frame clock, kbd loop
-src/keyboard.rs    TCA8418RTWR driver (I2C0 @ 0x34) → NavKey events
-ui/ratputer.slint  All of the UI (splash → mainscreen: menu / rat-view / about)
-ui/images/         rat0..3.png — pixel-art frames (32×20, displayed at ×4 = 128×80)
-ui/fonts/          Press Start 2P (OFL) — THE UI font; DejaVu was removed
+src/main.rs        esp-hal init, LCD, SD SPI3, esp-rtos, Slint platform, main loop/state
+src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (blocking block_on)
+src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12)
+ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/about)
+ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 build.rs           slint-build: compiles ui/ratputer.slint, embeds fonts+images
+xtask/             host helper: builds release, creates and verifies merged binary
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
-build-bin.sh       builds release + produces merged ratputer-adv.bin from 0x0
 ```
 
 ## Toolchain
 
-- Rust fork **"esp"** installed once via `espup install` (NOT from nixpkgs). The fork is
-  a *nightly*; check `rust-toolchain.toml` (`channel = "esp"`). Dependencies must be
-  compatible with `-Zbuild-std` (`[unstable] build-std = ["core", "alloc"]` in
-  `.cargo/config.toml`) and the `xtensa-esp32s3-none-elf` target
-  (**⚠ without the `unknown` token** — the esp fork uses the short triple).
-- On NixOS the forked rustc needs `programs.nix-ld.enable = true` (already configured
-  on this host).
-- `nix develop` provides `rustup`, `espup` and `espflash` and sources
-  `~/export-esp.sh` (paths to the forked Xtensa GCC).
+- The **"esp"** Rust fork is supplied by the pinned `esp-rs-nix` flake input. The
+  devshell sets `RUSTUP_TOOLCHAIN` to its immutable Nix store path; do not run
+  `espup install` or source `~/export-esp.sh`.
+- The fork is a *nightly*. Dependencies must be compatible with `-Zbuild-std`
+  (`[unstable] build-std = ["core", "alloc"]` in `.cargo/config.toml`) and the
+  `xtensa-esp32s3-none-elf` target (**without the `unknown` token** — the esp fork
+  uses the short triple).
+- `nix develop` provides the complete Xtensa toolchain and `espflash`.
 - If the firmware reports nothing on the LCD but the build worked, the most common
   cause is a **forgotten `display_offset`** or wrong `display_size` order — the ST7789
   panel is a 135×240 *window* inside a 240×320 GRAM. Correct, verified values:
   `display_size(135, 240)` + `display_offset(52, 40)` + `Rotation::Deg90` (landscape
-  240×135). Documented in README "Geometria panelu".
+  240×135). Documented in README "Panel geometry".
 
 ## LCD quirks (ST7789)
 
@@ -79,26 +80,73 @@ build-bin.sh       builds release + produces merged ratputer-adv.bin from 0x0
 - Font is **Press Start 2P** — readable at 8 px multiples (UI: 8 px body, 12 px titles).
   It has **no Polish diacritics** — all UI strings stay ASCII.
 - Keyboard input is delivered via a root callback `key-pressed(string)`; Rust side
-  dispatches `"tab" | "enter" | "back" | "space" | "up" | "down" | "left" | "right"`.
-  **Do not** reintroduce `FocusScope` chain — the callback design keeps nav logic in
-  one place.
+  dispatches `"tab" | "enter" | "back" | "space" | "up" | "down" | "left" | "right"`
+  plus `"delete"`. **Do not** reintroduce `FocusScope` chain — the callback design keeps
+  nav logic in one place.
+- Rust-side Wi-Fi commands flow through `wifi-action`/`wifi-action-index` (in-out ints).
+  Actions only SCHEDULE work (`radio_pending: Option<RadioStep>`); the actual radio call
+  (one scan pass / one connect attempt) runs in a later loop iteration in
+  `RadioStep { Scan, Connect }` steps. This keeps `busy_status()` (spinner + progress)
+  rendering between the blocking steps and retried attempts. Keep this step-machine
+  pattern for any new slow operation. While `radio_pending.is_some()`, keyboard input
+  is drained and discarded — otherwise queued keys replay after the radio unblocks.
+  The same drain-and-ignore guard covers the splash screen.
+- Main-loop order matters: input → scheduled actions/step executor → animation ticker →
+  **draw at the BOTTOM of the iteration**. This makes the `wifi-connecting` spinner
+  pop-up appear in the same frame as the Enter press, BEFORE the first blocking radio
+  call; a step scheduled in iteration N executes at iteration N+1. Do not move the
+  draw back to the top, or every connect/scan will look like an input lag.
+- No arrow buttons exist in Slint 1.18 `visible`/`if` alternation used for empty-list
+  hints; lists are plain `for item[i] in model` renderers against `VecModel<SharedString>`
+  set from Rust via `ModelRc`. SSIDs longer than the screen are truncated to 18 chars.
 
 ## Keyboard (TCA8418)
 
+- Use the **`cardputer-adv-keyboard` 0.2.6 crate** (wrapper `Keyboard::new(i2c)` +
+  `inputs()`) — it resolves the full ADV keymap including Shift/Fn layers. The old
+  hand-rolled `src/keyboard.rs` was only good for nav keys and was removed.
 - I²C0 @ 400 kHz, SDA=G8, SCL=G9, 7-bit address **0x34**, INT=G11 (unused — we poll).
-- FIFO: read `KEY_LCK_EC` (0x03, low nibble = event count), pop with
-  `KEY_EVENT_A` (0x04). `bit7 = pressed`, low 7 bits = 1-based key code with
-  10 columns/row. `idx = code - (code/10)*2 - 1` maps into the 7×8 matrix
-  (see `src/keyboard.rs` constants; full map in crate `cardputer` 0.2).
-- Arrow keys are the physical `,` `;` `.` `/` keys (idx 43/46/47/51) — the Fn layer
-  that produces punctuation is **software**, TCA8418 is unaware of it.
+- Arrow keys: bare `,` `;` `.` `/` = Left/Up/Down/Right (legacy behavior, restored in
+  main.rs as Char remaps outside password entry); Fn+those are also arrows per the
+  crate's Fn layer (Fn+, → Left, Fn+; → Up, Fn+. → Down, Fn+/ → Right). In password
+  entry chars stay punctuation. Enter connects; Escape (Fn+backtick) is "back";
+  Delete (Fn+Backspace) forgets a saved network.
+
+## Wi-Fi (esp-radio 1.0.0-beta.1) + SD (embedded-sdmmc 0.10)
+
+- **`esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0)` MUST run before
+  `WifiController::new`**; the internal Wi-Fi tasks/timers depend on it. We do NOT use
+  embassy executor — `scan_async`/`connect_async` are driven with
+  `embassy_futures::block_on` (esp-rtos provides the polling hooks).
+- API shape: `WifiController::new(peripherals.WIFI, ControllerConfig::default())` then
+  `Interface::station()` (one-shot singleton). `set_config(&Config::Station(...))` also
+  (re)starts the radio; `connect_async()` returns `Result<_, ConnectionError>` (NOT
+  WifiError) and `is_connected()` is unstable/private — call `disconnect_async()` and
+  ignore `NotConnected`.
+- Scan results use `ScanConfig` + `AccessPointInfo` (ssid/signal_strength/auth_method).
+  Default active dwell (10–20 ms/channel) misses APs — we scan with
+  `ScanTypeConfig::Active{min:50ms,max:250ms}` and merge 2 passes in `src/wifi.rs`.
+  Association is flaky; `connect()` retries 3× (disconnect between attempts).
+  Station auth is `AuthenticationMethodConfig`
+  (Open/Wep/Wpa/Wpa2Personal/WpaWpa2Personal) — WPA3-only APs are marked unsupported.
+- SD: dedicated SPI3, SCLK=G40 MOSI=G14 MISO=G39 CS=G12 @ **400 kHz** (proper card
+  init speed; file is a few KB anyway). `embedded_sdmmc::SdCard::new(SpiDevice,...)` +
+  `VolumeManager` (RefCell inside → all methods `&self`). Files: 8.3 uppercase FAT
+  names (`RATPUTER/WIFI.CFG`), `embedded_io::Write` + `flush` required.
+- Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
+  the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
 
 ## Flashing
 
+- The merged image must use **DIO flash mode**. A QIO header makes the ESP32-S3 ROM
+  load only the first bootloader segment and then reset with `ets_loader.c 78` /
+  `TG0WDT_SYS_RST`, before either the second-stage bootloader or application starts.
+- Flash frequency remains 80 MHz; this is independent of the LCD's 40 MHz SPI limit.
+
 ```sh
 nix develop
-./build-bin.sh                                   # → ratputer-adv.bin
-espflash write-bin 0x0 ratputer-adv.bin --verify # merged image from 0x0
+build # → ratputer-adv.bin
+flash # rebuild, flash from 0x0, and verify
 ```
 
 Boot mode (when the port is stubborn): hold G0 while plugging USB-C.
