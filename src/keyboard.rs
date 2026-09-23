@@ -1,29 +1,29 @@
-//! Klawiatura Cardputer ADV — TCA8418RTWR przez I2C0 (addr 0x34, SDA=G8, SCL=G9).
+//! Cardputer ADV keyboard — TCA8418RTWR over I2C0 (addr 0x34, SDA=G8, SCL=G9).
 //!
-//! Sterownik ograniczony do tego co potrzebne w UI: zdarzenia *naciśnięcia*
-//! zmapowane na klawisze nawigacyjne. Metodologia FIFO i tablica kodów
-//! odpowiadają crate'owi `cardputer` 0.2.0 (src/adv/keyboard.rs, MIT OR Apache-2.0)
-//! — przepisane z esp-idf-hal na esp-hal blocking I2C (embedded-hal 1.0).
+//! Minimal driver covering what the UI needs: *press* events mapped to
+//! navigation keys. The FIFO mechanics and the event-code table follow the
+//! `cardputer` 0.2.0 crate (src/adv/keyboard.rs, MIT OR Apache-2.0) — ported
+//! from esp-idf-hal to esp-hal blocking I2C (embedded-hal 1.0).
 
 use esp_hal::i2c::master::I2c;
 use esp_hal::Blocking;
 
 const I2C_ADDRESS: u8 = 0x34;
 
-// Rejestry TCA8418
-const ADDR_CFG: u8 = 0x01;          // CFG — bit0 = KE_IEN (interrupt z kolejki klawiszy)
-const REG_KEY_LCK_EC: u8 = 0x03;    // KEY_LCK_EC — dół = liczba zdarzeń w FIFO
-const REG_KEY_EVENT_A: u8 = 0x04;   // KEY_EVENT_A / KP_GPIO — czytanie zdejmuje z FIFO
-const ADDR_KP_GPIO1: u8 = 0x1D;     // ROW0..7 jako wejścia keypadu
-const ADDR_KP_GPIO2: u8 = 0x1E;     // COL0..7 jako wyjścia keypadu
-const ADDR_KP_GPIO3: u8 = 0x1F;     // COL8/COL9 (nie używane w ADV)
+// TCA8418 registers
+const ADDR_CFG: u8 = 0x01;          // CFG — bit0 = KE_IEN (key event FIFO interrupt)
+const REG_KEY_LCK_EC: u8 = 0x03;    // KEY_LCK_EC — low nibble = number of FIFO events
+const REG_KEY_EVENT_A: u8 = 0x04;   // KEY_EVENT_A — reading pops one FIFO entry
+const ADDR_KP_GPIO1: u8 = 0x1D;     // ROW0..7 as keypad inputs
+const ADDR_KP_GPIO2: u8 = 0x1E;     // COL0..7 as keypad outputs
+const ADDR_KP_GPIO3: u8 = 0x1F;     // COL8/COL9 (unused on the ADV)
 
-/// Indeks w macierzy 7×8 (wg talerzy `cardputer::keyboard::adv::KEY_MATRIX`).
-/// Kod zdarzenia TCA8418 jest 1-based z 10 kolumnami (kampany n-ty rząd). Przeliczenie:
-/// `idx = code - (code / 10) * 2 - 1` — wtedy:
-///   1 = Tab, 52 = Backspace, 54 = Enter, 55 = Spacja;
-///   43 = ←, 46 = ↑, 47 = ↓, 51 = → (fizyczne strzałki ADV as klawisze, których
-///   fn-warstwa to `,` `;` `.` `/` — stąd ich indeksy).
+/// Index into the ADV's 7x8 matrix (see `cardputer::keyboard::adv::KEY_MATRIX`).
+/// The TCA8418 event code is 1-based with 10 columns per row; conversion:
+/// `idx = code - (code / 10) * 2 - 1` — then:
+///   1 = Tab, 52 = Backspace, 54 = Enter, 55 = Space;
+///   43 = Left Arrow, 46 = Up Arrow, 47 = Down Arrow, 51 = Right Arrow
+///   (physical ADV keys whose Fn layer yields `,` `;` `.` `/` — hence the indices).
 const IDX_TAB: u8 = 1;
 const IDX_ARROW_LEFT: u8 = 43;
 const IDX_ARROW_UP: u8 = 46;
@@ -43,7 +43,7 @@ pub enum NavKey {
     ArrowDown,
     ArrowLeft,
     ArrowRight,
-    Other(u8), // kod indeksu macierzy (do przyszłego wykorzystania)
+    Other(u8), // matrix index (for future use)
 }
 
 pub struct Keyboard<'a> {
@@ -51,23 +51,23 @@ pub struct Keyboard<'a> {
 }
 
 impl<'a> Keyboard<'a> {
-    /// Inicjalizacja macierzy — konfiguracja identyczna jak w `cardputer::adv`.
+    /// Matrix setup — configuration identical to `cardputer::keyboard::adv`.
     pub fn new(i2c: I2c<'a, Blocking>) -> Self {
         let mut k = Self { i2c };
-        // ROW0..6 jako keypad (7 wierszy: 0x7F), COL0..7 jako keypad (0xFF), COL8/9 wyłączone
+        // ROW0..6 as keypad (7 rows: 0x7F), COL0..7 as keypad (0xFF), COL8/9 disabled
         let _ = k.i2c.write(I2C_ADDRESS, &[ADDR_KP_GPIO1, 0x7F]);
         let _ = k.i2c.write(I2C_ADDRESS, &[ADDR_KP_GPIO2, 0xFF]);
         let _ = k.i2c.write(I2C_ADDRESS, &[ADDR_KP_GPIO3, 0x00]);
-        // Włącz interrupt fifo klawiszy
+        // Enable key-event FIFO interrupts
         let _ = k.i2c.write(I2C_ADDRESS, &[ADDR_CFG, 0x01]);
         k.flush();
         k
     }
 
-    /// Opróżnij FIFO (żeby stare zdarzenia z bootu nie przeszkadzały).
+    /// Drain the FIFO (so stale boot-time events don't confuse the UI).
     fn flush(&mut self) {
         let mut b = [0u8; 1];
-        // Czytamy KEY_EVENT_A do exhaustion FIFO (max 10 zdarzeń)
+        // Read KEY_EVENT_A until the FIFO is empty (max 10 events)
         for _ in 0..11 {
             if self.i2c.write_read(I2C_ADDRESS, &[REG_KEY_EVENT_A], &mut b).is_err() {
                 return;
@@ -78,10 +78,10 @@ impl<'a> Keyboard<'a> {
         }
     }
 
-    /// Zdejmuje jedno zdarzenie z FIFO. Zdarzenia puści (release) i puste są przewalane.
-    /// Zwraca kod nawigacyjny dla zdarzenia *naciśnięcia*.
+    /// Pops one event from the FIFO. Release events and empty slots are skipped.
+    /// Returns a navigation key decoded from *press* events.
     pub fn next_nav_key(&mut self) -> Option<NavKey> {
-        // Sprawdź liczbę zdarzeń
+        // Check the pending event count
         let mut ec = [0u8; 1];
         if self.i2c.write_read(I2C_ADDRESS, &[REG_KEY_LCK_EC], &mut ec).is_err() {
             return None;
@@ -90,7 +90,7 @@ impl<'a> Keyboard<'a> {
             return None;
         }
 
-        // Zdejmij jedno zdarzenie — serializujemy go do dziennika diagnostycznego
+        // Pop one event — log it for diagnostics
         let mut ev = [0u8; 1];
         if self.i2c.write_read(I2C_ADDRESS, &[REG_KEY_EVENT_A], &mut ev).is_err() {
             return None;
@@ -102,9 +102,9 @@ impl<'a> Keyboard<'a> {
 
         let pressed = raw & 0x80 != 0;
         let code = raw & 0x7F;
-        // 1-based code, kolumny 10 w rzędzie — 8 kolumn używanych
+        // 1-based code, 10 columns per row — 8 columns actually wired
         let idx = code.wrapping_sub((code / 10) * 2).wrapping_sub(1);
-        log::info!("kbd event: raw=0x{:02x} pressed={} idx={}", raw, pressed, idx);
+        log::debug!("kbd event: raw=0x{:02x} pressed={} idx={}", raw, pressed, idx);
 
         if !pressed {
             return None;

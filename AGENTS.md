@@ -17,8 +17,8 @@ work does not rediscover the same pitfalls.
    picture.
 3. **The ADV has no PSRAM.** All heap lives in internal RAM. Before touching allocation,
    read "Memory".
-4. Keep comments/docstrings in **Polish** (project convention), `README.md` in Polish,
-   code in Rust idioms. UI strings are ASCII-only (pixel font has no Polish glyphs).
+4. Write **everything in English** — code comments, `README.md`, docstrings, commit
+   messages. UI strings are ASCII-only (the pixel font has no non-ASCII glyphs).
 
 ## Repository layout
 

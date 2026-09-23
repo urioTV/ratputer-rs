@@ -3,4 +3,4 @@
 channel = "esp"
 profile = "minimal"
 components = ["rust-src", "rustfmt"]
-targets = ["xtensa-esp32s3-none-elf"]  # fork ESP: bez członu "unknown"
+targets = ["xtensa-esp32s3-none-elf"]  # esp fork: the triple omits "unknown"

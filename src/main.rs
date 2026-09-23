@@ -1,13 +1,12 @@
 #![no_std]
 #![no_main]
 
-// RATPUTER — Slint (no_std, renderer software) na M5Stack Cardputer ADV (ESP32-S3).
+// RATPUTER — Slint (no_std, software renderer) on M5Stack Cardputer ADV (ESP32-S3).
 //
-// Przepisane z renderowania „embedded-graphics Text" na pełny UI Slint:
-// - build.rs kompiluje ui/ratputer.slint do kodu (tu: slint::include_modules!()),
-// - MinimalSoftwareWindow + render_by_line wypychają każdą linię przez mipidsi
-//   do ST7789V2 (ten sam SPI 40 MHz co wcześniej),
-// - Slint potrzebuje alokatora: esp-alloc, heap w wewnętrznym RAM (ADV nie ma PSRAM!).
+// - build.rs compiles ui/ratputer.slint into Rust (see slint::include_modules!()),
+// - MinimalSoftwareWindow + render_by_line push each line through mipidsi to the
+//   ST7789V2 LCD (SPI @ 40 MHz — LCD pins go through the GPIO matrix, not IOMUX),
+// - Slint needs an allocator: esp-alloc heap in internal SRAM (the ADV has no PSRAM).
 
 extern crate alloc;
 
@@ -19,7 +18,7 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_hal_bus::spi::ExclusiveDevice;
 
-use esp_backtrace as _; // panic handler + backtrace na UART
+use esp_backtrace as _; // panic handler + backtrace to UART
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
@@ -38,24 +37,25 @@ use mipidsi::Builder;
 
 use slint::platform::software_renderer::{LineBufferProvider, MinimalSoftwareWindow, Rgb565Pixel};
 
-// Deskryptor aplikacji ESP-IDF (wymagany przez espflash save-image --merge)
+// ESP-IDF app descriptor (required by espflash save-image --merge)
 esp_bootloader_esp_idf::esp_app_desc!();
 
-// Moduły wygenerowane z ui/ratputer.slint przez build.rs
+// Modules generated from ui/ratputer.slint by build.rs
 slint::include_modules!();
 
-// Heap w wewnętrznym RAM — ADV = Stamp-S3A (ESP32-S3FN8), bez PSRAM.
-// 512 KB SRAM; wywoływane w main() przed pierwszym Box/Rc (Slint potrzebuje alloc).
+// Heap in internal SRAM — ADV = Stamp-S3A (ESP32-S3FN8) has no PSRAM.
+// 512 KB SRAM total; MUST be called in main() before the first Box/Rc (Slint needs alloc).
 const HEAP_SIZE: usize = 150 * 1024;
 
 const LCD_WIDTH: usize = 240;
 const LCD_HEIGHT: usize = 135;
 const FRAME_MS: u64 = 250;
-// Po tym czasie splash screen zamienia się na UI firmware'u (crossfade w .slint 600 ms)
+// After this delay the splash screen transitions to the firmware UI
+// (600 ms crossfade declared in .slint states).
 const SPLASH_AFTER_MS: u64 = 3500;
 
 // ---------------------------------------------------------------------------
-// Backend Slint dla esp-hal (pojedynczy rdzeń, bez Schedulerzy)
+// Slint backend for esp-hal (single core, no scheduler)
 // ---------------------------------------------------------------------------
 struct EspBackend {
     window: Rc<MinimalSoftwareWindow>,
@@ -76,7 +76,7 @@ impl slint::platform::Platform for EspBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Most: linia z renderera Slint -> wiązka pikseli do ST7789 przez mipidsi
+// Bridge: a line rendered by Slint -> a pixel burst to the ST7789 via mipidsi
 // ---------------------------------------------------------------------------
 struct HardwareDrawBuffer<'a, Display> {
     display: &'a mut Display,
@@ -125,14 +125,15 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     let mut delay = Delay::new();
 
-    // --- LCD ST7789V2 przez SPI2 (Cardputer ADV) — identycznie jak poprzednio ---
+    // --- LCD ST7789V2 on SPI2 (Cardputer ADV) ---
     let dc = Output::new(peripherals.GPIO34, Level::Low, OutputConfig::default());
     let cs = Output::new(peripherals.GPIO37, Level::High, OutputConfig::default());
     let rst = Output::new(peripherals.GPIO33, Level::High, OutputConfig::default());
     let mut backlight = Output::new(peripherals.GPIO38, Level::High, OutputConfig::default());
 
-    // 40 MHz — piny LCD idą przez macierz GPIO (nie IOMUX), przy 80 MHz obraz się
-    // rozjeżdża. Referencja: espp m5stack-cardputer.hpp (lcd_clock_speed = 40 MHz).
+    // 40 MHz — the LCD pins are routed through the GPIO matrix (not IOMUX);
+    // at 80 MHz ST7789 setup times are violated and the picture scrambles.
+    // Reference: espp m5stack-cardputer.hpp (lcd_clock_speed = 40 MHz).
     let spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default().with_frequency(Rate::from_mhz(40)),
@@ -142,11 +143,11 @@ fn main() -> ! {
     .with_mosi(peripherals.GPIO35);
 
     let spi_dev = ExclusiveDevice::new(spi, cs, Delay::new()).unwrap();
-    let mut buffer = [0u8; 512]; // bufor transakcji DCS mipidsi
+    let mut buffer = [0u8; 512]; // mipidsi DCS transaction buffer
     let interface = SpiInterface::new(spi_dev, dc, &mut buffer);
 
-    // display_size/display_offset w przestrzeni NATYWNEJ ST7789 (portrait 240x320 GRAM);
-    // rotacja Deg90 robi 240x135 logiczne — geometrycznie dokładnie tak jak dotąd.
+    // display_size/display_offset are in the ST7789-native space (portrait 240x320 GRAM);
+    // Deg90 rotation produces a 240x135 logical landscape.
     let mut display = Builder::new(ST7789, interface)
         .invert_colors(ColorInversion::Inverted)
         .orientation(Orientation::new().rotate(Rotation::Deg90))
@@ -159,7 +160,7 @@ fn main() -> ! {
     backlight.set_level(Level::High);
     display.clear(Rgb565::BLACK).unwrap();
 
-    // --- Klawiatura TCA8418 (Cardputer ADV): I2C0 @ 400 kHz, SDA=G8, SCL=G9 ---
+    // --- Keyboard TCA8418 (Cardputer ADV): I2C0 @ 400 kHz, SDA=G8, SCL=G9 ---
     let i2c = I2c::new(
         peripherals.I2C0,
         I2cConfig::default().with_frequency(Rate::from_khz(400)),
@@ -169,7 +170,7 @@ fn main() -> ! {
     .with_scl(peripherals.GPIO9);
     let mut keyboard = Keyboard::new(i2c);
 
-    // --- Slint: minimalne okno software'owe + platforma ---
+    // --- Slint: minimal software window + platform ---
     let window = MinimalSoftwareWindow::new(
         slint::platform::software_renderer::RepaintBufferType::ReusedBuffer,
     );
@@ -180,14 +181,14 @@ fn main() -> ! {
         window: window.clone(),
         boot_micros,
     }))
-    .expect("platforma Slint już ustawiona");
+    .expect("Slint platform already set");
 
     let ui = MainWindow::new().unwrap();
 
-    // Bufor jednej linii (ReusedBuffer) — 240 px RGB565
+    // Single-line buffer (ReusedBuffer) — 240 px RGB565
     let mut line_buffer: [Rgb565Pixel; LCD_WIDTH] = [Rgb565Pixel(0); LCD_WIDTH];
 
-    // --- pętla główna: Slint tick + ewentualny render + splash -> firmware ---
+    // --- main loop: Slint tick + redraw + splash -> firmware transition ---
     let mut frame_idx: u32 = 0;
     let mut splash_done = false;
     let splash_start = Instant::now();
@@ -202,13 +203,13 @@ fn main() -> ! {
 
         let now = Instant::now();
 
-        // Po SPLASH_AFTER_MS: przechodzimy na ekran główny (Slint states, crossfade 600 ms)
+        // After SPLASH_AFTER_MS: switch to the main screen (Slint states, 600 ms crossfade)
         if !splash_done && now - splash_start >= Duration::from_millis(SPLASH_AFTER_MS) {
             ui.set_splash_done(true);
             splash_done = true;
         }
 
-        // --- Klawiatura: dispatch do Slint verbatim ---
+        // --- Keyboard: dispatch raw nav events to the Slint callback ---
         while let Some(nav) = keyboard.next_nav_key() {
             match nav {
                 NavKey::Tab => { ui.invoke_key_pressed("tab".into()) }
@@ -223,7 +224,7 @@ fn main() -> ! {
             }
         }
 
-        // Animacja szczura: w splashu ORAZ gdy mainscreen pokazuje rat-view
+        // Rat animation: in the splash AND when the mainscreen shows the rat view
         let animate_rat = !splash_done || ui.get_view_state() == 1;
         if animate_rat && now - last_switch >= Duration::from_millis(FRAME_MS) {
             frame_idx = (frame_idx + 1) % 4;

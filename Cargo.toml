@@ -3,23 +3,23 @@ name = "ratputer-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Rust firmware dla M5Stack Cardputer ADV (ESP32-S3)"
+description = "Rust firmware for the M5Stack Cardputer ADV (ESP32-S3)"
 
 [dependencies]
 # HAL (no_std, bare-metal) — ESP32-S3 = Xtensa
-esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }  # unstable: moduł delay
+esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }  # unstable: delay module
 esp-backtrace = { version = "0.20", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.18", features = ["esp32s3", "log-04"] }
-esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }  # deskryptor aplikacji (wymagany do merged .bin)
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }  # app descriptor (required for merged .bin)
 log = "0.4"
 
-# Grafika ekranowa
+# Display graphics
 embedded-graphics = "0.8"
-mipidsi = "0.9"                # driver ST7789 (z wbudowanym SpiInterface)
+mipidsi = "0.9"                # ST7789 driver (built-in SpiInterface)
 embedded-hal = "1.0"
-embedded-hal-bus = "0.3"       # SpiDevice (ExclusiveDevice) nad esp-hal
+embedded-hal-bus = "0.3"       # SpiDevice (ExclusiveDevice) on top of esp-hal
 
-# Slint (no_std MCU): renderer software RGB565, bez wątków (single-core)
+# Slint (no_std MCU): software RGB565 renderer – no threads (single-core)
 slint = { version = "1.18", default-features = false, features = [
     "compat-1-2",
     "unsafe-single-threaded",
@@ -27,12 +27,12 @@ slint = { version = "1.18", default-features = false, features = [
     "renderer-software",
 ] }
 
-# Heap w wewnętrznym RAM (ADV bez PSRAM!) — wymagany przez Slint (alloc)
+# Heap in internal SRAM (the ADV has no PSRAM!) — required by Slint (alloc)
 esp-alloc = { version = "0.11", features = ["esp32s3"] }
-esp-rom-sys = "0.1"             # symbole ROM (libc-ish) — prophylaktycznie
+esp-rom-sys = "0.1"             # ROM symbols (libc-ish) — kept defensively
 
 [build-dependencies]
-# Kompilator .slint -> Rust; fonty pakujemy z ui/fonts do obrazu
+# .slint -> Rust compiler; fonts are packed from ui/fonts into the image
 slint-build = "1.18"
 
 [profile.dev]

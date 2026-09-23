@@ -1,28 +1,27 @@
-// ratputer.slint — RATPUTER dla M5Stack Cardputer ADV (240×135 px), no_std.
-// UI w konwencji pixel-art: font Press Start 2P (OFL, rozmiary 8/12 px —
-// krancie się zaokrąglają do pełnych pikseli 8×8, więc wszystko ostra).
+// ratputer.slint — RATPUTER for M5Stack Cardputer ADV (240×135 px), no_std.
+// Pixel-art style UI: Press Start 2P font (OFL), sizes 8/12 px — snapping to
+// the full 8x8 grid keeps everything crisp.
 
 import "fonts/PressStart2P-Regular.ttf";
 
 export component MainWindow inherits Window {
     default-font-family: "Press Start 2P";
 
-    // --- firmware steruje tymi własnościami ---
+    // --- properties driven by the firmware ---
     in property <bool> splash-done: false;
     in-out property <int> frame-index: 0;
 
-    // --- stan widoku mainscreen (0 = MENU, 1 = SZCZUR, 2 = O PROJEKCIE) ---
+    // --- mainscreen view state (0 = MENU, 1 = RAT VIEW, 2 = ABOUT) ---
     in-out property <int> view-state: 0;
     in-out property <int> menu-index: 0;
 
-    // Press Start 2P nie ma glifów poza podstawowym ASCII + wybranymi —
-    // etykiety trzymamy stricte ASCII (bez polskich znaków).
+    // Press Start 2P has no glyphs outside basic ASCII — labels stay strict ASCII.
     property <[string]> menu-labels: ["PODGLAD SZCZURA", "O PROJEKCIE"];
 
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
 
-    // Klatki pixel-art (pakowane do obrazu przez embed_resources)
+    // Pixel-art frames (packed into the image by embed_resources)
     property <[image]> frames: [
         @image-url("images/rat0.png"),
         @image-url("images/rat1.png"),
@@ -30,7 +29,7 @@ export component MainWindow inherits Window {
         @image-url("images/rat3.png"),
     ];
 
-    // Klawiatura — wywoływane z firmware'u (nazwy: "tab" | "enter" | "back" | "space"
+    // Keyboard — invoked from the firmware (nazwy: "tab" | "enter" | "back" | "space"
     //   | "up" | "down" | "left" | "right")
     callback key-pressed(string);
     key-pressed(key) => {
@@ -40,7 +39,7 @@ export component MainWindow inherits Window {
             if (root.view-state == 0) {
                 root.view-state = root.menu-index == 0 ? 1 : 2;
             } else {
-                root.view-state = 0;    // select/enter w widoku = wyjście
+                root.view-state = 0;    // select/enter inside a view = exit
             }
         } else if (key == "tab" || key == "down" || key == "right") {
             if (root.view-state == 0) {

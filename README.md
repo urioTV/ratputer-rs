@@ -1,161 +1,166 @@
-# Ratputer RS — Cardputer ADV Firmware w Rust
+# Ratputer RS — Cardputer ADV firmware in Rust
 
-Firmware dla **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) napisany w Rust.
-Demo: animowany ASCII Szczur na ekranie ST7789V2 (240×135) — w pełnym **UI Slint** 🐀
+Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
+Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
+a nav-menu UI, full keyboard support, everything in **Slint (no_std)**. 🐀
 
 ## Stack
 
-| Warstwa | Wybór |
+| Layer | Choice |
 |---|---|
 | Chip | ESP32-S3 (Xtensa LX7) → target `xtensa-esp32s3-none-elf` |
 | Framework | `esp-hal` 1.2 (no_std, bare-metal, safe API) |
 | UI | **Slint 1.18** (`renderer-software`, `unsafe-single-threaded`, `libm`) |
-| Pamięć | `esp-alloc` 0.11 — heap 150 KB w **RAM wewnętrznym** (ADV nie ma PSRAM!) |
-| Ekran | renderer software Slint → `LineBufferProvider` po liniach → SPI, `mipidsi` 0.9 (ST7789) |
-| Fonty | **Press Start 2P** (OFL, pixel-style 8px) — `import "fonts/PressStart2P-Regular.ttf"` |
-> Poprzednio: DejaVu Sans/Mono (słaba czytelność przy 6–8 px); teraz font pixelowy
-| Toolchain | fork Rusta **"esp"** (instaluje `espup`) |
+| Memory | `esp-alloc` 0.11 — 150 KB heap in **internal SRAM** (the ADV has no PSRAM!) |
+| Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
+| Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
+| Toolchain | **"esp"** Rust fork (installed once via `espup`) |
 
-## UI Slint: struktura
+> Previous font picks were DejaVu Sans/Mono — weak readability at 6–8 px; the pixel font fits the art natively.
 
-- `build.rs` kompiluje `ui/ratputer.slint` z embedowaniem zasobów
-  (`EmbedForSoftwareRenderer`) — fonty i obrazki pakowane są do flashu;
-- szablon definiuje **dwa nadrzędne ekrany** sterowane własnością **splash-done**
-  (Slint `states` z `animate opacity { duration: 600ms; easing }`) oraz
-  **trzy widoki mainscreen** (`in-out property <int> view-state`: 0=menu,
-  1=podgląd szczura, 2=o projekcie) + callback **`key-pressed(string)`**:
-  - **splash** — animowany pixel-art szczur (`ui/images/rat0..3.png` skalowane ×4
-    = 128×80 px; klatki: bob / krok / mrugnięcie / ogon w górę) + nagłówek
-    `RATPUTER · BOOTING` + stopka `MODE STALKING/SNIFFING/HUNTING/LOITERING`
-    z spinnerem;
-  - **menu** — zaznaczenie pozycji *(menu-index)* na zielonawym tle;
-    obsługuje klawiaturę: **↑↓ / ←→** = wybór (działa też **Tab**),
-    **Enter/Spacja** = wejście, **Backspace** = powrót;
-  - **widok szczura** (`view-state == 1`) — ten sam animowany pixel-art co splash
-    (klatka nadal jest cyklowana przez firmware, dopóki widok jest aktywny);
-  - **widok o projekcie** (`view-state == 2`) — technikalia;
-- firmware (`src/main.rs`) multipleksuje FIFO klawiatury TCA8418 → czytelne nazwy
-  (`"tab" | "enter" | "back" | "space"`), a logikę nawigacji wykonuje callback w .slint —
-  zmiana stanu (`set_splash_done`, `view-state`, `menu-index`) to jedna linijka Rust;
-- firmware w głównej pętli: `update_timers_and_animations()` →
-  `draw_if_needed(render_by_line)` → co **250 ms** `ui.set_frame_index(i)` (w splashu
-  **i w widoku szczura**), po `SPLASH_AFTER_MS` → `ui.set_splash_done(true)`;
+## UI Slint: structure
 
-### Klawiatura — TCA8418RTWR przez I2C0
+- `build.rs` compiles `ui/ratputer.slint` with `EmbedForSoftwareRenderer`: font
+  files and images land in flash;
+- The template defines **two top-level screens** driven by the `splash-done` property
+  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus **three
+  mainscreen views** (`in-out property <int> view-state`: 0=menu, 1=rat view,
+  2=about) and a **`key-pressed(string)`** callback:
+  - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
+    128×80 px; frames: bob / step / blink / tail-up) + header `RATPUTER · BOOTING`
+    + footer `MODE STALKING/SNIFFING/HUNTING/LOITERING` with a spinner;
+  - **menu** — item highlight (*menu-index*) on a greenish strip; keyboard:
+    **↑↓ / ←→** = choose (Tab also works), **Enter/Space** = enter,
+    **Backspace** = back;
+  - **rat view** (`view-state == 1`) — the same animated pixel-art as the splash
+    (frames keep cycling while the view is active);
+  - **about view** (`view-state == 2`) — technical info;
+- The firmware (`src/main.rs`) polls the TCA8418 FIFO and sends readable key names
+  (`"tab" | "enter" | "back" | "space" | "up" | "down" | "left" | "right"`); the nav
+  logic lives entirely in the .slint callback, so a state change is a one-liner from
+  Rust (`set_splash_done`, `view-state`, `menu-index`);
+- Main loop: `update_timers_and_animations()` → `draw_if_needed(render_by_line)` →
+  every **250 ms** `ui.set_frame_index(i)` (in the splash **and** in the rat view),
+  after `SPLASH_AFTER_MS` → `ui.set_splash_done(true)`;
 
-`src/keyboard.rs` — zdejmuje zdarzenia z FIFO (rejestr KEY_EVENT_A=0x04,
-blok EVENTA=LCK i EVENT COUNT=0x03), dekoduje bit7 jako „wciśnięty” i mapuje
-1-based kod TCA8418 na indeks macierzy 7×8 używanej w ADV (Tab=1,
-Backspace=52, Enter=54, Spacja=55, **strzałki ←=43 / ↑=46 / ↓=47 / →=51**
-  — ADV ma fizyczne strzałki; ich fn-warstwa to `,` `;` `.` `/`). Metodologia i rejestry są spójne z
-przykładowym crate'em `cardputer` 0.2 (cardputer-adv).
+### Keyboard — TCA8418RTWR via I2C0
 
-### Pamięć (ADV nie ma PSRAM!)
+`src/keyboard.rs` — pops events from the FIFO (read event count from
+`KEY_LCK_EC`=0x03, pop with `KEY_EVENT_A`=0x04), decodes bit7 as "pressed" and maps
+the 1-based TCA8418 code to the 7×8 matrix index used by the ADV (Tab=1,
+Backspace=52, Enter=54, Space=55, **arrows ←=43 / ↑=46 / ↓=47 / →=51**; the Fn layer
+that turns those into `,` `;` `.` `/` is software-level and not used here). Register
+set and sequence follow the `cardputer` 0.2 crate (cardputer-adv).
 
-- Heap 150 KB w **RAM wewnętrznym** (`esp_alloc::heap_allocator!(size: 150*1024);`
-  wywołać w main PRZED pierwszym Box/Rc); reszta pamięci jest w `.bss`/stack;
-- Framebuffer *nie* jest potrzebny trwały — Slint w trybie `ReusedBuffer`
-  przechowuje tylko **jedną linię** (240 Rgb565 = 480 B) i wypycha ją w SPI
-  przez `LineBufferProvider` → `mipidsi::Display::set_pixels(...)`.
-- Fonty i obrazki pakowane do flashu przez `build.rs` (embed resources);
-- poprzednia wersja: 4 klatki ASCII-artu (Gio, z fontem mono) — w historii git.
+### Memory (ADV has no PSRAM!)
 
-## Konfiguracja (raz)
+- Heap 150 KB in **internal SRAM** (`esp_alloc::heap_allocator!(size: 150*1024);`
+  **called inside `main()` before any Box/Rc**); rest of the memory is `.bss`/stack;
+- No persistent framebuffer — Slint in `ReusedBuffer` mode only holds **one raster
+  line** (240 Rgb565 ≈ 480 B) and pushes it via `LineBufferProvider` →
+  `mipidsi::Display::set_pixels(...)`;
+- Fonts and images are packaged into flash by `build.rs` (embed resources);
+- Previous version: 4 ASCII-art frames (by Gio) — in git history.
 
-Nix devshell dostarcza `rustup`, `espup`, `espflash` i podpina `export-esp.sh`
-(ścieżki do forkowanego GCC Xtensa).
+## Setup (once)
 
-Toolchain Xtensa instaluje się raz globalnie (fork nie jest dostępny w nixpkgs):
+The Nix devshell provides `rustup`, `espup`, `espflash` and sources `export-esp.sh`
+(paths to the forked Xtensa GCC).
+
+The Xtensa toolchain is installed once, globally (the fork is not in nixpkgs):
 
 ```bash
 nix develop
-espup install          # ~1.2 GB do ~/.rustup/toolchains/esp
+espup install          # ~1.2 GB into ~/.rustup/toolchains/esp
 ```
 
-> **NixOS:** forkowany rustc z espup potrzebuje dynamicznego linkera —
-> `programs.nix-ld.enable = true;` w konfiguracji NixOS (na tym hoście już włączone).
+> **NixOS:** the espup-forked rustc needs a dynamic linker — add
+> `programs.nix-ld.enable = true;` to your NixOS config (already enabled on
+> the original dev host).
 
-> Build jest zweryfikowany: `cargo build --release` przechodzi
-> (ELF w `target/xtensa-esp32s3-none-elf/release/`; obraz aplikacji ~467 KB —
-> głównie renderer software Slint + spakowane fonty).
+> The build is verified: `cargo build --release` passes
+> (ELF in `target/xtensa-esp32s3-none-elf/release/`; app image ~467 KB —
+  mostly the Slint software renderer + the bundled font).
 
-## Build i flash
+## Build & flash
 
-### Łatwy flash: merged .bin (jedno polecenie)
+### Simplest: merged .bin (one command)
 
 ```bash
 nix develop
 ./build-bin.sh                      # build + merged ratputer-adv.bin (~520 KB)
 ```
 
-Obraz zawiera wszystko: bootloader @0x0 + tabelę partycji @0x8000 + aplikację @0x10000.
-Nagłówek wg spec modułu M5Stack StampS3A: **8 MB, QIO, 80 MHz** (zweryfikowane bajtami nagłówka).
+The image contains everything: bootloader @0x0 + partition table @0x8000 + app @0x10000.
+Header per the M5Stack StampS3A module spec: **8 MB, QIO, 80 MHz** (verified byte-wise).
 
 ```bash
 espflash write-bin 0x0 ratputer-adv.bin --verify
-# albo esptool:
+# or esptool:
 esptool --chip esp32s3 write_flash 0x0 ratputer-adv.bin
 ```
 
-### Flashowanie w pętli dev (z monitorem UART)
+### Dev-loop flash (with UART monitor)
 
 ```bash
 nix develop
-cargo run --release     # flash + podgląd UART (espflash monitor)
+cargo run --release     # flash + UART monitor (espflash monitor)
 ```
 
-Urządzenie wykrywa espflash automatycznie po kablu USB-C.
-W trybie download (jeśli port nie pojawia się): wciśnij G0 + podłącz USB.
+espflash auto-detects the device over USB-C.
+Download mode (if the port doesn't appear): hold G0 while connecting USB.
 
-## Piny LCD (Cardputer ADV, wg pin mapy M5Stack ST7789V2)
-| GPIO | Funkcja |
+## LCD pins (Cardputer ADV, per the M5Stack ST7789V2 pin map)
+
+| GPIO | Function |
 |---|---|
 | G36 | SPI SCK |
 | G35 | SPI MOSI (DAT) |
-
-Szyna LCD działa na **40 MHz** — tyle używa referencyjna implementacja espp dla tej płytki
-(`lcd_clock_speed = 40 * 1000 * 1000`). Przy 80 MHz obraz się „rozjeżdżał": piny LCD
-(G33–G38) nie są natywnymi pinami IOMUX SPI2 na ESP32-S3 (sygnał idzie przez macierz
-GPIO), więc przy 80 MHz czasy setup ST7789 są naruszane — korupcja danych daje
-rozsypany/rozciągany obraz, różny w każdej klatce.
 | G37 | CS |
 | G34 | RS / DC |
 | G33 | RST |
 | G38 | Backlight |
 
-Jeśli obraz jest **odwrócony w poziomie/pionie** (ale wypełnia ekran) — zmień
-`Rotation::Deg90` na `Rotation::Deg270` w `src/main.rs`. Gdyby obraz był
-**przesunięty ucięty**, sprawdź czy `display_size` i `display_offset` są podane
-w natywnej orientacji panelu (patrz niżej).
+The LCD bus runs at **40 MHz** — the reference espp implementation for this board
+(`lcd_clock_speed = 40 * 1000 * 1000`). At 80 MHz the picture gets "scrambled": the
+LCD pins (G33–G38) are not native IOMUX SPI2 pins on the ESP32-S3 (signals route
+through the GPIO matrix), so ST7789 setup times are violated — data corruption shows
+as a smeared/stretched image, different per frame.
 
-### Geometria panelu (dlaczego takie wartości)
+If the image is **flipped horizontally/vertically** (but fills the screen) — change
+`Rotation::Deg90` to `Rotation::Deg270` in `src/main.rs`. If it were
+**offset/clipped**, check `display_size`/`display_offset` are given in the panel's
+native orientation (below).
 
-Panel to 1.14" ST7789V2 135x240 (natywnie portrait), a kontroler ma GRAM 240x320.
-Panel jest w nim **wyśrodkowany**:
+### Panel geometry (why these numbers)
 
-| Oś | Zakres w GRAM | Offset |
+The panel is a 1.14" ST7789V2 135×240 (native portrait), while the controller has
+a 240×320 GRAM. The panel window is **centered** in it:
+
+| Axis | GRAM range | Offset |
 |---|---|---|
 | 135 px → GRAM x | 52..186 | `(240-135)/2 = 52` |
 | 240 px → GRAM y | 40..279 | `(320-240)/2 = 40` |
 
-Dlatego (i bo `Builder::new` w mipidsi ≥0.8 wymaga ręcznych rozmiarów):
-`display_size(135, 240)` w **natywnej** orientacji + `display_offset(52, 40)`.
-Rotację do landscape (240x135) wykonuje MADCTL — mipidsi sam przelicza offset
-(dla `Deg90` daje to natywne `(40, 53)`, co odpowiada wariantowi `st7789_pico1`
-z mipidsi 0.7 dla tego samego panelu).
+Hence (and because `Builder::new` in mipidsi ≥0.8 requires explicit sizes):
+`display_size(135, 240)` in the **native** orientation + `display_offset(52, 40)`.
+The landscape (240×135) rotation is done by MADCTL — mipidsi transforms the offset
+itself (for `Deg90` it produces native `(40, 53)`, matching the `st7789_pico1`
+variant from mipidsi 0.7 for the same panel).
 
-## Klawiatura (na później)
+## Keyboard (details)
 
-Cardputer ADV ma klawiaturę na kontrolerze **TCA8418** przez I²C (G8=SDA, G9=SCL, G4=INT).
-Gotowy driver: crate `cardputer-adv-keyboard` (embedded-hal 1.0, kompatybilny z esp-hal).
+Cardputer ADV's keyboard hangs off a **TCA8418** over I²C (G8=SDA, G9=SCL, G11=INT —
+not used; we poll the FIFO). Reference driver: `cardputer` crate 0.2 (`src/adv/keyboard.rs`),
+also `cardputer-adv-keyboard` (LarsBollmann) — embedded-hal 1.0 compatible.
 
-## Zasoby
+## Resources
 
 - [esp-hal docs — ESP32-S3](https://docs.espressif.com/projects/rust/esp-hal/latest/esp32s3/esp_hal/)
 - [Rust on ESP Book](https://docs.espressif.com/projects/rust/book/)
 - [Cardputer ADV — M5 docs](https://docs.m5stack.com/en/core/Cardputer-Adv)
 - [espflash CLI](https://github.com/esp-rs/espflash)
 
-## Licencja
+## License
 
 MIT OR Apache-2.0

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Buduje firmware i generuje merged .bin (bootloader @0x0 + tabela partycji @0x8000 + app @0x10000).
-# Nagłówek obrazu wg spec modułu M5Stack StampS3A (ESP32-S3FN8):
-#   flash: 8 MB, QIO, 80 MHz  (źródło: platformio board m5stack-stamps3.json)
+# Builds the firmware and produces a merged .bin (bootloader @0x0 + partition table @0x8000 + app @0x10000).
+# Image header per the M5Stack StampS3A module spec (ESP32-S3FN8):
+#   flash: 8 MB, QIO, 80 MHz  (source: platformio board m5stack-stamps3.json)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,7 +19,7 @@ espflash save-image \
 
 ls -lh ratputer-adv.bin
 echo ""
-echo "Flash (jedno polecenie, obraz jest merged od 0x0):"
+echo "Flash (one command; the image is merged from 0x0):"
 echo "  espflash write-bin 0x0 ratputer-adv.bin --verify"
-echo "  # albo esptool:"
+echo "  # or esptool:"
 echo "  esptool --chip esp32s3 write_flash 0x0 ratputer-adv.bin"
