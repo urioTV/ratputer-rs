@@ -1,5 +1,25 @@
 {
   "nodes": {
+    "esp-rs-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788126714,
+        "narHash": "sha256-6ag7OxjQZ1ZYyl23O6sXyWTU1gOkj1MawAyjLqOAS74=",
+        "owner": "leighleighleigh",
+        "repo": "esp-rs-nix",
+        "rev": "b159fc2e7e70854d2c8ccfd48d07564df59681f6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "leighleighleigh",
+        "repo": "esp-rs-nix",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +56,7 @@
     },
     "root": {
       "inputs": {
+        "esp-rs-nix": "esp-rs-nix",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }

@@ -1,5 +1,5 @@
 [toolchain]
-# Channel "esp" instaluje `espup install` (fork Rust ze wsparciem Xtensa)
+# The Nix devshell overrides this channel with its pinned Xtensa toolchain path.
 channel = "esp"
 profile = "minimal"
 components = ["rust-src", "rustfmt"]

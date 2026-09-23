@@ -4,47 +4,86 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    esp-rs-nix = {
+      url = "github:leighleighleigh/esp-rs-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = nixpkgs.legacyPackages.${system}; in
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      esp-rs-nix,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        # Pin exact compiler versions instead of inheriting the community
+        # flake's moving defaults.
+        espToolchain = esp-rs-nix.packages.${system}.esp-rs.override {
+          rustc-version = "1.98.0.0";
+          crosstool-version = "16.1.0_20260609";
+        };
+        buildCommand = pkgs.writeShellApplication {
+          name = "build";
+          runtimeInputs = [
+            pkgs.git
+            espToolchain
+            pkgs.espflash
+          ];
+          text = ''
+            project_root="$(git rev-parse --show-toplevel)"
+            cd "$project_root"
+            cargo xtask build
+          '';
+        };
+        flashCommand = pkgs.writeShellApplication {
+          name = "flash";
+          runtimeInputs = [
+            pkgs.git
+            espToolchain
+            pkgs.espflash
+          ];
+          text = ''
+            project_root="$(git rev-parse --show-toplevel)"
+            cd "$project_root"
+            cargo xtask build
+            exec espflash write-bin 0x0 ratputer-adv.bin
+          '';
+        };
+      in
       {
         devShells.default = pkgs.mkShell {
           name = "ratputer-rs-devshell";
 
           packages = with pkgs; [
-            # rustup manages the toolchain directly in $HOME.
-            # ESP32-S3 is Xtensa — it needs the forked Rust toolchain ("esp"),
-            # not available from nixpkgs/oxalica-overlay.
+            # Keep the compiler and target-specific linker binaries on PATH;
+            # rustup still provides the standard proxy behavior for Cargo.
+            espToolchain
             rustup
-            espup
             espflash
+            buildCommand
+            flashCommand
           ];
+
+          # The Xtensa Rust fork, rust-src, LLVM, and GCC are supplied by Nix.
+          # This takes precedence over the "esp" channel in rust-toolchain.toml.
+          RUSTUP_TOOLCHAIN = "${espToolchain}";
 
           shellHook = ''
             echo ""
             echo "=== ratputer-rs — Cardputer ADV (ESP32-S3) ==="
             echo ""
 
-            # rustup shims (cargo/rustc) first in PATH
-            export PATH="$HOME/.cargo/bin:$PATH"
-            # GCC linker/toolchain for Xtensa (installed by espup)
-            [ -f "$HOME/export-esp.sh" ] && source "$HOME/export-esp.sh"
-
-            if ! rustup toolchain list 2>/dev/null | grep -q '^esp'; then
-              echo "⚠️  Missing the 'esp' toolchain (Xtensa fork). Install once:"
-              echo "     espup install"
-              echo ""
-              echo "   Note (NixOS): the espup-forked rustc needs a dynamic linker."
-              echo "   Enable it in your NixOS config:"
-              echo "     programs.nix-ld.enable = true;"
-            fi
-
-            echo "Build:   cargo build --release"
-            echo "Flash:   cargo run --release   (espflash + monitor)"
+            echo "Toolchain: $(rustc --version)"
+            echo "Build:     build (merged and verified image)"
+            echo "Flash:     flash (build, flash, and verify)"
             echo ""
           '';
         };
-      });
+      }
+    );
 }
