@@ -31,6 +31,9 @@ use esp_hal::time::{Duration, Instant, Rate};
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 
+mod battery;
+mod clock;
+mod net;
 mod storage;
 mod wifi;
 
@@ -61,6 +64,12 @@ const FRAME_MS: u64 = 250;
 // After this delay the splash screen transitions to the firmware UI
 // (600 ms crossfade declared in .slint states).
 const SPLASH_AFTER_MS: u64 = 3500;
+// Top bar refresh: battery sampling period and SNTP resync / retry intervals.
+const BATTERY_EVERY_MS: u64 = 5000;
+const SNTP_RESYNC_SECS: u64 = 3600;
+const SNTP_RETRY_SECS: u64 = 30;
+// Glyph budget of the top-bar SSID field (120 px / 8 px per glyph).
+const TOP_BAR_SSID_CHARS: usize = 15;
 
 // ---------------------------------------------------------------------------
 // Slint backend for esp-hal (single core, no scheduler)
@@ -167,8 +176,12 @@ fn scan_network_model(networks: &[wifi::ScanNetwork]) -> ModelRc<SharedString> {
 }
 
 fn display_ssid(ssid: &str) -> String {
-    ssid.chars()
-        .take(18)
+    truncate_ascii(ssid, 18)
+}
+
+fn truncate_ascii(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
         .map(|character| if character.is_ascii() { character } else { '?' })
         .collect()
 }
@@ -316,13 +329,21 @@ fn main() -> ! {
     // esp-radio relies on esp-rtos for its internal Wi-Fi tasks and timers.
     let timer_group = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timer_group.timer0, peripherals.FROM_CPU_INTR0);
-    let mut wifi = match wifi::WifiManager::new(peripherals.WIFI) {
-        Ok(manager) => Some(manager),
+    let (mut wifi, mut network) = match wifi::WifiManager::new(peripherals.WIFI) {
+        Ok((manager, interface)) => {
+            // The hardware RNG is a true entropy source while the radio is running.
+            let rng = esp_hal::rng::Rng::new();
+            let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
+            (Some(manager), Some(net::Network::new(interface, seed)))
+        }
         Err(error) => {
             log::error!("Unable to initialize Wi-Fi: {error:?}");
-            None
+            (None, None)
         }
     };
+
+    // --- Battery gauge: GPIO10 / ADC1_CH9, 2:1 divider ---
+    let mut battery = battery::Battery::new(peripherals.ADC1, peripherals.GPIO10);
     let mut scan_networks: Vec<wifi::ScanNetwork> = Vec::new();
 
     // --- Slint: minimal software window + platform ---
@@ -364,6 +385,14 @@ fn main() -> ! {
     let splash_start = Instant::now();
     let mut last_switch = splash_start;
     let mut radio_pending: Option<RadioStep> = None;
+
+    // Top-bar state; `shown_*` caches avoid re-setting unchanged properties.
+    let mut wall_clock = clock::WallClock::default();
+    let mut next_sntp_at = splash_start;
+    let mut link_was_up = false;
+    let mut shown_clock: Option<Option<(u8, u8)>> = None;
+    let mut shown_link_state = -1;
+    let mut last_battery_at: Option<Instant> = None;
     loop {
         slint::platform::update_timers_and_animations();
 
@@ -466,6 +495,7 @@ fn main() -> ! {
                     match wifi.as_mut().map(|manager| manager.connect_attempt()) {
                         Some(Ok(())) => {
                             let ssid = network.ssid.clone();
+                            ui.set_link_ssid(truncate_ascii(&ssid, TOP_BAR_SSID_CHARS).into());
                             wifi_config.upsert(network);
                             ui.set_saved_networks(saved_network_model(&wifi_config));
                             if storage::save(&storage, &wifi_config).is_err() {
@@ -587,6 +617,70 @@ fn main() -> ! {
                 }
                 _ => {}
             }
+        }
+
+        // --- Network: DHCP/DNS/SNTP advance without blocking (one poll per iteration) ---
+        if let Some(network) = network.as_mut() {
+            if let Some(result) = network.poll() {
+                let finished = Instant::now();
+                match result {
+                    Ok(unix_seconds) => {
+                        log::info!("SNTP sync: {unix_seconds}");
+                        wall_clock.set(unix_seconds, finished);
+                        next_sntp_at = finished + Duration::from_secs(SNTP_RESYNC_SECS);
+                    }
+                    Err(error) => {
+                        log::warn!("SNTP sync failed: {error:?}");
+                        next_sntp_at = finished + Duration::from_secs(SNTP_RETRY_SECS);
+                    }
+                }
+            }
+
+            let link_up = network.is_link_up();
+            if link_up && !link_was_up {
+                // Fresh association: sync as soon as DHCP completes.
+                next_sntp_at = now;
+            } else if !link_up && link_was_up && radio_pending.is_none() {
+                // The clock keeps running from the last sync; only the status changes.
+                ui.set_wifi_status("CONNECTION LOST".into());
+            }
+            link_was_up = link_up;
+
+            if network.is_online() && !network.sntp_running() && now >= next_sntp_at {
+                network.start_sntp(wifi_config.clock.ntp_server.clone());
+            }
+        }
+
+        // --- Top bar: Wi-Fi link, clock, battery ---
+        let link_state = match (&radio_pending, network.as_ref()) {
+            (Some(RadioStep::Connect { .. }), _) => 1,
+            (_, Some(network)) if network.is_online() => 3,
+            (_, Some(network)) if network.is_link_up() => 2,
+            _ => 0,
+        };
+        if link_state != shown_link_state {
+            ui.set_link_state(link_state);
+            shown_link_state = link_state;
+        }
+
+        let clock_hh_mm = wall_clock
+            .unix_now()
+            .map(|unix_seconds| clock::local_hh_mm(unix_seconds, &wifi_config.clock));
+        if shown_clock != Some(clock_hh_mm) {
+            let text = match clock_hh_mm {
+                Some((hours, minutes)) => format!("{hours:02}:{minutes:02}"),
+                None => String::from("--:--"),
+            };
+            ui.set_clock_text(text.into());
+            ui.set_clock_synced(wall_clock.is_synced());
+            shown_clock = Some(clock_hh_mm);
+        }
+
+        if last_battery_at
+            .is_none_or(|at| now - at >= Duration::from_millis(BATTERY_EVERY_MS))
+        {
+            ui.set_battery_percent(i32::from(battery.sample_percent()));
+            last_battery_at = Some(now);
         }
 
         // Frame ticker: splash and rat view animate the rat; while the radio is busy

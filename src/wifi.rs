@@ -25,7 +25,6 @@ pub struct ScanNetwork {
 
 pub struct WifiManager<'d> {
     controller: WifiController<'d>,
-    _interface: Interface,
 }
 
 #[derive(Debug)]
@@ -48,13 +47,12 @@ impl From<ConnectionError> for ConnectError {
 }
 
 impl<'d> WifiManager<'d> {
-    pub fn new(device: esp_hal::peripherals::WIFI<'d>) -> Result<Self, WifiError> {
+    /// Returns the controller plus the station interface, which the caller hands
+    /// to the IP stack (see `net.rs`).
+    pub fn new(device: esp_hal::peripherals::WIFI<'d>) -> Result<(Self, Interface), WifiError> {
         let controller = WifiController::new(device, Default::default())?;
         let interface = Interface::station();
-        Ok(Self {
-            controller,
-            _interface: interface,
-        })
+        Ok((Self { controller }, interface))
     }
 
     /// A single scan pass. The caller repeats and merges passes so the UI can show

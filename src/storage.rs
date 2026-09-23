@@ -29,9 +29,51 @@ pub struct SavedNetwork {
     pub auth: AuthKind,
 }
 
+/// Daylight-saving rule applied on top of the fixed UTC offset.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DstRule {
+    None,
+    /// EU rule: +1 h from the last Sunday of March to the last Sunday of October (01:00 UTC).
+    #[default]
+    Eu,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClockConfig {
+    #[serde(default = "default_utc_offset_minutes")]
+    pub utc_offset_minutes: i16,
+    #[serde(default)]
+    pub dst: DstRule,
+    #[serde(default = "default_ntp_server")]
+    pub ntp_server: String,
+}
+
+// Defaults match Central European Time (CET/CEST).
+fn default_utc_offset_minutes() -> i16 {
+    60
+}
+
+fn default_ntp_server() -> String {
+    String::from("pool.ntp.org")
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self {
+            utc_offset_minutes: default_utc_offset_minutes(),
+            dst: DstRule::default(),
+            ntp_server: default_ntp_server(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WifiConfig {
     pub version: u8,
+    // Kept before `networks`: TOML needs plain tables ahead of arrays of tables.
+    #[serde(default)]
+    pub clock: ClockConfig,
     #[serde(default)]
     pub networks: Vec<SavedNetwork>,
 }
@@ -40,6 +82,7 @@ impl Default for WifiConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            clock: ClockConfig::default(),
             networks: Vec::new(),
         }
     }
@@ -78,6 +121,13 @@ impl WifiConfig {
             !entry.ssid.is_empty() && entry.ssid.len() <= 32 && entry.password.len() <= 64
         });
         self.networks.truncate(MAX_SAVED_NETWORKS);
+        // Real-world offsets span UTC-12:00..UTC+14:00.
+        if !(-720..=840).contains(&self.clock.utc_offset_minutes) {
+            self.clock.utc_offset_minutes = default_utc_offset_minutes();
+        }
+        if self.clock.ntp_server.is_empty() || self.clock.ntp_server.len() > 64 {
+            self.clock.ntp_server = default_ntp_server();
+        }
         Ok(self)
     }
 }

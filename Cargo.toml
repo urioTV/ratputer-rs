@@ -20,8 +20,14 @@ log = "0.4"
 
 # Wi-Fi radio and its bare-metal scheduler
 esp-radio = { version = "1.0.0-beta.1", features = ["esp32s3", "wifi", "log-04"] }
-esp-rtos = { version = "0.4", features = ["esp32s3", "esp-radio", "esp-alloc"] }
+# `embassy`: esp-rtos provides the embassy-time driver used by embassy-net timers
+esp-rtos = { version = "0.4", features = ["esp32s3", "esp-radio", "esp-alloc", "embassy"] }
 embassy-futures = "0.1"
+
+# IPv4 stack over the Wi-Fi station interface: DHCP + DNS + UDP (SNTP clock sync)
+embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "log"] }
+embassy-time = "0.5"
+nb = "1"                        # non-blocking ADC reads (esp-hal oneshot API)
 
 # SD-card credential storage and TOML serialization (all no_std + alloc)
 embedded-sdmmc = { version = "0.10", default-features = false, features = ["log"] }
