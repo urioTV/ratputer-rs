@@ -19,6 +19,7 @@ credentials, everything in **Slint (no_std)**. 🐀
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
+| Network | `embassy-net` 0.8 (DHCP + DNS + UDP) over the esp-radio station interface — SNTP clock sync |
 
 > Previous font picks were DejaVu Sans/Mono — weak readability at 6–8 px; the pixel font fits the art natively.
 
@@ -26,6 +27,9 @@ credentials, everything in **Slint (no_std)**. 🐀
 
 - `build.rs` compiles `ui/ratputer.slint` with `EmbedForSoftwareRenderer`: font
   files and images land in flash;
+- Every main-screen view sits below a 12 px **top bar**: local time (`HH:MM`,
+  `--:--` until the first NTP sync), Wi-Fi signal bars + SSID (`CONNECTING`/`OFFLINE`),
+  and the battery percentage with a gauge icon (red below 15 %);
 - The template defines **two top-level screens** driven by the `splash-done` property
   (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus seven
   mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
@@ -64,6 +68,11 @@ The SD card must contain a FAT volume. Credentials are stored at
 ```toml
 version = 1
 
+[clock]                       # optional; these are the defaults (CET/CEST)
+utc_offset_minutes = 60
+dst = "eu"                    # "eu" or "none"
+ntp_server = "pool.ntp.org"
+
 [[networks]]
 ssid = "example"
 password = "secret"
@@ -88,6 +97,26 @@ SD wiring uses the ADV's dedicated SPI3 bus:
 
 The bus stays at 400 kHz for standards-compliant card initialization and because
 the credential file is only a few kilobytes.
+
+### Top bar: clock, Wi-Fi, battery
+
+- **Clock** — after a connection gets a DHCP lease, the firmware sends an SNTP
+  request to `clock.ntp_server` (falls back to `time.cloudflare.com` by IP if DNS
+  fails). The result is anchored to the monotonic timer, so the time keeps running
+  from the last sync when Wi-Fi drops or is never reconnected (until reboot — the
+  ADV has no battery-backed RTC). Resync every hour while online, retry every 30 s
+  on failure. Local time = UTC + `utc_offset_minutes` + EU DST (last Sunday of
+  March → last Sunday of October, 01:00 UTC) when `dst = "eu"`.
+- **Wi-Fi** — bars are bright when online (DHCP lease), dim when associated without
+  an IP, sweep while connecting, dark when offline. A dropped link shows
+  `CONNECTION LOST` in the Wi-Fi views.
+- **Battery** — GPIO10 / ADC1_CH9 behind a 100k/100k divider (BAT+/2), read with
+  eFuse curve calibration every 5 s, smoothed, and mapped through a 1S Li-ion
+  discharge curve. While charging, the reading is the charger voltage, so it shows
+  close to 100 %.
+
+The network stack runs without an async executor: its runner and the SNTP job are
+polled once per main-loop iteration, so DHCP/DNS/NTP never block the UI.
 
 ### Scan + connect reliability
 
@@ -202,6 +231,9 @@ variant from mipidsi 0.7 for the same panel).
 6. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
 7. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
 8. Test an incorrect password, an open network, no SD card, and an empty scan.
+9. Top bar: after connecting, the clock switches from `--:--` to local time within a
+   few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
+   the clock keeps counting; compare the battery % against the charge level.
 
 A successful host build verifies compilation and image headers, but radio, antenna,
 SD-card compatibility, and internal-SRAM headroom require this physical test.

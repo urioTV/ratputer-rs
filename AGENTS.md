@@ -27,7 +27,10 @@ the same pitfalls.
 ```
 src/main.rs        esp-hal init, LCD, SD SPI3, esp-rtos, Slint platform, main loop/state
 src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (blocking block_on)
-src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12)
+src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12) + [clock]
+src/net.rs         embassy-net stack (DHCP/DNS/UDP) + one-shot SNTP job, polled without executor
+src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
+src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
 ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 build.rs           slint-build: compiles ui/ratputer.slint, embeds fonts+images
@@ -91,14 +94,21 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   pattern for any new slow operation. While `radio_pending.is_some()`, keyboard input
   is drained and discarded — otherwise queued keys replay after the radio unblocks.
   The same drain-and-ignore guard covers the splash screen.
-- Main-loop order matters: input → scheduled actions/step executor → animation ticker →
-  **draw at the BOTTOM of the iteration**. This makes the `wifi-connecting` spinner
+- Main-loop order matters: input → scheduled actions/step executor → network poll +
+  top-bar refresh → animation ticker → **draw at the BOTTOM of the iteration**. This makes the `wifi-connecting` spinner
   pop-up appear in the same frame as the Enter press, BEFORE the first blocking radio
   call; a step scheduled in iteration N executes at iteration N+1. Do not move the
   draw back to the top, or every connect/scan will look like an input lag.
 - No arrow buttons exist in Slint 1.18 `visible`/`if` alternation used for empty-list
   hints; lists are plain `for item[i] in model` renderers against `VecModel<SharedString>`
   set from Rust via `ModelRc`. SSIDs longer than the screen are truncated to 18 chars.
+- The top bar takes the first 12 px of `mainscreen`; every view lives inside
+  `content` (y = 12 px, 123 px tall). New views go inside `content`, not next to it.
+- Saved/scan lists are **clipped viewports** (`saved-list`/`scan-list`): the row
+  column slides by `first * 10px` and rows outside `first..first+rows` are hidden,
+  otherwise a half row bleeds over the status line. Keep 10 px rows or update `rows`.
+- Press Start 2P has no `…` glyph, so `overflow: elide` is useless — truncate in Rust
+  (`truncate_ascii`) and use `overflow: clip`.
 
 ## Keyboard (TCA8418)
 
@@ -136,6 +146,35 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
 
+## Network, clock, battery (top bar)
+
+- `WifiManager::new` returns `(manager, Interface)`; the station `Interface` implements
+  `embassy-net-driver` 0.2 and is moved into `embassy_net::new` (see `src/net.rs`).
+  Versions must line up: `embassy-net` 0.8 ↔ driver 0.2 ↔ `embassy-time` 0.5 ↔
+  esp-rtos 0.4 (`embassy-time-driver` 0.2).
+- **esp-rtos needs the `embassy` feature**: it registers the embassy-time driver that
+  embassy-net's internal timers (DHCP, DNS, `with_timeout`) rely on. Without it, the
+  link fails with `undefined reference to _embassy_time_now` / `_embassy_time_schedule_wake`.
+- There is still **no executor**: `Network::poll()` polls the stack runner and the
+  SNTP job once per loop with `Waker::noop()`. Never `block_on` network futures —
+  DHCP/DNS take seconds and would freeze the UI. Stack resources and the runner are
+  `Box::leak`ed to get `'static`.
+- Link state comes from esp-radio's `station_state() == Connected` via the driver, so
+  `stack.is_link_up()` detects drops; `is_config_up()` = DHCP lease. Top-bar
+  `link-state`: 0 offline, 1 connecting (a `RadioStep::Connect` is pending),
+  2 associated/no IP, 3 online.
+- SNTP: resolve `clock.ntp_server` (4 s timeout, fallback 162.159.200.1), send a
+  48-byte mode-3 request, accept only a mode-4, non-zero-stratum reply from the same
+  endpoint; overall 8 s timeout. Sync on every fresh association, then hourly;
+  retry after 30 s on failure. `WallClock` = last sync + monotonic elapsed, so time
+  survives a lost link (not a reboot — no RTC battery).
+- Local time: `utc_offset_minutes` + optional EU DST computed in `src/clock.rs`
+  (Hinnant civil-date algorithms, verified host-side against the 2024–2027 switch
+  dates). No chrono/tz database — keep it that way for flash size.
+- Battery: **GPIO10 = ADC1_CH9**, 100k/100k divider. Use ADC1 only — ADC2 is unusable
+  while Wi-Fi runs. `AdcCalCurve<ADC1>` returns millivolts at the pin; multiply by 2.
+  Sampled every 5 s (8 reads + 1/4 exponential smoothing).
+
 ## Flashing
 
 - The merged image must use **DIO flash mode**. A QIO header makes the ESP32-S3 ROM
@@ -158,6 +197,13 @@ Boot mode (when the port is stubborn): hold G0 while plugging USB-C.
   to check art alignment (`/tmp/egtest` pattern).
 - Implement the mipidsi `Interface` trait on a recorder to make sure address windows
   (CASET/RASET/MADCTL) are as expected on real hardware.
+- **Render the real UI on the host** (`/tmp/slintpreview` pattern): a throwaway std
+  binary that compiles `ui/ratputer.slint` with the SAME no_std Slint features as the
+  firmware (`compat-1-2`, `unsafe-single-threaded`, `libm`, `renderer-software` — the
+  `std` feature pulls fontconfig and fails in the Nix shell), a `Platform` with a fake
+  clock (advance it so the splash crossfade finishes), `MinimalSoftwareWindow::render`
+  into a 240×135 `Rgb565Pixel` buffer, then dump PPM → PNG and inspect it. This caught
+  clipped popups and half-visible list rows that the compiler cannot.
 
 ## Commit hygiene
 
