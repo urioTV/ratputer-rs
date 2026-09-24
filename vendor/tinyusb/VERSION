@@ -1,3 +1,0 @@
-TinyUSB release 0.21.0
-Upstream commit: dae3f9a366bfcddbf9dcf1b48d7500286a849539
-Only the device/MSC/DWC2 subset is vendored.

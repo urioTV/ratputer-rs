@@ -28,15 +28,14 @@ the same pitfalls.
 src/main.rs        esp-hal init, LCD, SD SPI3, esp-rtos, Slint platform, main loop/state
 src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (blocking block_on)
 src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12) + [clock]
-src/usbdisk.rs     TinyUSB FFI, exclusive SD sector backend, USB-OTG PHY switching
-src/usb/           bare-metal TinyUSB config + C MSC/descriptors/callback bridge
-vendor/tinyusb/    pinned TinyUSB 0.21.0 device/MSC/DWC2 subset (MIT)
+src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY switching
+src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
 src/net.rs         embassy-net stack (DHCP/DNS/UDP) + one-shot SNTP job, polled without executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
 ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/USB/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
-build.rs           compiles Slint resources and the isolated TinyUSB C library
+build.rs           compiles Slint resources
 xtask/             host helper: builds release, creates and verifies merged binary
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 ```
@@ -152,38 +151,43 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
 
-## USB Mass Storage (TinyUSB C island)
+## USB Mass Storage (pure Rust)
 
 - `esp-hal` 1.2 exposes ESP32-S3 USB-OTG through `embassy-usb-driver`, but
-  `embassy-usb` still has no stable **device-side MSC class**. Do not confuse this
-  with `embassy-usb-host::class::msc` (wrong USB direction). `usbd-storage` targets
-  the incompatible blocking `usb-device::UsbBus` API.
-- The firmware therefore vendors the minimum **TinyUSB 0.21.0** subset: device core,
-  MSC/SCSI class and Synopsys DWC2 device controller. `build.rs` compiles it with
-  `xtensa-esp32s3-elf-gcc`. It does NOT link ESP-IDF or FreeRTOS.
-- `vendor/tinyusb/src/portable/synopsys/dwc2/dwc2_esp32.h` is intentionally replaced
-  by a polling bare-metal port. Its interrupt allocation hooks are no-ops;
-  `UsbDisk::poll()` calls `dcd_int_handler(0)` and `tud_task_ext(0, false)` every main
-  loop. **DWC2 buffer DMA must stay enabled**: slave mode is IRQ-driven and polling
-  it once per firmware loop leaves bulk FIFO service late enough for Windows I/O to
-  time out and block Explorer. Espressif also defaults its current TinyUSB port to
-  DMA. USB buffers are static internal SRAM (the ADV has no cached PSRAM), so S3
-  needs no ESP-IDF cache-maintenance hooks.
+  `embassy-usb` has no **device-side MSC class** (do not confuse with
+  `embassy-usb-host::class::msc`; `usbd-storage` needs the incompatible
+  `usb-device::UsbBus`). `src/msc.rs` is our own BOT + SCSI class: CBW/CSW
+  validation, GET_MAX_LUN / BULK_ONLY_RESET, INQUIRY (+VPD 0/80/83), TEST UNIT
+  READY, REQUEST SENSE, MODE SENSE 6/10, READ CAPACITY 10/16, READ FORMAT
+  CAPACITIES, REPORT LUNS, READ/WRITE/VERIFY 10, START STOP UNIT, PREVENT/ALLOW,
+  SYNCHRONIZE CACHE. Unknown opcodes fail with ILLEGAL REQUEST sense.
+- The device is single-function (class 0, no IADs) so Windows binds `usbstor`
+  directly. `embassy-usb` is built with `max-handler-count-1`/`max-interface-count-1`
+  and without `usbd-hid`.
+- The DWC2 FIFO is serviced by esp-hal's real USB interrupt; there is still no
+  executor. `UsbDisk::poll()` polls the `join(device.run(), msc.run())` future with a
+  waker that sets a static flag, and keeps re-polling while the interrupt reports
+  progress for up to 40 ms per main-loop pass. **Do not go back to one poll per loop
+  with `Waker::noop()`**: every 64-byte bulk packet needs a poll, so Windows I/O
+  would time out and Explorer would hang.
+- The USB task is created once (descriptor/endpoint buffers are leaked `Box`es) and
+  kept across USB DISK sessions; `detach()` only clears the backend and swaps the
+  PHY back. Re-attaching relies on the host's bus reset to resynchronise BOT.
 - USB-OTG and USB-Serial-JTAG share the ESP32-S3 PHY. Delay OTG PHY selection until
   the user opens USB DISK, otherwise espflash monitor disappears at boot. On exit,
   select Serial/JTAG again; the host port re-enumerates. Native pins are fixed:
   D−=GPIO19, D+=GPIO20.
 - The SD card has **exactly one owner**. Entering USB DISK consumes
   `VolumeManager::free()`, boxes the raw `SdCard` at a stable address and registers
-  the sector callbacks. Exit disconnects TinyUSB before clearing that pointer, then
+  the sector backend. Exit switches the PHY away and clears that pointer, then
   reconstructs `VolumeManager` to invalidate its FAT cache and reloads `WIFI.CFG`.
   Never let filesystem methods run while MSC owns the card.
 - Host eject is observed through SCSI START STOP UNIT. Normal exit is rejected while
   the host is mounted. A second EXIT forces disconnect because forced B-valid means
   cable removal cannot always be detected; this is recovery-only and can lose host
   writes. Block writes themselves are synchronous; SYNCHRONIZE CACHE succeeds.
-- Keep TinyUSB's vendored `LICENSE` and `VERSION`. Development descriptors currently
-  use VID:PID `CAFE:4002`; obtain real identifiers before product distribution.
+- Development descriptors use VID:PID `CAFE:4002`; obtain real identifiers before
+  product distribution.
 - USB sector traffic uses the 10 MHz post-init SPI clock. Never construct the card
   at 10 MHz: identification must remain ≤400 kHz, and only `apply_config` after a
   successful `get_card_type()` may raise it. The default-speed SD limit is 25 MHz;

@@ -33,6 +33,7 @@ use esp_println as _;
 
 mod battery;
 mod clock;
+mod msc;
 mod net;
 mod storage;
 mod usbdisk;

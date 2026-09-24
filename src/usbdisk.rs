@@ -1,53 +1,49 @@
 //! USB Mass Storage device backed by the physical SD card.
 //!
-//! TinyUSB owns the USB-OTG controller while this module provides sector I/O
-//! callbacks into an `embedded_sdmmc::BlockDevice`. The backend pointer is only
-//! installed while the FAT filesystem manager is absent, so the host and the
-//! firmware can never access the card concurrently.
+//! The USB transport is entirely Rust: `esp-hal` and `embassy-usb` drive the
+//! ESP32-S3 DWC2 peripheral, while `crate::msc` implements BOT and SCSI. The
+//! backend is installed only while the FAT volume manager is absent, so the
+//! host and firmware can never access the card concurrently.
 
-use core::{ffi::c_void, ptr, slice};
-
-use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
-use esp_hal::usb::otg::Usb;
-
-type CountFn = unsafe fn(*const ()) -> u32;
-type ReadFn = unsafe fn(*const (), u32, u32, *mut u8, u32) -> i32;
-type WriteFn = unsafe fn(*const (), u32, u32, *const u8, u32) -> i32;
-
-#[derive(Clone, Copy)]
-struct Backend {
-    context: *const (),
-    count: CountFn,
-    read: ReadFn,
-    write: WriteFn,
-}
-
-unsafe impl Sync for Backend {}
-
-unsafe fn no_count(_: *const ()) -> u32 {
-    0
-}
-unsafe fn no_read(_: *const (), _: u32, _: u32, _: *mut u8, _: u32) -> i32 {
-    -1
-}
-unsafe fn no_write(_: *const (), _: u32, _: u32, _: *const u8, _: u32) -> i32 {
-    -1
-}
-
-static mut BACKEND: Backend = Backend {
-    context: ptr::null(),
-    count: no_count,
-    read: no_read,
-    write: no_write,
+use alloc::{boxed::Box, rc::Rc};
+use core::{
+    cell::RefCell,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-unsafe extern "C" {
-    fn ratputer_tinyusb_init() -> bool;
-    fn ratputer_tinyusb_poll();
-    fn ratputer_tinyusb_connect();
-    fn ratputer_tinyusb_disconnect();
-    fn ratputer_tinyusb_state() -> u8;
-    fn ratputer_tinyusb_can_disconnect() -> bool;
+use embassy_futures::join::join;
+use embedded_sdmmc::BlockDevice;
+use esp_hal::time::{Duration, Instant};
+use esp_hal::usb::otg::{embassy_usb_device, Usb};
+
+use crate::msc::{MscClass, SharedState};
+
+/// Longest time one `poll()` call may keep driving USB before returning to the UI.
+const POLL_BUDGET: Duration = Duration::from_millis(40);
+
+/// Set by the USB-OTG interrupt (through embassy's wakers) whenever the task
+/// can make progress. There is no executor, so `poll()` spins on this flag.
+static USB_WOKEN: AtomicBool = AtomicBool::new(true);
+
+static WAKER_VTABLE: RawWakerVTable =
+    RawWakerVTable::new(waker_clone, waker_wake, waker_wake, waker_drop);
+
+fn waker_clone(_: *const ()) -> RawWaker {
+    RawWaker::new(core::ptr::null(), &WAKER_VTABLE)
+}
+
+fn waker_wake(_: *const ()) {
+    USB_WOKEN.store(true, Ordering::Release);
+}
+
+fn waker_drop(_: *const ()) {}
+
+fn flag_waker() -> Waker {
+    // SAFETY: the vtable ignores the data pointer and only touches a static flag.
+    unsafe { Waker::from_raw(waker_clone(core::ptr::null())) }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,10 +54,13 @@ pub enum UsbDiskState {
     Ejected,
 }
 
-/// Owns USB_FS and keeps esp-hal's peripheral clock guard alive.
+type UsbTask = Pin<Box<dyn Future<Output = ()> + 'static>>;
+
 pub struct UsbDisk {
-    _usb: Usb<'static>,
-    initialized: bool,
+    usb: Option<Usb<'static>>,
+    task: Option<UsbTask>,
+    shared: Rc<RefCell<SharedState>>,
+    active: bool,
     init_attempted: bool,
 }
 
@@ -70,19 +69,20 @@ impl UsbDisk {
         // Keep the default USB-Serial-JTAG path intact until the user actually
         // opens USB DISK. This preserves espflash monitor logs during boot.
         Self {
-            _usb: usb,
-            initialized: false,
+            usb: Some(usb),
+            task: None,
+            shared: Rc::new(RefCell::new(SharedState::default())),
+            active: false,
             init_attempted: false,
         }
     }
 
     pub fn available(&self) -> bool {
-        !self.init_attempted || self.initialized
+        !self.init_attempted || self.task.is_some()
     }
 
     fn select_otg_phy(&self) {
-        // Reproduce esp-hal's USB-OTG device-mode platform setup. TinyUSB then
-        // initializes the Synopsys DWC2 core itself.
+        // ESP32-S3's USB-OTG and USB-Serial-JTAG controllers share one PHY.
         esp_hal::peripherals::LPWR::regs()
             .usb_conf()
             .modify(|_, w| w.sw_hw_usb_phy_sel().set_bit().sw_usb_phy_sel().set_bit());
@@ -105,187 +105,133 @@ impl UsbDisk {
     }
 
     fn restore_serial_jtag_phy(&self) {
-        // ESP32-S3's two USB controllers share one PHY. Software selection 0
-        // returns it to the ROM USB-Serial-JTAG controller used by espflash.
         esp_hal::peripherals::LPWR::regs()
             .usb_conf()
             .modify(|_, w| w.sw_hw_usb_phy_sel().set_bit().sw_usb_phy_sel().clear_bit());
+    }
+
+    fn initialize(&mut self) -> bool {
+        if self.task.is_some() {
+            return true;
+        }
+        self.init_attempted = true;
+        let Some(usb) = self.usb.take() else {
+            return false;
+        };
+
+        // One OUT packet can be pending on EP0 and another on the MSC bulk OUT
+        // endpoint. Extra space keeps the Synopsys driver layout future-proof.
+        let endpoint_buffer = Box::leak(Box::new([0_u8; 1024]));
+        let driver = embassy_usb_device::Driver::new(
+            usb,
+            endpoint_buffer,
+            embassy_usb_device::Config::default(),
+        );
+
+        let mut config = embassy_usb::Config::new(0xcafe, 0x4002);
+        config.manufacturer = Some("RATPUTER");
+        config.product = Some("RATPUTER SD");
+        config.serial_number = Some("RATPUTER-ADV");
+        config.max_power = 500;
+        // A single-function device: let Windows bind usbstor directly instead
+        // of going through the composite (IAD) driver.
+        config.device_class = 0x00;
+        config.device_sub_class = 0x00;
+        config.device_protocol = 0x00;
+        config.composite_with_iads = false;
+
+        let config_descriptor = Box::leak(Box::new([0_u8; 256]));
+        let bos_descriptor = Box::leak(Box::new([0_u8; 64]));
+        let msos_descriptor = Box::leak(Box::new([0_u8; 64]));
+        let control_buffer = Box::leak(Box::new([0_u8; 64]));
+        let mut builder = embassy_usb::Builder::new(
+            driver,
+            config,
+            config_descriptor,
+            bos_descriptor,
+            msos_descriptor,
+            control_buffer,
+        );
+        let msc = MscClass::new(&mut builder, self.shared.clone());
+        let mut device = builder.build();
+
+        self.task = Some(Box::pin(async move {
+            let _ = join(device.run(), msc.run()).await;
+        }));
+        true
     }
 
     /// Attach an exclusively owned block device and enumerate it on USB.
     /// The caller must keep `device` pinned at the same address until `detach`.
     pub fn attach<D: BlockDevice>(&mut self, device: &D) -> bool {
         self.select_otg_phy();
-        if !self.initialized {
-            self.init_attempted = true;
-            self.initialized = unsafe { ratputer_tinyusb_init() };
-        }
-        if !self.initialized {
+        if !self.initialize() {
             self.restore_serial_jtag_phy();
             return false;
         }
-        unsafe {
-            BACKEND = Backend {
-                context: (device as *const D).cast(),
-                count: block_count::<D>,
-                read: read_blocks::<D>,
-                write: write_blocks::<D>,
-            };
-            ratputer_tinyusb_connect();
-        }
+        self.shared.borrow_mut().attach(device);
+        self.active = true;
         true
     }
 
     pub fn poll(&mut self) {
-        if self.initialized {
-            unsafe { ratputer_tinyusb_poll() };
+        if !self.active {
+            return;
+        }
+        let Some(task) = self.task.as_mut() else {
+            return;
+        };
+        // A bulk transfer advances one 64-byte packet per wake-up. Keep polling
+        // while the interrupt reports progress, bounded so the UI stays live.
+        let waker = flag_waker();
+        let mut context = Context::from_waker(&waker);
+        let start = Instant::now();
+        loop {
+            USB_WOKEN.store(false, Ordering::Release);
+            if let Poll::Ready(()) = task.as_mut().poll(&mut context) {
+                self.active = false;
+                return;
+            }
+            // Wait briefly for the next packet before yielding to the main loop.
+            while !USB_WOKEN.load(Ordering::Acquire) {
+                if start.elapsed() >= POLL_BUDGET {
+                    return;
+                }
+            }
         }
     }
 
     pub fn state(&self) -> UsbDiskState {
-        if !self.initialized {
+        if !self.active {
             return UsbDiskState::Inactive;
         }
-        match unsafe { ratputer_tinyusb_state() } {
-            1 => UsbDiskState::Waiting,
-            2 => UsbDiskState::Mounted,
-            3 => UsbDiskState::Ejected,
-            _ => UsbDiskState::Inactive,
+        let shared = self.shared.borrow();
+        if shared.ejected() {
+            UsbDiskState::Ejected
+        } else if shared.configured() {
+            UsbDiskState::Mounted
+        } else if shared.attached() {
+            UsbDiskState::Waiting
+        } else {
+            UsbDiskState::Inactive
         }
     }
 
     pub fn can_detach(&self) -> bool {
-        !self.initialized || unsafe { ratputer_tinyusb_can_disconnect() }
+        if !self.active {
+            return true;
+        }
+        let shared = self.shared.borrow();
+        !shared.configured() || shared.ejected()
     }
 
-    /// Disconnect first, then clear the backend pointer before its owner moves.
+    /// Remove the backend before its owner moves, then return the shared PHY to
+    /// USB-Serial-JTAG. The Rust DWC2 task is retained for the next attachment.
     pub fn detach(&mut self) {
-        if self.initialized {
-            unsafe {
-                ratputer_tinyusb_disconnect();
-                BACKEND = Backend {
-                    context: ptr::null(),
-                    count: no_count,
-                    read: no_read,
-                    write: no_write,
-                };
-            }
+        if self.active {
+            self.shared.borrow_mut().detach();
+            self.active = false;
             self.restore_serial_jtag_phy();
         }
     }
-}
-
-unsafe fn block_count<D: BlockDevice>(context: *const ()) -> u32 {
-    let device = &*context.cast::<D>();
-    device.num_blocks().map(|count| count.0).unwrap_or(0)
-}
-
-unsafe fn read_blocks<D: BlockDevice>(
-    context: *const (),
-    lba: u32,
-    offset: u32,
-    output: *mut u8,
-    length: u32,
-) -> i32 {
-    let device = &*context.cast::<D>();
-    let output = slice::from_raw_parts_mut(output, length as usize);
-    transfer_read(device, lba, offset as usize, output)
-        .then_some(length as i32)
-        .unwrap_or(-1)
-}
-
-unsafe fn write_blocks<D: BlockDevice>(
-    context: *const (),
-    lba: u32,
-    offset: u32,
-    input: *const u8,
-    length: u32,
-) -> i32 {
-    let device = &*context.cast::<D>();
-    let input = slice::from_raw_parts(input, length as usize);
-    transfer_write(device, lba, offset as usize, input)
-        .then_some(length as i32)
-        .unwrap_or(-1)
-}
-
-fn transfer_read<D: BlockDevice>(
-    device: &D,
-    mut lba: u32,
-    mut offset: usize,
-    mut out: &mut [u8],
-) -> bool {
-    if offset >= Block::LEN {
-        return false;
-    }
-    while !out.is_empty() {
-        let mut block = [Block::new()];
-        if device.read(&mut block, BlockIdx(lba)).is_err() {
-            return false;
-        }
-        let count = out.len().min(Block::LEN - offset);
-        out[..count].copy_from_slice(&block[0].contents[offset..offset + count]);
-        out = &mut out[count..];
-        lba += 1;
-        offset = 0;
-    }
-    true
-}
-
-fn transfer_write<D: BlockDevice>(
-    device: &D,
-    mut lba: u32,
-    mut offset: usize,
-    mut input: &[u8],
-) -> bool {
-    if offset >= Block::LEN {
-        return false;
-    }
-    while !input.is_empty() {
-        let count = input.len().min(Block::LEN - offset);
-        let mut block = [Block::new()];
-        // TinyUSB normally submits whole 512-byte chunks. Read-modify-write
-        // keeps partial transfers correct as required by the callback contract.
-        if (offset != 0 || count != Block::LEN) && device.read(&mut block, BlockIdx(lba)).is_err() {
-            return false;
-        }
-        block[0].contents[offset..offset + count].copy_from_slice(&input[..count]);
-        if device.write(&block, BlockIdx(lba)).is_err() {
-            return false;
-        }
-        input = &input[count..];
-        lba += 1;
-        offset = 0;
-    }
-    true
-}
-
-#[no_mangle]
-pub extern "C" fn ratputer_sd_block_count() -> u32 {
-    unsafe { (BACKEND.count)(BACKEND.context) }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ratputer_sd_read(
-    lba: u32,
-    offset: u32,
-    buffer: *mut c_void,
-    length: u32,
-) -> i32 {
-    if buffer.is_null() {
-        return -1;
-    }
-    (BACKEND.read)(BACKEND.context, lba, offset, buffer.cast(), length)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn ratputer_sd_write(
-    lba: u32,
-    offset: u32,
-    buffer: *const c_void,
-    length: u32,
-) -> i32 {
-    if buffer.is_null() {
-        return -1;
-    }
-    (BACKEND.write)(BACKEND.context, lba, offset, buffer.cast(), length)
 }

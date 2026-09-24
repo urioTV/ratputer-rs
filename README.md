@@ -17,7 +17,7 @@ credentials, and USB Mass Storage export of the SD card, everything in **Slint
 | Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
 | Storage | `embedded-sdmmc`, FAT card on SPI3, TOML credentials |
-| USB disk | TinyUSB 0.21 MSC/SCSI (isolated C component, no ESP-IDF/FreeRTOS) over ESP32-S3 USB-OTG |
+| USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
@@ -111,11 +111,12 @@ standard writable USB Mass Storage/SCSI device. The native ESP32-S3 USB-OTG pins
 are fixed: D−=GPIO19 and D+=GPIO20, both already connected to the Cardputer ADV
 USB-C socket.
 
-The USB implementation is a deliberately isolated C component: a vendored subset
-of **TinyUSB 0.21.0** (device core, MSC/SCSI and Synopsys DWC2 controller) compiled
-by `build.rs`. It uses no ESP-IDF or FreeRTOS. The DWC2 controller moves endpoint
-buffers with its internal DMA; Rust polls completion events and TinyUSB's queue from
-the normal firmware loop and provides sector callbacks backed by `embedded-sdmmc`.
+The USB stack is entirely Rust. `esp-hal` drives the Synopsys DWC2 controller
+(interrupt-driven, through `embassy-usb-synopsys-otg`), `embassy-usb` 0.6 handles
+enumeration, and `src/msc.rs` implements the Mass Storage Bulk-Only Transport
+and the SCSI commands used by Windows, Linux and macOS. There is no executor: the
+USB future is polled from the main loop with a waker that the USB interrupt sets,
+in bursts of up to 40 ms, and sector I/O goes straight to `embedded-sdmmc`.
 
 Only one side owns the card at a time. Entering USB DISK consumes the firmware's
 `VolumeManager`; leaving disconnects USB, recreates the FAT manager (discarding its
@@ -131,7 +132,7 @@ post-initialization 10 MHz SD data clock.
 The USB-OTG controller shares its PHY with ESP32-S3 USB-Serial-JTAG. The firmware
 switches to OTG only when USB DISK opens and restores Serial/JTAG when it closes;
 the serial port will disappear and re-enumerate during that interval. Descriptors
-currently use TinyUSB's development VID `0xCAFE` with PID `0x4002` and are not
+currently use the development VID `0xCAFE` with PID `0x4002` and are not
 intended as production USB identifiers.
 
 ### Top bar: clock, Wi-Fi, battery
