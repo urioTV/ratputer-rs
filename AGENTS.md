@@ -212,7 +212,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 ## FTP server
 
 - `src/ftp.rs` is a single-client FTP server on `embassy-net` TCP. It is active
-  **only** while view 8 is open. Control = port 21, fixed passive data = port 20;
+  **only** while view 8 is open. Control = port 21, fixed passive data = port 50000;
   `PASV`/`EPSV` only, no active `PORT`/`EPRT`, anonymous access or TLS. Default
   login is `rat` / `cheese`; `[ftp]` in `WIFI.CFG` persists it and Tab on the FTP
   screen opens the password editor. Credentials and data are plaintext: LAN only.

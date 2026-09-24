@@ -32,7 +32,7 @@ use crate::storage::{FtpConfig, SdVolumeManager};
 
 pub const CONTROL_PORT: u16 = 21;
 /// Fixed passive-mode data listener, right next to the control port.
-const DATA_PORT: u16 = 20;
+const DATA_PORT: u16 = 50_000;
 const CONTROL_RX_LEN: usize = 1024;
 const CONTROL_TX_LEN: usize = 1024;
 const DATA_RX_LEN: usize = 4096;
@@ -164,6 +164,9 @@ struct Session {
     transfer: Option<Transfer>,
     /// PASV/EPSV given; waiting for the client to pick a data transfer.
     passive_requested: bool,
+    /// Keep one full network-runner poll between queuing 227/229 and arming
+    /// the second listening socket.
+    passive_arm_delay: bool,
     quit: bool,
     last_activity: Instant,
 }
@@ -181,6 +184,7 @@ impl Session {
             pending: None,
             transfer: None,
             passive_requested: false,
+            passive_arm_delay: false,
             quit: false,
             last_activity: Instant::now(),
         }
@@ -479,11 +483,15 @@ impl FtpServer {
             fatal = true;
         }
 
-        // 7. The client hung up on us.
+        // 7. The client hung up on us. After a peer FIN smoltcp enters
+        // CloseWait: may_send() is still true, but may_recv() is false and an
+        // empty receive queue never makes can_recv() true, so read() cannot be
+        // used to discover EOF.
         if !session.quit
-            && !self.control.may_send()
-            && session.out.is_empty()
-            && self.control.send_queue() == 0
+            && ((!self.control.may_recv() && !self.control.can_recv())
+                || (!self.control.may_send()
+                    && session.out.is_empty()
+                    && self.control.send_queue() == 0))
         {
             fatal = true;
         }
@@ -491,26 +499,38 @@ impl FtpServer {
     }
 
     fn poll_data(&mut self, manager: &Manager, session: &mut Session) {
+        // Queue 227/229 into the established control socket *before* putting the
+        // second socket into Listen. With our executor-less polling, arming the
+        // data listener first can prevent the control reply from progressing.
+        // Once `out` is empty, the reply is safely in control's TCP TX buffer;
+        // the following network poll sends it with the listener already active.
+        if session.passive_requested && !self.data_listening {
+            if !session.out.is_empty() {
+                return;
+            }
+            if session.passive_arm_delay {
+                session.passive_arm_delay = false;
+                return;
+            }
+            match self.data.state() {
+                State::Closed => {
+                    let _ = poll_once(self.data.accept(DATA_PORT));
+                    self.data_listening = true;
+                }
+                // smoltcp cannot re-listen from teardown states.
+                State::TimeWait
+                | State::LastAck
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait => self.data.abort(),
+                _ => {}
+            }
+        }
+
         // Nothing to transfer: keep the passive socket armed if PASV was given,
         // otherwise reset it.
         if session.pending.is_none() && session.transfer.is_none() {
-            if session.passive_requested {
-                if !self.data_listening {
-                    match self.data.state() {
-                        State::Closed => {
-                            let _ = poll_once(self.data.accept(DATA_PORT));
-                            self.data_listening = true;
-                        }
-                        // smoltcp cannot re-listen from teardown states.
-                        State::TimeWait
-                        | State::LastAck
-                        | State::FinWait1
-                        | State::FinWait2
-                        | State::CloseWait => self.data.abort(),
-                        _ => {}
-                    }
-                }
-            } else if self.data_listening {
+            if !session.passive_requested && self.data_listening {
                 self.data.abort();
                 self.data_listening = false;
             }
@@ -992,6 +1012,7 @@ impl FtpServer {
                     session.pending = None;
                     Self::abort_data(&mut self.data, &mut self.data_listening);
                     session.passive_requested = true;
+                    session.passive_arm_delay = true;
                     let [a, b, c, d] = ip.octets();
                     session.reply(&format!(
                         "227 Entering Passive Mode ({a},{b},{c},{d},{},{})",
@@ -1006,6 +1027,7 @@ impl FtpServer {
                     session.pending = None;
                     Self::abort_data(&mut self.data, &mut self.data_listening);
                     session.passive_requested = true;
+                    session.passive_arm_delay = true;
                     session.reply(&format!("229 (|||{DATA_PORT}|)"));
                 }
                 None => session.reply("425 No IP yet"),
@@ -1419,6 +1441,9 @@ fn fill_listing(
     mut skip: usize,
     chunk: &mut Vec<u8>,
 ) -> Result<usize, ()> {
+    // The same allocation is reused for successive directory chunks. Remove
+    // the previous chunk before deciding whether the iterator reached EOF.
+    chunk.clear();
     let mut produced = 0_usize;
     let mut storage = [0_u8; LFN_UTF8_LEN];
     let mut lfn = LfnBuffer::new(&mut storage);

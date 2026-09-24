@@ -163,7 +163,7 @@ Backspace stops the server and closes every open file before returning to the
 menu. USB DISK cannot take the card while FTP owns its volume.
 
 The implementation is a single-client, passive-mode server: control port 21 and
-fixed data port 20 (`PASV` and `EPSV`; active `PORT`/`EPRT` are rejected). It
+fixed data port 50000 (`PASV` and `EPSV`; active `PORT`/`EPRT` are rejected). It
 supports `LIST`, `NLST`, `MLSD`, `MLST`, `PWD`, `CWD`, `CDUP`, `SIZE`, `MDTM`,
 `REST` for downloads, `RETR`, `STOR`, `DELE`, `MKD`, `RMD`, `ABOR`, and the usual
 login/session commands. `LIST -a`/`-la` options are accepted. Network and FTP
