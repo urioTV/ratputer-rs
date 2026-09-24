@@ -556,34 +556,34 @@ impl FtpServer {
             return;
         }
 
-        // A completed/failed transfer finishes when the TCP queue is drained.
+        // All outgoing bytes are now queued. Close immediately: smoltcp sends
+        // FIN *after* the queued payload, which gives FTP clients their required
+        // data-channel EOF. Waiting for every ACK before close deadlocks WinSCP,
+        // which waits for EOF before it finishes the listing.
         if transfer.finishing || transfer.failed.is_some() {
-            let drained = self.data.send_queue() == 0;
-            let dead = !(self.data.may_send() || self.data.may_recv());
-            if drained || dead {
-                if transfer.failed.is_some() {
-                    session.reply("426 Transfer aborted");
-                    session.reply("226 Data closed");
-                } else {
-                    let mut line = String::from("226 Finished");
-                    write!(line, " {}", transfer.topic).ok();
-                    session.reply(&line);
-                }
-                match &mut transfer.kind {
-                    TransferKind::List { dir, .. } => {
-                        if let Some(dir) = dir.take() {
-                            let _ = manager.close_dir(dir);
-                        }
-                    }
-                    TransferKind::Retrieve { file } | TransferKind::Store { file } => {
-                        let _ = manager.close_file(*file);
+            let failed = transfer.failed.is_some();
+            match &mut transfer.kind {
+                TransferKind::List { dir, .. } => {
+                    if let Some(dir) = dir.take() {
+                        let _ = manager.close_dir(dir);
                     }
                 }
-                self.data.close();
-                self.data_listening = false;
-                return;
+                TransferKind::Retrieve { file } | TransferKind::Store { file } => {
+                    let _ = manager.close_file(*file);
+                }
             }
-            session.transfer = Some(transfer);
+            if failed {
+                self.data.abort();
+                session.reply("426 Transfer aborted");
+                session.reply("226 Data closed");
+                log::warn!("FTP transfer failed: {}", transfer.topic);
+            } else {
+                // close() preserves buffered payload and appends FIN.
+                self.data.close();
+                session.reply(&format!("226 Finished {}", transfer.topic));
+                log::info!("FTP transfer finished: {}", transfer.topic);
+            }
+            self.data_listening = false;
             return;
         }
 
