@@ -30,13 +30,45 @@ impl WallClock {
 
 /// Local time as (hours, minutes) for the configured offset and DST rule.
 pub fn local_hh_mm(unix_seconds: u64, config: &ClockConfig) -> (u8, u8) {
+    let seconds_of_day = local_seconds(unix_seconds, config).rem_euclid(SECONDS_PER_DAY);
+    (
+        (seconds_of_day / 3600) as u8,
+        ((seconds_of_day % 3600) / 60) as u8,
+    )
+}
+
+/// Seconds since 1970-01-01 00:00 *local* time (offset and DST applied).
+pub fn local_seconds(unix_seconds: u64, config: &ClockConfig) -> i64 {
     let utc = unix_seconds as i64;
     let mut local = utc + i64::from(config.utc_offset_minutes) * 60;
     if config.dst == DstRule::Eu && eu_summer_time(utc) {
         local += 3600;
     }
-    let seconds_of_day = local.rem_euclid(SECONDS_PER_DAY);
-    ((seconds_of_day / 3600) as u8, ((seconds_of_day % 3600) / 60) as u8)
+    local
+}
+
+/// Calendar fields of a [`local_seconds`] value.
+#[derive(Clone, Copy)]
+pub struct DateTime {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+}
+
+pub fn date_time(seconds: i64) -> DateTime {
+    let (year, month, day) = civil_from_days(seconds.div_euclid(SECONDS_PER_DAY));
+    let seconds_of_day = seconds.rem_euclid(SECONDS_PER_DAY) as u32;
+    DateTime {
+        year,
+        month,
+        day,
+        hour: seconds_of_day / 3600,
+        minute: seconds_of_day % 3600 / 60,
+        second: seconds_of_day % 60,
+    }
 }
 
 /// EU summer time: from 01:00 UTC on the last Sunday of March
@@ -50,7 +82,11 @@ fn eu_summer_time(utc: i64) -> bool {
 
 /// Day number (days since 1970-01-01) of the last Sunday of `month`.
 fn last_sunday(year: i64, month: u32) -> i64 {
-    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let last_day = days_from_civil(next_year, next_month, 1) - 1;
     // 1970-01-01 was a Thursday; with Sunday = 0 that day is weekday 4.
     last_day - (last_day + 4).rem_euclid(7)
@@ -77,7 +113,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let shifted_month = (5 * day_of_year + 2) / 153;
     let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
-    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 } as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
     let year = year_of_era + era * 400 + i64::from(month <= 2);
     (year, month, day)
 }

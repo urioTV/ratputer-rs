@@ -30,11 +30,13 @@ src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (block
 src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12) + [clock]
 src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY switching
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
-src/net.rs         embassy-net stack (DHCP/DNS/UDP) + one-shot SNTP job, polled without executor
+src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
+src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
-ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/USB/about)
+ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/FTP/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
+vendor/embedded-sdmmc/  0.10.0 + local FAT delete/free-chain fixes
 build.rs           compiles Slint resources
 xtask/             host helper: builds release, creates and verifies merged binary
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
@@ -206,6 +208,36 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   SPI3 has no IOMUX pins on the S3, so the bus goes through the GPIO matrix; 20 MHz
   keeps margin for MISO sampling. If a card shows read errors (`C` stays low, host
   I/O errors), fall back to 10 MHz before suspecting the MSC code.
+
+## FTP server
+
+- `src/ftp.rs` is a single-client FTP server on `embassy-net` TCP. It is active
+  **only** while view 8 is open. Control = port 21, fixed passive data = port 20;
+  `PASV`/`EPSV` only, no active `PORT`/`EPRT`, anonymous access or TLS. Default
+  login is `rat` / `cheese`; `[ftp]` in `WIFI.CFG` persists it and Tab on the FTP
+  screen opens the password editor. Credentials and data are plaintext: LAN only.
+- Supported file operations: LIST/NLST/MLSD/MLST, PWD/CWD/CDUP, SIZE/MDTM,
+  RETR (+ REST), STOR, DELE, MKD, empty RMD and ABOR. `LIST -a`/`-la` works.
+  Downloads/listings preserve LFNs, but new files/directories are 8.3 only and
+  rename is unsupported because embedded-sdmmc 0.10 cannot write LFNs.
+- `vendor/embedded-sdmmc` is patched through `[patch.crates-io]`: DELE/RMD free
+  their FAT cluster chains, delete adjacent LFN entries in the same directory
+  block, and correctly update the FSInfo free-cluster count for the final cluster.
+  Keep `PATCHES.md` in sync with local changes.
+- The FTP screen owns one raw volume for its lifetime. Stop FTP and close all
+  RawFile/RawDirectory handles before USB MSC can call `VolumeManager::free()`.
+  `main.rs` enforces FTP↔USB exclusion and defensively stops FTP on navigation.
+- There is no executor: `TcpSocket::accept/read/write` futures are polled once
+  with `Waker::noop()` only when socket readiness says they can progress. During
+  transfers, main burst-polls `Network::poll_stack()` + `FtpServer::poll()` for
+  up to 15 ms, then returns to input/rendering. Do not consume `Network::poll()`
+  inside the burst or an SNTP completion result will be lost.
+- `Network` uses `StackResources<8>` for DHCP/DNS/SNTP plus two persistent FTP
+  sockets. FTP allocates 1 KiB RX/TX control + 4 KiB RX/TX data buffers once and
+  refuses first creation when heap free is below 32 KiB. UI refresh is 2 Hz.
+- FAT timestamps use `storage::FatClock`, backed by the SNTP-derived local time;
+  before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
+  the 226 reply. Do not add write-back caching.
 
 ## Network, clock, battery (top bar)
 

@@ -33,6 +33,7 @@ use esp_println as _;
 
 mod battery;
 mod clock;
+mod ftp;
 mod msc;
 mod net;
 mod storage;
@@ -40,7 +41,7 @@ mod usbdisk;
 mod wifi;
 
 use cardputer_adv_keyboard::{Arrow, KeyInput, Keyboard};
-use storage::{BuildTime, SavedNetwork, StorageError, WifiConfig};
+use storage::{FatClock, SavedNetwork, StorageError, WifiConfig};
 
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
@@ -338,7 +339,7 @@ fn main() -> ! {
     }
     // `None` means the raw card has been moved to USB MSC. Reconstructing the
     // manager after detach also invalidates its FAT block cache.
-    let mut storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, BuildTime));
+    let mut storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, FatClock));
     let (mut wifi_config, storage_available) = match storage::load(storage.as_ref().unwrap()) {
         Ok(config) => (config, true),
         Err(StorageError::Missing) => (WifiConfig::default(), true),
@@ -367,6 +368,9 @@ fn main() -> ! {
     // --- Battery gauge: GPIO10 / ADC1_CH9, 2:1 divider ---
     let mut battery = battery::Battery::new(peripherals.ADC1, peripherals.GPIO10);
     let mut scan_networks: Vec<wifi::ScanNetwork> = Vec::new();
+    // Created lazily on the first FTP screen open (socket buffers use heap),
+    // then retained so repeated opens do not leak another pair of sockets.
+    let mut ftp_server: Option<ftp::FtpServer> = None;
 
     // --- Slint: minimal software window + platform ---
     let window = MinimalSoftwareWindow::new(
@@ -405,6 +409,8 @@ fn main() -> ! {
         }
         .into(),
     );
+    set_ftp_login_text(&ui, &wifi_config);
+    ui.set_ftp_status("STOPPED".into());
 
     // Single-line buffer (ReusedBuffer) — 240 px RGB565
     let mut line_buffer: [Rgb565Pixel; LCD_WIDTH] = [Rgb565Pixel(0); LCD_WIDTH];
@@ -426,6 +432,7 @@ fn main() -> ! {
     let mut usb_sd = None;
     let mut shown_usb_state = None;
     let mut next_usb_stats_at = Instant::now();
+    let mut next_ftp_stats_at = Instant::now();
     let mut usb_force_exit_armed = false;
     loop {
         slint::platform::update_timers_and_animations();
@@ -457,6 +464,15 @@ fn main() -> ! {
                             }
                         }
                     }
+                    KeyInput::Char(character) if ui.get_view_state() == 9 => {
+                        if character.is_ascii_graphic() {
+                            let mut password = ui.get_ftp_password().to_string();
+                            if password.len() < 32 {
+                                password.push(character);
+                                ui.set_ftp_password(password.into());
+                            }
+                        }
+                    }
                     KeyInput::Char(' ') => ui.invoke_key_pressed("space".into()),
                     // Legacy ADV behavior: outside text entry the bare `,` `;` `.` `/`
                     // keys act as arrows (directions match the Fn layer in the crate).
@@ -470,6 +486,11 @@ fn main() -> ! {
                         let mut password = ui.get_wifi_password().to_string();
                         password.pop();
                         set_password(&ui, &password);
+                    }
+                    KeyInput::Backspace if ui.get_view_state() == 9 => {
+                        let mut password = ui.get_ftp_password().to_string();
+                        password.pop();
+                        ui.set_ftp_password(password.into());
                     }
                     KeyInput::Backspace | KeyInput::Escape => ui.invoke_key_pressed("back".into()),
                     KeyInput::Delete => ui.invoke_key_pressed("delete".into()),
@@ -671,7 +692,11 @@ fn main() -> ! {
         if usb_action != 0 {
             ui.set_usb_disk_action(0);
             match usb_action {
-                1 if usb_sd.is_none() => {
+                1 if usb_sd.is_none()
+                    && ftp_server
+                        .as_ref()
+                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped) =>
+                {
                     if let Some(manager) = storage.take() {
                         let (sd_card, _) = manager.free();
                         let card = Box::new(sd_card);
@@ -681,12 +706,18 @@ fn main() -> ! {
                             shown_usb_state = None;
                             usb_force_exit_armed = false;
                         } else {
-                            storage = Some(embedded_sdmmc::VolumeManager::new(*card, BuildTime));
+                            storage = Some(embedded_sdmmc::VolumeManager::new(*card, FatClock));
                             ui.set_usb_disk_status("USB INIT ERROR".into());
                         }
                     } else {
                         ui.set_usb_disk_status("SD ALREADY IN USE".into());
                     }
+                }
+                1 if ftp_server
+                    .as_ref()
+                    .is_some_and(|server| server.status() != ftp::FtpStatus::Stopped) =>
+                {
+                    ui.set_usb_disk_status("SD IN USE BY FTP".into());
                 }
                 2 if usb_sd.is_some() => {
                     if usb_disk.can_detach() || usb_force_exit_armed {
@@ -695,7 +726,7 @@ fn main() -> ! {
                         }
                         usb_disk.detach();
                         let sd_card = *usb_sd.take().unwrap();
-                        storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, BuildTime));
+                        storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, FatClock));
                         let reload_ok = match storage::load(storage.as_ref().unwrap()) {
                             Ok(config) => {
                                 wifi_config = config;
@@ -764,6 +795,87 @@ fn main() -> ! {
             }
         }
 
+        // --- FTP server: active only while its screen is open ---
+        let ftp_action = ui.get_ftp_action();
+        if ftp_action != 0 {
+            ui.set_ftp_action(0);
+            match ftp_action {
+                1 => start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui),
+                2 => {
+                    stop_ftp(&mut ftp_server, &storage);
+                    ui.set_ftp_status("STOPPED".into());
+                }
+                3 => {
+                    stop_ftp(&mut ftp_server, &storage);
+                    ui.set_ftp_password(wifi_config.ftp.password.clone().into());
+                    ui.set_ftp_status("TYPE NEW PASSWORD".into());
+                }
+                4 => {
+                    let password = ui.get_ftp_password().to_string();
+                    if !storage::valid_ftp_credential(&password) {
+                        ui.set_ftp_status("1-32 ASCII, NO SPACES".into());
+                    } else if let Some(manager) = storage.as_ref() {
+                        wifi_config.ftp.password = password;
+                        if storage::save(manager, &wifi_config).is_err() {
+                            ui.set_ftp_status("SD SAVE FAILED".into());
+                        } else {
+                            set_ftp_login_text(&ui, &wifi_config);
+                            ui.set_view_state(8);
+                            start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui);
+                        }
+                    } else {
+                        ui.set_ftp_status("SD BUSY".into());
+                    }
+                }
+                5 => {
+                    ui.set_view_state(8);
+                    start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui);
+                }
+                _ => {}
+            }
+        }
+
+        // Defensive invariant: any unexpected navigation away from FTP also
+        // closes its files/volume before another feature can use the card.
+        if !matches!(ui.get_view_state(), 8 | 9)
+            && ftp_server
+                .as_ref()
+                .is_some_and(|server| server.status() != ftp::FtpStatus::Stopped)
+        {
+            stop_ftp(&mut ftp_server, &storage);
+        }
+
+        if let (Some(server), Some(manager), Some(network)) =
+            (ftp_server.as_mut(), storage.as_ref(), network.as_ref())
+        {
+            if server.status() != ftp::FtpStatus::Stopped {
+                server.poll(manager, network.stack(), &wifi_config.ftp);
+                let status = if server.status() == ftp::FtpStatus::Transfer
+                    && !server.activity().is_empty()
+                {
+                    truncate_ascii(server.activity(), 26)
+                } else if let Some(peer) = server.peer() {
+                    format!("{} {}", server.status().label(), truncate_ascii(peer, 12))
+                } else {
+                    server.status().label().to_string()
+                };
+                if ui.get_ftp_status() != status.as_str() {
+                    ui.set_ftp_status(status.into());
+                }
+                let address = server
+                    .ip()
+                    .map(|ip| format!("FTP://{}:21", ip))
+                    .unwrap_or_else(|| String::from("NO IP YET"));
+                if ui.get_ftp_addr() != address.as_str() {
+                    ui.set_ftp_addr(address.into());
+                }
+                if now >= next_ftp_stats_at {
+                    next_ftp_stats_at = now + Duration::from_millis(500);
+                    ui.set_ftp_stats(ftp_stats_text(server.stats()).into());
+                }
+            }
+        }
+
         // --- Network: DHCP/DNS/SNTP advance without blocking (one poll per iteration) ---
         if let Some(network) = network.as_mut() {
             if let Some(result) = network.poll() {
@@ -808,6 +920,9 @@ fn main() -> ! {
             shown_link_state = link_state;
         }
 
+        if let Some(unix_seconds) = wall_clock.unix_now() {
+            storage::set_local_time(clock::local_seconds(unix_seconds, &wifi_config.clock));
+        }
         let clock_hh_mm = wall_clock
             .unix_now()
             .map(|unix_seconds| clock::local_hh_mm(unix_seconds, &wifi_config.clock));
@@ -840,11 +955,93 @@ fn main() -> ! {
             last_switch = now;
         }
 
+        // During a transfer, burst-poll the network and FTP for up to 15 ms.
+        // This keeps TCP windows moving without starving input/display forever.
+        let ftp_busy = ftp_server
+            .as_ref()
+            .is_some_and(|server| server.status() == ftp::FtpStatus::Transfer);
+        if ftp_busy {
+            let burst_start = Instant::now();
+            while burst_start.elapsed() < Duration::from_millis(15) {
+                let (Some(network), Some(manager), Some(server)) =
+                    (network.as_mut(), storage.as_ref(), ftp_server.as_mut())
+                else {
+                    break;
+                };
+                network.poll_stack();
+                server.poll(manager, network.stack(), &wifi_config.ftp);
+                if server.status() != ftp::FtpStatus::Transfer {
+                    break;
+                }
+            }
+        }
+
         window.draw_if_needed(|renderer| {
             renderer.render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
         });
 
-        delay.delay_millis(10);
+        delay.delay_millis(if ftp_busy { 1 } else { 10 });
+    }
+}
+
+fn set_ftp_login_text(ui: &MainWindow, config: &WifiConfig) {
+    // 27 glyphs fit the 216 px content width. Long custom passwords are still
+    // accepted but elided here; they remain editable in the password screen.
+    let text = format!("USER:{} PASS:{}", config.ftp.user, config.ftp.password);
+    ui.set_ftp_user(truncate_ascii(&text, 27).into());
+}
+
+fn start_ftp(
+    server: &mut Option<ftp::FtpServer>,
+    storage: &Option<storage::SdVolumeManager>,
+    network: &Option<net::Network>,
+    config: &WifiConfig,
+    ui: &MainWindow,
+) {
+    let (Some(manager), Some(network)) = (storage.as_ref(), network.as_ref()) else {
+        ui.set_ftp_status("SD OR WI-FI UNAVAILABLE".into());
+        return;
+    };
+    if server.is_none() {
+        // Socket buffers consume 10 KiB plus allocator overhead. Keep ample
+        // margin for Slint redraws and Wi-Fi control allocations.
+        if esp_alloc::HEAP.free() < 32 * 1024 {
+            ui.set_ftp_status("LOW MEMORY".into());
+            return;
+        }
+        *server = Some(ftp::FtpServer::new(network.stack()));
+    }
+    match server.as_mut().unwrap().start(manager, network.stack()) {
+        Ok(()) => {
+            set_ftp_login_text(ui, config);
+            ui.set_ftp_status("WAITING FOR WI-FI".into());
+        }
+        Err(()) => ui.set_ftp_status("SD VOLUME ERROR".into()),
+    }
+}
+
+fn stop_ftp(server: &mut Option<ftp::FtpServer>, storage: &Option<storage::SdVolumeManager>) {
+    if let (Some(server), Some(manager)) = (server.as_mut(), storage.as_ref()) {
+        if server.status() != ftp::FtpStatus::Stopped {
+            server.stop(manager);
+        }
+    }
+}
+
+fn ftp_stats_text(stats: ftp::FtpStats) -> String {
+    format!(
+        "UP {}  DOWN {}  FREE {}K",
+        byte_size_text(stats.sent_bytes),
+        byte_size_text(stats.received_bytes),
+        esp_alloc::HEAP.free() / 1024
+    )
+}
+
+fn byte_size_text(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        format!("{}K", bytes / 1024)
+    } else {
+        format!("{}M", bytes / (1024 * 1024))
     }
 }
 

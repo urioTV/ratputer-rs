@@ -3,8 +3,8 @@
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
 Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
 a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, SD-backed
-credentials, and USB Mass Storage export of the SD card, everything in **Slint
-(no_std)**. 🐀
+credentials, USB Mass Storage export, and a Wi-Fi FTP server for the SD card,
+everything in **Slint (no_std)**. 🐀
 
 ## Stack
 
@@ -18,6 +18,7 @@ credentials, and USB Mass Storage export of the SD card, everything in **Slint
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
 | Storage | `embedded-sdmmc`, FAT card on SPI3, TOML credentials |
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
+| FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
@@ -33,9 +34,9 @@ credentials, and USB Mass Storage export of the SD card, everything in **Slint
   `--:--` until the first NTP sync), Wi-Fi signal bars + SSID (`CONNECTING`/`OFFLINE`),
   and the battery percentage with a gauge icon (red below 15 %);
 - The template defines **two top-level screens** driven by the `splash-done` property
-  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus eight
+  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus ten
   mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
-  4=scan results, 5=password, 6=about, 7=USB disk) and a
+  4=scan results, 5=password, 6=about, 7=USB disk, 8=FTP server, 9=FTP password) and a
   **`key-pressed(string)`** callback:
   - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
     128×80 px; frames: bob / step / blink / tail-up) + header `RATPUTER · BOOTING`
@@ -49,6 +50,9 @@ credentials, and USB Mass Storage export of the SD card, everything in **Slint
     connection status, and forgetting credentials;
   - **USB disk** (`view-state == 7`) — exports the whole physical SD card to the
     connected computer and reports waiting/mounted/ejected state;
+  - **FTP server** (`view-state == 8`) — shares the SD over Wi-Fi and reports its
+    address, login, client/transfer state, byte counters and free heap; Tab opens
+    the password editor (`view-state == 9`);
   - **about view** (`view-state == 6`) — technical info;
 - The firmware (`src/main.rs`) polls the TCA8418 FIFO. Navigation keys are sent to
   Slint while printable characters are appended to the password in Rust. Wi-Fi
@@ -77,6 +81,10 @@ version = 1
 utc_offset_minutes = 60
 dst = "eu"                    # "eu" or "none"
 ntp_server = "pool.ntp.org"
+
+[ftp]                         # optional; shown on the FTP SERVER screen
+user = "rat"
+password = "cheese"
 
 [[networks]]
 ssid = "example"
@@ -143,6 +151,36 @@ switches to OTG only when USB DISK opens and restores Serial/JTAG when it closes
 the serial port will disappear and re-enumerate during that interval. Descriptors
 currently use the development VID `0xCAFE` with PID `0x4002` and are not
 intended as production USB identifiers.
+
+### FTP server over Wi-Fi
+
+Connect the Cardputer to Wi-Fi, then open **FTP SERVER**. While that screen is
+open the firmware holds the FAT volume exclusively and listens on TCP port 21;
+the UI shows an address such as `FTP://192.168.1.23:21`. The default credentials
+are `rat` / `cheese`. Press **Tab** to edit the password (1–32 printable ASCII
+characters without spaces); it is saved in `[ftp]` in `WIFI.CFG`. Enter or
+Backspace stops the server and closes every open file before returning to the
+menu. USB DISK cannot take the card while FTP owns its volume.
+
+The implementation is a single-client, passive-mode server: control port 21 and
+fixed data port 20 (`PASV` and `EPSV`; active `PORT`/`EPRT` are rejected). It
+supports `LIST`, `NLST`, `MLSD`, `MLST`, `PWD`, `CWD`, `CDUP`, `SIZE`, `MDTM`,
+`REST` for downloads, `RETR`, `STOR`, `DELE`, `MKD`, `RMD`, `ABOR`, and the usual
+login/session commands. `LIST -a`/`-la` options are accepted. Network and FTP
+futures run without an executor; during a transfer the main loop burst-polls TCP
+for up to 15 ms at a time, then returns to input and display rendering.
+
+`embedded-sdmmc` can read/list long FAT names, but version 0.10 cannot create or
+rename them. Consequently, downloads and listings preserve long names, while new
+uploads and directories must use DOS 8.3 names such as `PHOTO001.JPG`; rename is
+reported as unsupported. `DELE` and empty-directory `RMD` use a local vendored
+fix that releases their FAT cluster chains instead of leaking space.
+
+FTP credentials and all file contents travel in **plain text**. Use this only on
+a trusted LAN; the shared card contains `RATPUTER/WIFI.CFG` with Wi-Fi passwords.
+There is no anonymous login, TLS, internet exposure, or background server: closing
+the FTP screen immediately stops access. Files uploaded after SNTP synchronization
+receive the current configured local FAT timestamp.
 
 ### Top bar: clock, Wi-Fi, battery
 
@@ -280,9 +318,13 @@ variant from mipidsi 0.7 for the same panel).
 9. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and
    write a test file, eject it on the host, then press Backspace and verify that
    `WIFI.CFG` is reloaded.
-10. Top bar: after connecting, the clock switches from `--:--` to local time within a
-   few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
-   the clock keeps counting; compare the battery % against the charge level.
+10. Open **FTP SERVER**, connect a passive FTP client to the displayed address with
+    `rat` / `cheese`, then test listing, an 8.3 upload, download, delete, mkdir/rmdir,
+    resume download, disconnect, and password editing. Confirm USB DISK is unavailable
+    until the FTP screen is closed.
+11. Top bar: after connecting, the clock switches from `--:--` to local time within a
+    few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
+    the clock keeps counting; compare the battery % against the charge level.
 
 A successful host build verifies compilation and image headers, but radio, antenna,
 SD-card compatibility, and internal-SRAM headroom require this physical test.

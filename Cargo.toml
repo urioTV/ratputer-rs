@@ -30,7 +30,7 @@ embassy-usb = { version = "0.6", default-features = false, features = [
 ] }
 
 # IPv4 stack over the Wi-Fi station interface: DHCP + DNS + UDP (SNTP clock sync)
-embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "log"] }
+embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "tcp", "log"] }
 embassy-time = "0.5"
 # REQUIRED: without a generic queue, esp-rtos uses the executor-integrated timer queue,
 # which panics ("Found waker not created by the Embassy executor") on the first

@@ -10,7 +10,7 @@ export component MainWindow inherits Window {
     in-out property <int> frame-index: 0;
 
     // 0 menu, 1 rat, 2 Wi-Fi menu, 3 saved, 4 scan, 5 password,
-    // 6 about, 7 USB disk.
+    // 6 about, 7 USB disk, 8 FTP server, 9 FTP password edit.
     in-out property <int> view-state: 0;
     in-out property <int> menu-index: 0;
     in-out property <int> wifi-menu-index: 0;
@@ -35,6 +35,16 @@ export component MainWindow inherits Window {
     in property <string> usb-disk-status: "USB NOT ACTIVE";
     in property <string> usb-disk-stats: "";
 
+    // FTP server: firmware polls and clears this command.
+    // 1 start (screen opened), 2 stop (leaving), 3 open password editor,
+    // 4 save password, 5 cancel password edit.
+    in-out property <int> ftp-action: 0;
+    in property <string> ftp-status: "STOPPED";
+    in property <string> ftp-addr: "NO WI-FI";
+    in property <string> ftp-user: "USER:RAT";
+    in property <string> ftp-stats: "";
+    in-out property <string> ftp-password: "";
+
     // Top bar (main screen only): clock, Wi-Fi link, battery.
     in property <string> clock-text: "--:--";
     in property <bool> clock-synced: false;
@@ -44,7 +54,7 @@ export component MainWindow inherits Window {
     // -1 = no reading yet.
     in property <int> battery-percent: -1;
 
-    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "USB DISK", "ABOUT"];
+    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "USB DISK", "FTP SERVER", "ABOUT"];
     property <[string]> wifi-menu-labels: ["SAVED NETWORKS", "SCAN NETWORKS"];
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
@@ -66,6 +76,11 @@ export component MainWindow inherits Window {
                 root.view-state = 2;
             } else if (root.view-state == 7) {
                 root.usb-disk-action = 2;
+            } else if (root.view-state == 8) {
+                root.ftp-action = 2;
+                root.view-state = 0;
+            } else if (root.view-state == 9) {
+                root.ftp-action = 5;
             } else if (root.view-state != 0) {
                 root.view-state = 0;
             }
@@ -79,6 +94,9 @@ export component MainWindow inherits Window {
                 if (root.menu-index == 2) {
                     root.usb-disk-action = 1;
                     root.view-state = 7;
+                } else if (root.menu-index == 3) {
+                    root.ftp-action = 1;
+                    root.view-state = 8;
                 } else {
                     root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : 6;
                 }
@@ -86,6 +104,11 @@ export component MainWindow inherits Window {
                 root.view-state = 0;
             } else if (root.view-state == 7) {
                 root.usb-disk-action = 2;
+            } else if (root.view-state == 8) {
+                root.ftp-action = 2;
+                root.view-state = 0;
+            } else if (root.view-state == 9) {
+                root.ftp-action = 4;
             } else if (root.view-state == 2) {
                 if (root.wifi-menu-index == 0) {
                     root.view-state = 3;
@@ -106,6 +129,9 @@ export component MainWindow inherits Window {
                 root.wifi-connecting = true;
                 root.wifi-action = 4;
             }
+        } else if (key == "tab" && root.view-state == 8) {
+            root.ftp-action = 3;
+            root.view-state = 9;
         } else if (key == "tab" || key == "down" || key == "right") {
             if (root.view-state == 0) {
                 root.menu-index = Math.mod(root.menu-index + 1, root.menu-labels.length);
@@ -475,6 +501,62 @@ export component MainWindow inherits Window {
                     Text { text: root.usb-disk-stats; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
                     Text { text: "EJECT ON PC BEFORE EXIT"; color: #ffb347; font-size: 8px; horizontal-alignment: center; }
                     Text { text: "ENTER/BS = EXIT"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 12px; }
+                }
+            }
+
+            ftp-view := Rectangle {
+                visible: view-state == 8;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 4px;
+                    Text { text: "FTP SERVER"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
+                    Rectangle { height: 1px; background: #0d2b16; }
+                    Text { text: root.ftp-addr; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
+                    Text { text: root.ftp-user; color: #3d8a5a; font-size: 8px; horizontal-alignment: center; }
+                    Rectangle {
+                        height: 24px;
+                        border-width: 1px;
+                        border-color: #2b5c3b;
+                        background: #030903;
+                        Text {
+                            text: root.ftp-status;
+                            color: #7dffa9;
+                            font-size: 8px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text { text: root.ftp-stats; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
+                    Text { text: "TAB PASSWORD"; color: #ffb347; font-size: 8px; horizontal-alignment: center; }
+                    Text { text: "ENTER/BS = STOP"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 12px; }
+                }
+            }
+
+            ftp-password-view := Rectangle {
+                visible: view-state == 9;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 5px;
+                    Text { text: "FTP PASSWORD"; color: #7dffa9; font-size: 8px; horizontal-alignment: center; height: 14px; }
+                    Text { text: "SERVER IS STOPPED WHILE EDITING"; color: #ffb347; font-size: 8px; horizontal-alignment: center; height: 15px; }
+                    Rectangle {
+                        height: 24px;
+                        border-width: 1px;
+                        border-color: #2b5c3b;
+                        background: #030903;
+                        Text {
+                            text: ftp-password + "_";
+                            x: 4px;
+                            width: parent.width - 8px;
+                            color: #7dffa9;
+                            font-size: 8px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    Text { text: root.ftp-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
+                    Rectangle { height: 1px; background: #0d2b16; }
+                    Text { text: "TYPE  ENTER SAVE  ESC CANCEL"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
                 }
             }
 

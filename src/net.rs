@@ -44,8 +44,9 @@ pub struct Network {
 
 impl Network {
     pub fn new(interface: Interface, random_seed: u64) -> Self {
-        // DHCP + DNS + one UDP socket for SNTP (+1 spare).
-        let resources = Box::leak(Box::new(StackResources::<4>::new()));
+        // DHCP/DNS/SNTP plus persistent FTP control + data TCP sockets.
+        // Keep spare slots for a DNS query while the FTP sockets exist.
+        let resources = Box::leak(Box::new(StackResources::<8>::new()));
         let (stack, runner) = embassy_net::new(
             interface,
             Config::dhcpv4(Default::default()),
@@ -60,11 +61,22 @@ impl Network {
         }
     }
 
+    pub fn stack(&self) -> Stack<'static> {
+        self.stack
+    }
+
+    /// Advance only the network driver. FTP burst-polls this without advancing
+    /// (and accidentally consuming) an SNTP completion result.
+    pub fn poll_stack(&mut self) {
+        let mut context = Context::from_waker(Waker::noop());
+        let _ = self.runner.as_mut().poll(&mut context);
+    }
+
     /// Advance the stack and the SNTP job without blocking. Returns the SNTP
     /// result (Unix seconds) in the iteration the job finishes.
     pub fn poll(&mut self) -> Option<Result<u64, SntpError>> {
+        self.poll_stack();
         let mut context = Context::from_waker(Waker::noop());
-        let _ = self.runner.as_mut().poll(&mut context);
         let job = self.sntp.as_mut()?;
         match job.as_mut().poll(&mut context) {
             Poll::Ready(result) => {
@@ -99,8 +111,7 @@ impl Network {
 }
 
 async fn sntp_query(stack: Stack<'static>, server: String) -> Result<u64, SntpError> {
-    let address = match with_timeout(DNS_TIMEOUT, stack.dns_query(&server, DnsQueryType::A)).await
-    {
+    let address = match with_timeout(DNS_TIMEOUT, stack.dns_query(&server, DnsQueryType::A)).await {
         Ok(Ok(addresses)) if !addresses.is_empty() => addresses[0],
         _ => {
             log::warn!("DNS lookup of {server} failed, using fallback NTP server");
