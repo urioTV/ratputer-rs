@@ -8,8 +8,9 @@
 //!
 //! FAT access goes through `hadris-fat`. Open handles (`FatDir`, `FileReader`,
 //! `FileWriter`) borrow the volume, so they are created, used, and dropped
-//! within a single poll step; transfer state between polls is only paths and
-//! byte offsets. Writes are write-through (no FAT cache), so the 226 reply
+//! within a single poll step; transfer state between polls is paths, offsets,
+//! and opaque validated FAT cursors (append + read). Writes are write-through
+//! (no FAT cache), so the 226 reply
 //! means the data physically reached the card.
 
 use alloc::boxed::Box;
@@ -23,7 +24,11 @@ use embassy_net::tcp::{State, TcpSocket};
 use embassy_net::{IpAddress, Ipv4Address, Stack};
 use embassy_time::Duration as NetDuration;
 use esp_hal::time::Instant;
-use hadris_fat::sync::{FatDir, FileEntry, SeekFrom};
+use hadris_fat::sync::{
+    read::{FileReader, ReadCursor},
+    write::{AppendCursor, FileWriter},
+    FatDir, FileEntry, SeekFrom,
+};
 use hadris_fat::time::FatDateTime;
 
 use crate::storage::{fmt_fat_mtime, now_ymdhms, FtpConfig, SdBlock, SdVolume};
@@ -40,8 +45,8 @@ const LIST_CHUNK_TARGET: usize = 3072;
 const MAX_COMMAND_LINE: usize = 512;
 /// Close idle control connections after 5 minutes.
 const IDLE_TIMEOUT_SECS: u64 = 300;
-/// Drop any session that received no bytes for this long, even mid-transfer
-/// (dead clients without FIN hold the single-client port otherwise).
+/// Drop any session with no control or data progress for this long. Data
+/// progress refreshes the timer, so large healthy transfers are not capped.
 const LIVEN_TIMEOUT_SECS: u64 = 120;
 /// Give the client this long to open its data connection after PASV.
 const DATA_ACCEPT_TIMEOUT_SECS: u64 = 20;
@@ -133,12 +138,17 @@ enum TransferKind {
         parent: Vec<String>,
         leaf: String,
         offset: u64,
+        /// FAT cluster position after the last read chunk.
+        cursor: Option<ReadCursor>,
     },
     Store {
         parent: Vec<String>,
         leaf: String,
         /// True once the entry exists and initial write succeeded.
         initialized: bool,
+        /// FAT tail position after the last committed chunk. This avoids an
+        /// O(n) chain walk for every independently-polled append.
+        cursor: Option<AppendCursor>,
     },
 }
 
@@ -231,10 +241,11 @@ impl FtpServer {
         let data_tx = Box::leak(Box::new([0_u8; DATA_TX_LEN]));
         let mut control = TcpSocket::new(stack, control_rx, control_tx);
         let mut data = TcpSocket::new(stack, data_rx, data_tx);
-        // Reclaim sockets wedged in FIN_WAIT instead of leaking the fixed port.
-        // 45 s is well below the 5-minute session idle timeout, so a vanished
-        // client frees the control port quickly.
-        control.set_timeout(Some(NetDuration::from_secs(45)));
+        // Session-level idle/liveness checks reclaim dead control clients and
+        // are refreshed by data progress. A transport timeout on the control
+        // socket would incorrectly reset any transfer lasting over 45 seconds.
+        control.set_timeout(None);
+        // A stalled passive data connection still needs a bounded recovery.
         data.set_timeout(Some(NetDuration::from_secs(45)));
         Self {
             control,
@@ -352,16 +363,14 @@ impl FtpServer {
         if self.session.is_some() {
             let mut session = self.session.take().unwrap();
             if self.poll_session(volume, &mut session, config) {
-                // Session over: abort whatever survived and re-listen lazily.
+                // Session over: discard teardown states and arm the single
+                // listener immediately. This removes the brief refused window
+                // seen by clients that reconnect right after QUIT.
                 let _ = session.transfer.take();
                 let _ = session.pending.take();
-                if !matches!(
-                    self.control.state(),
-                    State::Closed | State::TimeWait | State::LastAck
-                ) {
-                    self.control.abort();
-                }
-                self.control_listening = false;
+                self.control.abort();
+                let _ = poll_once(self.control.accept(CONTROL_PORT));
+                self.control_listening = true;
                 self.data.abort();
                 self.data_listening = false;
                 log::info!("FTP client {} left", session.peer);
@@ -622,6 +631,7 @@ impl FtpServer {
                         parent: parent.clone(),
                         leaf: leaf.clone(),
                         offset: *offset,
+                        cursor: None,
                     },
                     announced: false,
                     chunk: Vec::new(),
@@ -644,6 +654,7 @@ impl FtpServer {
                         parent: parent.clone(),
                         leaf: leaf.clone(),
                         initialized: false,
+                        cursor: None,
                     },
                     announced: false,
                     chunk: Vec::new(),
@@ -699,12 +710,7 @@ impl FtpServer {
     }
 
     /// One slice of work per poll: either send queued bytes or produce more.
-    fn step_transfer(
-        &mut self,
-        volume: &SdVolume,
-        transfer: &mut Transfer,
-        _session: &mut Session,
-    ) {
+    fn step_transfer(&mut self, volume: &SdVolume, transfer: &mut Transfer, session: &mut Session) {
         let socket_dead = !self.data.may_send() && !self.data.may_recv();
 
         // Send what is already queued.
@@ -714,6 +720,7 @@ impl FtpServer {
                     Some(Ok(count)) if count > 0 => {
                         transfer.chunk_sent += count;
                         self.stats.sent_bytes += count as u64;
+                        session.last_activity = Instant::now();
                     }
                     Some(Ok(_)) | None => {}
                     Some(Err(_)) => transfer.failed = Some("pipe"),
@@ -753,20 +760,24 @@ impl FtpServer {
                 parent,
                 leaf,
                 offset,
-            } => match read_file_slice(volume, parent, leaf, *offset, &mut transfer.chunk) {
-                Ok(read) => {
-                    *offset += read as u64;
-                    transfer.chunk_sent = 0;
-                    if read == 0 {
-                        transfer.finishing = true;
+                cursor,
+            } => {
+                match read_file_slice(volume, parent, leaf, *offset, cursor, &mut transfer.chunk) {
+                    Ok(read) => {
+                        *offset += read as u64;
+                        transfer.chunk_sent = 0;
+                        if read == 0 {
+                            transfer.finishing = true;
+                        }
                     }
+                    Err(()) => transfer.failed = Some("read"),
                 }
-                Err(()) => transfer.failed = Some("read"),
-            },
+            }
             TransferKind::Store {
                 parent,
                 leaf,
                 initialized,
+                cursor,
             } => {
                 // Receive first: the client pushes the stream.
                 if self.data.can_recv() {
@@ -778,11 +789,14 @@ impl FtpServer {
                                 parent,
                                 leaf,
                                 *initialized,
+                                cursor.take(),
                                 &buffer[..count],
                             ) {
-                                Ok(()) => {
+                                Ok(next_cursor) => {
                                     *initialized = true;
+                                    *cursor = Some(next_cursor);
                                     self.stats.received_bytes += count as u64;
+                                    session.last_activity = Instant::now();
                                 }
                                 Err(()) => transfer.failed = Some("write"),
                             }
@@ -1155,13 +1169,24 @@ fn read_file_slice(
     parent: &[String],
     leaf: &str,
     offset: u64,
+    cursor: &mut Option<ReadCursor>,
     chunk: &mut Vec<u8>,
 ) -> Result<usize, ()> {
     let dir = open_dir_path(volume, parent).ok_or(())?;
-    let mut reader = dir.open_file(leaf).map_err(|_| ())?;
-    reader.seek(SeekFrom::Start(offset)).map_err(|_| ())?;
+    let entry = dir.find(leaf).map_err(|_| ())?.ok_or(())?;
+    if entry.is_directory() {
+        return Err(());
+    }
+    let mut reader = if let Some(cursor) = cursor.take() {
+        FileReader::new_from_cursor(volume, &entry, cursor).map_err(|_| ())?
+    } else {
+        let mut reader = FileReader::new(volume, &entry).map_err(|_| ())?;
+        reader.seek(SeekFrom::Start(offset)).map_err(|_| ())?;
+        reader
+    };
     let mut buffer = [0_u8; FILE_CHUNK_LEN];
     let read = reader.read(&mut buffer).map_err(|_| ())?;
+    *cursor = Some(reader.cursor());
     chunk.extend_from_slice(&buffer[..read]);
     Ok(read)
 }
@@ -1174,8 +1199,9 @@ fn append_file_slice(
     parent: &[String],
     leaf: &str,
     initialized: bool,
+    cursor: Option<AppendCursor>,
     data: &[u8],
-) -> Result<(), ()> {
+) -> Result<AppendCursor, ()> {
     let dir = open_dir_path(volume, parent).ok_or(())?;
     let entry = match dir.find(leaf) {
         Ok(Some(entry)) if !entry.is_directory() => {
@@ -1188,13 +1214,20 @@ fn append_file_slice(
             }
         }
         Ok(Some(_)) => return Err(()), // directory collision
-        Ok(None) => volume.create_file(&dir, leaf).map_err(|_| ())?,
-        Err(_) => return Err(()),
+        Ok(None) if !initialized => volume.create_file(&dir, leaf).map_err(|_| ())?,
+        Ok(None) | Err(_) => return Err(()),
     };
-    let mut writer =
-        hadris_fat::sync::write::FileWriter::new_append(volume, &entry).map_err(|_| ())?;
-    writer.write(data).map_err(|_| ())?;
-    writer.finish().map_err(|_| ())
+    let mut writer = if initialized {
+        FileWriter::new_append_from_cursor(volume, &entry, cursor.ok_or(())?).map_err(|_| ())?
+    } else {
+        FileWriter::new(volume, &entry).map_err(|_| ())?
+    };
+    if writer.write(data).map_err(|_| ())? != data.len() {
+        return Err(());
+    }
+    let next_cursor = writer.append_cursor();
+    writer.finish().map_err(|_| ())?;
+    Ok(next_cursor)
 }
 
 /// Append up to `LIST_CHUNK_TARGET` bytes of entry lines, skipping the first
@@ -1213,12 +1246,15 @@ fn fill_listing(
     loop {
         match iter.next_entry() {
             Some(Ok(hadris_fat::dir::DirectoryEntry::Entry(entry))) => {
-                if skip > 0 {
-                    skip -= 1;
-                    continue;
-                }
                 let name = entry.name().into_owned();
                 if name == "." || name == ".." || name.contains('\r') || name.contains('\n') {
+                    continue;
+                }
+                // `skip` counts visible entries, just like `produced`. Applying
+                // it before filtering FAT's dot entries makes every follow-up
+                // chunk repeat the final two visible names.
+                if skip > 0 {
+                    skip -= 1;
                     continue;
                 }
                 let line = listing_line(kind, &entry);
