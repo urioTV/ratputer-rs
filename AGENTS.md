@@ -144,7 +144,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   (Open/Wep/Wpa/Wpa2Personal/WpaWpa2Personal) — WPA3-only APs are marked unsupported.
 - SD: dedicated SPI3, SCLK=G40 MOSI=G14 MISO=G39 CS=G12. Initialize at **400 kHz**,
   call `get_card_type()` to complete identification, then use `SdCard::spi` →
-  `ExclusiveDevice::bus_mut()` → `Spi::apply_config` to switch to **10 MHz**.
+  `ExclusiveDevice::bus_mut()` → `Spi::apply_config` to switch to **20 MHz**.
   `embedded_sdmmc::SdCard::new(SpiDevice,...)` + `VolumeManager` (RefCell inside →
   all methods `&self`). Files: 8.3 uppercase FAT
   names (`RATPUTER/WIFI.CFG`), `embedded_io::Write` + `flush` required.
@@ -200,10 +200,12 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   writes. Block writes themselves are synchronous; SYNCHRONIZE CACHE succeeds.
 - Development descriptors use VID:PID `CAFE:4002`; obtain real identifiers before
   product distribution.
-- USB sector traffic uses the 10 MHz post-init SPI clock. Never construct the card
-  at 10 MHz: identification must remain ≤400 kHz, and only `apply_config` after a
-  successful `get_card_type()` may raise it. The default-speed SD limit is 25 MHz;
-  10 MHz leaves margin for the ADV's GPIO-matrix routing.
+- USB sector traffic uses the 20 MHz post-init SPI clock. Never construct the card
+  at 20 MHz: identification must remain ≤400 kHz, and only `apply_config` after a
+  successful `get_card_type()` may raise it. The default-speed SD limit is 25 MHz.
+  SPI3 has no IOMUX pins on the S3, so the bus goes through the GPIO matrix; 20 MHz
+  keeps margin for MISO sampling. If a card shows read errors (`C` stays low, host
+  I/O errors), fall back to 10 MHz before suspecting the MSC code.
 
 ## Network, clock, battery (top bar)
 

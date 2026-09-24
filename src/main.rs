@@ -311,7 +311,7 @@ fn main() -> ! {
 
     // --- SD card on dedicated SPI3: SCLK=G40, MOSI=G14, MISO=G39, CS=G12 ---
     // SD identification MUST run at <=400 kHz. After it succeeds, switch to a
-    // conservative 10 MHz data clock (the SPI default-speed limit is 25 MHz).
+    // 20 MHz data clock, below the 25 MHz SD default-speed limit.
     let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
     let sd_spi = Spi::new(
         peripherals.SPI3,
@@ -324,12 +324,12 @@ fn main() -> ! {
     let sd_device = ExclusiveDevice::new(sd_spi, sd_cs, Delay::new()).unwrap();
     let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
     if let Some(card_type) = sd_card.get_card_type() {
-        let fast_config = SpiConfig::default().with_frequency(Rate::from_mhz(10));
+        let fast_config = SpiConfig::default().with_frequency(Rate::from_mhz(20));
         if sd_card
             .spi(|device| device.bus_mut().apply_config(&fast_config))
             .is_ok()
         {
-            log::info!("SD initialized as {card_type:?}; SPI clock raised to 10 MHz");
+            log::info!("SD initialized as {card_type:?}; SPI clock raised to 20 MHz");
         } else {
             log::warn!("SD initialized, but SPI remained at 400 kHz");
         }

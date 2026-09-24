@@ -101,7 +101,7 @@ SD wiring uses the ADV's dedicated SPI3 bus:
 | G12 | CS |
 
 The card is identified at the standards-compliant 400 kHz startup clock. After
-successful initialization, SPI3 switches to a conservative 10 MHz data clock
+successful initialization, SPI3 switches to a 20 MHz data clock
 (the SD default-speed limit is 25 MHz).
 
 ### USB Mass Storage
@@ -136,7 +136,7 @@ impossible while the host owns the card.
 Backspace to exit.** The first exit attempt while the host is still mounted shows
 a warning; pressing exit again forces disconnection for recovery after an
 unplugged cable and can corrupt pending host writes. USB sector traffic uses the
-post-initialization 10 MHz SD data clock.
+post-initialization 20 MHz SD data clock.
 
 The USB-OTG controller shares its PHY with ESP32-S3 USB-Serial-JTAG. The firmware
 switches to OTG only when USB DISK opens and restores Serial/JTAG when it closes;
