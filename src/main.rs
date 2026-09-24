@@ -33,6 +33,7 @@ use esp_println as _;
 
 mod battery;
 mod clock;
+mod debug;
 mod ftp;
 mod msc;
 mod net;
@@ -195,6 +196,74 @@ fn set_password(ui: &MainWindow, password: &str) {
     ui.set_wifi_password(password.into());
 }
 
+fn view_name(view: i32) -> &'static str {
+    match view {
+        0 => "menu",
+        1 => "rat",
+        2 => "wifi_menu",
+        3 => "wifi_saved",
+        4 => "wifi_scan",
+        5 => "wifi_password",
+        6 => "about",
+        7 => "usb_disk",
+        8 => "ftp",
+        9 => "ftp_password",
+        _ => "unknown",
+    }
+}
+
+fn apply_debug_key(ui: &MainWindow, key: debug::DebugKey) {
+    match key {
+        debug::DebugKey::Up => ui.invoke_key_pressed("up".into()),
+        debug::DebugKey::Down => ui.invoke_key_pressed("down".into()),
+        debug::DebugKey::Left => ui.invoke_key_pressed("left".into()),
+        debug::DebugKey::Right => ui.invoke_key_pressed("right".into()),
+        debug::DebugKey::Enter => ui.invoke_key_pressed("enter".into()),
+        debug::DebugKey::Back => ui.invoke_key_pressed("back".into()),
+        debug::DebugKey::Delete => ui.invoke_key_pressed("delete".into()),
+        debug::DebugKey::Tab => ui.invoke_key_pressed("tab".into()),
+        debug::DebugKey::Space => ui.invoke_key_pressed("space".into()),
+        debug::DebugKey::Backspace if ui.get_view_state() == 5 => {
+            let mut password = ui.get_wifi_password().to_string();
+            password.pop();
+            set_password(ui, &password);
+        }
+        debug::DebugKey::Backspace if ui.get_view_state() == 9 => {
+            let mut password = ui.get_ftp_password().to_string();
+            password.pop();
+            ui.set_ftp_password(password.into());
+        }
+        debug::DebugKey::Backspace => ui.invoke_key_pressed("back".into()),
+    }
+}
+
+fn append_debug_text(ui: &MainWindow, text: &str) -> Result<(), &'static str> {
+    match ui.get_view_state() {
+        5 => {
+            let mut password = ui.get_wifi_password().to_string();
+            if password.len() + text.len() > 64 {
+                return Err("wifi_text_too_long");
+            }
+            password.push_str(text);
+            set_password(ui, &password);
+            Ok(())
+        }
+        9 => {
+            if !text.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err("ftp_text_disallows_spaces");
+            }
+            let mut password = ui.get_ftp_password().to_string();
+            if password.len() + text.len() > 32 {
+                return Err("ftp_text_too_long");
+            }
+            password.push_str(text);
+            ui.set_ftp_password(password.into());
+            Ok(())
+        }
+        _ => Err("text_entry_not_active"),
+    }
+}
+
 /// Blocking radio work split into steps (one scan pass / one connect attempt),
 /// so the UI keeps redrawing a spinner + progress between the steps.
 enum RadioStep {
@@ -260,6 +329,11 @@ fn main() -> ! {
 
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     let mut delay = Delay::new();
+
+    // The hardware USB Serial/JTAG CDC endpoint carries both normal logs and a
+    // prefixed command protocol used by `ratctl`. USB MSC temporarily takes the
+    // shared PHY, so debug commands pause while the SD is exported.
+    let mut debug_console = debug::DebugConsole::new(peripherals.USB_DEVICE);
 
     // Native USB-OTG uses the ESP32-S3's fixed D+=GPIO20 / D-=GPIO19 pins.
     let usb =
@@ -439,6 +513,7 @@ fn main() -> ! {
     let mut next_usb_stats_at = Instant::now();
     let mut next_ftp_stats_at = Instant::now();
     let mut usb_force_exit_armed = false;
+    let mut debug_reboot_requested = false;
     loop {
         slint::platform::update_timers_and_animations();
 
@@ -448,6 +523,214 @@ fn main() -> ! {
         if !splash_done && now - splash_start >= Duration::from_millis(SPLASH_AFTER_MS) {
             ui.set_splash_done(true);
             splash_done = true;
+        }
+
+        // USB debug control is intentionally handled before physical input, so
+        // an attached host can drive the exact same Slint navigation callbacks.
+        if let Some(command) = debug_console.poll() {
+            match command {
+                debug::DebugCommand::Ping { id } => {
+                    debug_console.ok(id, format_args!("PONG protocol=1"));
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Help { id } => {
+                    debug_console.ok(id, format_args!("commands"));
+                    debug_console.data(id, format_args!("PING"));
+                    debug_console.data(id, format_args!("STATUS"));
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "KEY up|down|left|right|enter|back|backspace|delete|tab|space"
+                        ),
+                    );
+                    debug_console.data(id, format_args!("TEXT <printable ASCII>"));
+                    debug_console.data(id, format_args!("CLEAR"));
+                    debug_console.data(id, format_args!("REBOOT"));
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Status { id } => {
+                    let view = ui.get_view_state();
+                    debug_console.ok(id, format_args!("status"));
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "system uptime_ms={} heap_free={}",
+                            now.duration_since_epoch().as_millis(),
+                            esp_alloc::HEAP.free()
+                        ),
+                    );
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "ui view={} name={} menu={} wifi_menu={} saved={} scan={}",
+                            view,
+                            view_name(view),
+                            ui.get_menu_index(),
+                            ui.get_wifi_menu_index(),
+                            ui.get_saved_index(),
+                            ui.get_scan_index()
+                        ),
+                    );
+                    let radio = match radio_pending.as_ref() {
+                        Some(RadioStep::Scan { .. }) => "scan",
+                        Some(RadioStep::Connect { .. }) => "connect",
+                        None => "idle",
+                    };
+                    let wifi_status = ui.get_wifi_status();
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "wifi link={} radio={} status={:?}",
+                            ui.get_link_state(),
+                            radio,
+                            wifi_status.as_str()
+                        ),
+                    );
+                    if let Some(network) = network.as_ref() {
+                        let ipv4 = network
+                            .stack()
+                            .config_v4()
+                            .map(|config| config.address.address());
+                        debug_console.data(
+                            id,
+                            format_args!(
+                                "network link_up={} online={} ipv4={ipv4:?}",
+                                network.is_link_up(),
+                                network.is_online()
+                            ),
+                        );
+                    } else {
+                        debug_console.data(id, format_args!("network unavailable"));
+                    }
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "storage mounted={} usb_exported={}",
+                            storage.is_some(),
+                            usb_sd.is_some()
+                        ),
+                    );
+                    let usb_status = ui.get_usb_disk_status();
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "usb state={:?} status={:?}",
+                            usb_disk.state(),
+                            usb_status.as_str()
+                        ),
+                    );
+                    let ftp_status = ui.get_ftp_status();
+                    let ftp_addr = ui.get_ftp_addr();
+                    let ftp_peer = ftp_server.as_ref().and_then(|server| server.peer());
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "ftp state={:?} peer={ftp_peer:?} address={:?}",
+                            ftp_status.as_str(),
+                            ftp_addr.as_str()
+                        ),
+                    );
+                    let clock = ui.get_clock_text();
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "top clock={:?} synced={} battery={} ssid={:?}",
+                            clock.as_str(),
+                            ui.get_clock_synced(),
+                            ui.get_battery_percent(),
+                            ui.get_link_ssid().as_str()
+                        ),
+                    );
+                    debug_console.data(
+                        id,
+                        format_args!(
+                            "lists saved={} scan={}",
+                            wifi_config.networks.len(),
+                            scan_networks.len()
+                        ),
+                    );
+                    for (index, network) in wifi_config.networks.iter().enumerate() {
+                        debug_console.data(
+                            id,
+                            format_args!(
+                                "saved index={index} ssid={:?} auth={:?}",
+                                network.ssid, network.auth
+                            ),
+                        );
+                    }
+                    for (index, network) in scan_networks.iter().enumerate() {
+                        debug_console.data(
+                            id,
+                            format_args!(
+                                "scan index={index} ssid={:?} rssi={} auth={:?} supported={}",
+                                network.ssid,
+                                network.signal_strength,
+                                network.auth,
+                                network.supported
+                            ),
+                        );
+                    }
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Key { id, key } => {
+                    if !splash_done || radio_pending.is_some() {
+                        debug_console.error(id, format_args!("input_busy"));
+                    } else if matches!(key, debug::DebugKey::Enter)
+                        && ui.get_view_state() == 0
+                        && ui.get_menu_index() == 2
+                    {
+                        // Entering USB DISK moves this same physical PHY from
+                        // Serial/JTAG to OTG, so a remote-only session could not
+                        // send Backspace to leave it.
+                        debug_console.error(id, format_args!("usb_disk_requires_physical_input"));
+                    } else {
+                        apply_debug_key(&ui, key);
+                        debug_console.ok(
+                            id,
+                            format_args!(
+                                "key={key:?} view={} name={}",
+                                ui.get_view_state(),
+                                view_name(ui.get_view_state())
+                            ),
+                        );
+                    }
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Text { id, text } => {
+                    if !splash_done || radio_pending.is_some() {
+                        debug_console.error(id, format_args!("input_busy"));
+                    } else {
+                        match append_debug_text(&ui, text.as_str()) {
+                            Ok(()) => debug_console.ok(id, format_args!("text_accepted")),
+                            Err(reason) => debug_console.error(id, format_args!("{reason}")),
+                        }
+                    }
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Clear { id } => {
+                    match ui.get_view_state() {
+                        5 => {
+                            set_password(&ui, "");
+                            debug_console.ok(id, format_args!("wifi_text_cleared"));
+                        }
+                        9 => {
+                            ui.set_ftp_password("".into());
+                            debug_console.ok(id, format_args!("ftp_text_cleared"));
+                        }
+                        _ => debug_console.error(id, format_args!("text_entry_not_active")),
+                    }
+                    debug_console.end(id);
+                }
+                debug::DebugCommand::Reboot { id } => {
+                    debug_console.ok(id, format_args!("rebooting"));
+                    debug_console.end(id);
+                    debug_reboot_requested = true;
+                }
+                debug::DebugCommand::Invalid { id, reason } => {
+                    debug_console.error(id, format_args!("{reason}"));
+                    debug_console.end(id);
+                }
+            }
         }
 
         // Full keyboard decoding includes printable characters and the Fn layer.
@@ -987,6 +1270,14 @@ fn main() -> ! {
         window.draw_if_needed(|renderer| {
             renderer.render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
         });
+
+        // Responses are queued so a disconnected host can never block the UI.
+        // Reboot only after the acknowledgement has left the hardware FIFO.
+        debug_console.service();
+        if debug_reboot_requested && debug_console.output_idle() {
+            delay.delay_millis(20);
+            esp_hal::system::software_reset();
+        }
 
         delay.delay_millis(if ftp_busy { 1 } else { 10 });
     }

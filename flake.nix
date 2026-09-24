@@ -54,6 +54,17 @@
             exec espflash write-bin 0x0 ratputer-adv.bin
           '';
         };
+        ratctlCommand = pkgs.writeShellApplication {
+          name = "ratctl";
+          runtimeInputs = [
+            pkgs.git
+            pkgs.python3
+          ];
+          text = ''
+            project_root="$(git rev-parse --show-toplevel)"
+            exec python3 "$project_root/tools/ratctl.py" "$@"
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -67,6 +78,7 @@
             espflash
             buildCommand
             flashCommand
+            ratctlCommand
           ];
 
           # The Xtensa Rust fork, rust-src, LLVM, and GCC are supplied by Nix.
@@ -81,6 +93,7 @@
             echo "Toolchain: $(rustc --version)"
             echo "Build:     build (merged and verified image)"
             echo "Flash:     flash (build, flash, and verify)"
+            echo "Debug:     ratctl STATUS (USB command console)"
             echo ""
           '';
         };
