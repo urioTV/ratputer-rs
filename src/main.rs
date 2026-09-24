@@ -461,6 +461,9 @@ fn main() -> ! {
                             if pass < wifi::SCAN_PASSES {
                                 Some(RadioStep::Scan { pass: pass + 1 })
                             } else {
+                                // Scan done: close the busy overlay or it stays on top
+                                // of the scan view forever.
+                                ui.set_wifi_connecting(false);
                                 ui.set_wifi_status(
                                     if scan_networks.is_empty() {
                                         "NO NETWORKS FOUND"
