@@ -19,7 +19,7 @@ use embedded_sdmmc::BlockDevice;
 use esp_hal::time::{Duration, Instant};
 use esp_hal::usb::otg::{embassy_usb_device, Usb};
 
-use crate::msc::{MscClass, SharedState};
+use crate::msc::{MscClass, SharedState, Stats};
 
 /// Longest time one `poll()` call may keep driving USB before returning to the UI.
 const POLL_BUDGET: Duration = Duration::from_millis(40);
@@ -215,6 +215,10 @@ impl UsbDisk {
         } else {
             UsbDiskState::Inactive
         }
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.shared.borrow().stats()
     }
 
     pub fn can_detach(&self) -> bool {

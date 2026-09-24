@@ -425,6 +425,7 @@ fn main() -> ! {
     let mut last_battery_at: Option<Instant> = None;
     let mut usb_sd = None;
     let mut shown_usb_state = None;
+    let mut next_usb_stats_at = Instant::now();
     let mut usb_force_exit_armed = false;
     loop {
         slint::platform::update_timers_and_animations();
@@ -752,6 +753,15 @@ fn main() -> ! {
                 );
                 shown_usb_state = Some(state);
             }
+            // Refresh counters at 2 Hz only: every redraw steals time from USB.
+            if Instant::now() >= next_usb_stats_at {
+                next_usb_stats_at = Instant::now() + Duration::from_millis(500);
+                let stats = usb_disk.stats();
+                let text = usb_stats_text(stats);
+                if ui.get_usb_disk_stats() != text.as_str() {
+                    ui.set_usb_disk_stats(text.into());
+                }
+            }
         }
 
         // --- Network: DHCP/DNS/SNTP advance without blocking (one poll per iteration) ---
@@ -835,5 +845,30 @@ fn main() -> ! {
         });
 
         delay.delay_millis(10);
+    }
+}
+
+/// "R 1234K W 56K C 87%": host reads/writes and the read cache hit rate.
+fn usb_stats_text(stats: msc::Stats) -> String {
+    let hit = if stats.read_blocks == 0 {
+        0
+    } else {
+        (stats.cache_hit_blocks as u64 * 100 / stats.read_blocks as u64) as u32
+    };
+    format!(
+        "R {} W {} C {}%",
+        usb_size_text(stats.read_blocks),
+        usb_size_text(stats.write_blocks),
+        hit
+    )
+}
+
+/// Short size for 512-byte block counts; switches to MiB to fit the 240 px line.
+fn usb_size_text(blocks: u32) -> String {
+    let kib = blocks / 2;
+    if kib < 10_000 {
+        format!("{kib}K")
+    } else {
+        format!("{}M", kib / 1024)
     }
 }

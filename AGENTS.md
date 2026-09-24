@@ -170,6 +170,18 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   progress for up to 40 ms per main-loop pass. **Do not go back to one poll per loop
   with `Waker::noop()`**: every 64-byte bulk packet needs a poll, so Windows I/O
   would time out and Explorer would hang.
+- **Never call `BlockDevice::num_blocks()` per SCSI command**: embedded-sdmmc re-reads
+  the CSD over SPI every time. The capacity is cached in `SharedState` at attach.
+- Read cache (`BlockCache` in `src/msc.rs`): 3 LRU lines + 1 stream line, 8 blocks
+  each, one `static` (16 KiB .bss, not heap; it shrinks `.stack` from ~114 to ~98 KiB).
+  Misses read an aligned line via CMD18; READ(10) larger than one line uses the
+  stream line only. Writes are chunked into the stream line and written with CMD25
+  before the CSW, then patched into any cached LRU copy. The cache is invalidated on
+  every attach (`SharedState::generation`) because the firmware may have rewritten
+  `WIFI.CFG` in between. **Do not add write-back caching**: Windows treats the
+  device as quick-removal and the forced second EXIT would lose acknowledged writes.
+- The USB DISK stats line is refreshed at 2 Hz only; every Slint redraw pauses USB
+  servicing for the duration of the SPI frame.
 - The USB task is created once (descriptor/endpoint buffers are leaked `Box`es) and
   kept across USB DISK sessions; `detach()` only clears the backend and swaps the
   PHY back. Re-attaching relies on the host's bus reset to resynchronise BOT.

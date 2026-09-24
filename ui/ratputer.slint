@@ -33,6 +33,7 @@ export component MainWindow inherits Window {
     // Firmware polls and clears this command: 1 attach/export SD, 2 detach.
     in-out property <int> usb-disk-action: 0;
     in property <string> usb-disk-status: "USB NOT ACTIVE";
+    in property <string> usb-disk-stats: "";
 
     // Top bar (main screen only): clock, Wi-Fi link, battery.
     in property <string> clock-text: "--:--";
@@ -457,13 +458,7 @@ export component MainWindow inherits Window {
                     spacing: 5px;
                     Text { text: "USB DISK"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
                     Rectangle { height: 1px; background: #0d2b16; }
-                    Text {
-                        text: "SD CARD IS EXCLUSIVE TO USB\nWHILE THIS SCREEN IS OPEN";
-                        color: #46a06a;
-                        font-size: 8px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                    Text { text: "SD IS EXCLUSIVE TO USB"; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
                     Rectangle {
                         height: 24px;
                         border-width: 1px;
@@ -477,6 +472,7 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                         }
                     }
+                    Text { text: root.usb-disk-stats; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
                     Text { text: "EJECT ON PC BEFORE EXIT"; color: #ffb347; font-size: 8px; horizontal-alignment: center; }
                     Text { text: "ENTER/BS = EXIT"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 12px; }
                 }

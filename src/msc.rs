@@ -53,9 +53,17 @@ const ASC_WRITE_ERROR: u8 = 0x0c;
 const ASC_INVALID_COMMAND: u8 = 0x20;
 const ASC_INVALID_FIELD: u8 = 0x24;
 
+/// Blocks moved by one SD multi-block command and held by one cache line.
+const LINE_BLOCKS: usize = 8;
+/// LRU lines for small, repeated reads (FAT, directories, boot sector).
+const CACHE_LINES: usize = 3;
+/// Index of the extra line used for large sequential transfers, so they do not
+/// evict the metadata cached in the LRU lines.
+const STREAM_LINE: usize = CACHE_LINES;
+
 type CountFn = unsafe fn(*const ()) -> u32;
-type ReadFn = unsafe fn(*const (), u32, &mut [u8; Block::LEN]) -> bool;
-type WriteFn = unsafe fn(*const (), u32, &[u8; Block::LEN]) -> bool;
+type ReadFn = unsafe fn(*const (), u32, &mut [Block]) -> bool;
+type WriteFn = unsafe fn(*const (), u32, &[Block]) -> bool;
 
 #[derive(Clone, Copy)]
 struct Backend {
@@ -68,10 +76,10 @@ struct Backend {
 unsafe fn no_count(_: *const ()) -> u32 {
     0
 }
-unsafe fn no_read(_: *const (), _: u32, _: &mut [u8; Block::LEN]) -> bool {
+unsafe fn no_read(_: *const (), _: u32, _: &mut [Block]) -> bool {
     false
 }
-unsafe fn no_write(_: *const (), _: u32, _: &[u8; Block::LEN]) -> bool {
+unsafe fn no_write(_: *const (), _: u32, _: &[Block]) -> bool {
     false
 }
 
@@ -93,22 +101,40 @@ struct Sense {
     ascq: u8,
 }
 
+/// Transfer counters shown on the USB DISK screen, in 512-byte blocks.
+#[derive(Clone, Copy, Default)]
+pub struct Stats {
+    pub read_blocks: u32,
+    pub write_blocks: u32,
+    pub cache_hit_blocks: u32,
+}
+
 pub struct SharedState {
     backend: Backend,
+    /// Card capacity, read once on attach. `num_blocks()` re-reads the CSD
+    /// register over SPI, far too slow for every SCSI command.
+    blocks: u32,
+    /// Bumped on every attach so the class drops blocks cached in an earlier
+    /// session; the firmware may have rewritten the card in between.
+    generation: u32,
     attached: bool,
     configured: bool,
     ejected: bool,
     sense: Sense,
+    stats: Stats,
 }
 
 impl Default for SharedState {
     fn default() -> Self {
         Self {
             backend: Backend::default(),
+            blocks: 0,
+            generation: 0,
             attached: false,
             configured: false,
             ejected: false,
             sense: Sense::default(),
+            stats: Stats::default(),
         }
     }
 }
@@ -118,16 +144,20 @@ impl SharedState {
         self.backend = Backend {
             context: (device as *const D).cast(),
             count: block_count::<D>,
-            read: read_block::<D>,
-            write: write_block::<D>,
+            read: read_blocks::<D>,
+            write: write_blocks::<D>,
         };
+        self.blocks = unsafe { (self.backend.count)(self.backend.context) };
+        self.generation = self.generation.wrapping_add(1);
         self.attached = true;
         self.ejected = false;
         self.sense = Sense::default();
+        self.stats = Stats::default();
     }
 
     pub fn detach(&mut self) {
         self.backend = Backend::default();
+        self.blocks = 0;
         self.attached = false;
         self.configured = false;
         self.ejected = false;
@@ -145,13 +175,17 @@ impl SharedState {
         self.ejected
     }
 
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
     fn ready(&self) -> bool {
-        self.attached && !self.ejected && unsafe { (self.backend.count)(self.backend.context) != 0 }
+        self.block_count() != 0
     }
 
     fn block_count(&self) -> u32 {
         if self.attached && !self.ejected {
-            unsafe { (self.backend.count)(self.backend.context) }
+            self.blocks
         } else {
             0
         }
@@ -169,32 +203,104 @@ unsafe fn block_count<D: BlockDevice>(context: *const ()) -> u32 {
         .unwrap_or(0)
 }
 
-unsafe fn read_block<D: BlockDevice>(
-    context: *const (),
-    lba: u32,
-    output: &mut [u8; Block::LEN],
-) -> bool {
-    let mut block = [Block::new()];
-    if (&*context.cast::<D>())
-        .read(&mut block, BlockIdx(lba))
-        .is_err()
-    {
-        return false;
-    }
-    output.copy_from_slice(&block[0].contents);
-    true
+// embedded-sdmmc issues CMD18/CMD25 for multi-block slices, so one call moves a
+// whole cache line with a single command/response exchange.
+unsafe fn read_blocks<D: BlockDevice>(context: *const (), lba: u32, blocks: &mut [Block]) -> bool {
+    (&*context.cast::<D>()).read(blocks, BlockIdx(lba)).is_ok()
 }
 
-unsafe fn write_block<D: BlockDevice>(
-    context: *const (),
-    lba: u32,
-    input: &[u8; Block::LEN],
-) -> bool {
-    let mut block = Block::new();
-    block.contents.copy_from_slice(input);
-    (&*context.cast::<D>())
-        .write(core::slice::from_ref(&block), BlockIdx(lba))
-        .is_ok()
+unsafe fn write_blocks<D: BlockDevice>(context: *const (), lba: u32, blocks: &[Block]) -> bool {
+    (&*context.cast::<D>()).write(blocks, BlockIdx(lba)).is_ok()
+}
+
+struct Line {
+    valid: bool,
+    /// First LBA held by the line (aligned to `LINE_BLOCKS` for cached reads).
+    start: u32,
+    len: u32,
+    last_used: u32,
+    data: [Block; LINE_BLOCKS],
+}
+
+impl Line {
+    fn contains(&self, lba: u32) -> bool {
+        self.valid && lba >= self.start && lba - self.start < self.len
+    }
+}
+
+/// Read cache in front of the SD card. Writes go through to the card before the
+/// CSW is sent (no write-back), and update any cached copy of the same blocks.
+struct BlockCache {
+    lines: [Line; CACHE_LINES + 1],
+    clock: u32,
+}
+
+impl BlockCache {
+    fn invalidate(&mut self) {
+        for line in &mut self.lines {
+            line.valid = false;
+        }
+    }
+
+    fn find(&mut self, lba: u32) -> Option<usize> {
+        let index = self.lines.iter().position(|line| line.contains(lba))?;
+        self.clock = self.clock.wrapping_add(1);
+        self.lines[index].last_used = self.clock;
+        Some(index)
+    }
+
+    fn victim(&mut self, streaming: bool) -> usize {
+        if streaming {
+            return STREAM_LINE;
+        }
+        let mut index = 0;
+        for (candidate, line) in self.lines[..CACHE_LINES].iter().enumerate() {
+            if !line.valid {
+                return candidate;
+            }
+            if line.last_used < self.lines[index].last_used {
+                index = candidate;
+            }
+        }
+        index
+    }
+
+    /// Refresh cached copies of `count` blocks just written from the stream line.
+    fn update_from_stream(&mut self, lba: u32, count: usize) {
+        let (lines, stream) = self.lines.split_at_mut(STREAM_LINE);
+        let blocks = &stream[0].data[..count];
+        for line in lines {
+            for (offset, block) in blocks.iter().enumerate() {
+                let target = lba + offset as u32;
+                if line.contains(target) {
+                    line.data[(target - line.start) as usize]
+                        .contents
+                        .copy_from_slice(&block.contents);
+                }
+            }
+        }
+    }
+}
+
+/// 16 KiB of internal SRAM, kept out of the 150 KiB heap shared with Wi-Fi and
+/// Slint. `MscClass` is created once, so the cache has exactly one owner.
+static mut CACHE: core::mem::MaybeUninit<BlockCache> = core::mem::MaybeUninit::zeroed();
+
+async fn write_packets<E: EndpointIn>(endpoint: &mut E, data: &[u8]) -> Result<(), EndpointError> {
+    for chunk in data.chunks(BULK_PACKET_SIZE as usize) {
+        endpoint.write(chunk).await?;
+    }
+    Ok(())
+}
+
+async fn read_packets<E: EndpointOut>(endpoint: &mut E, data: &mut [u8]) -> Result<(), EndpointError> {
+    for chunk in data.chunks_mut(BULK_PACKET_SIZE as usize) {
+        let count = endpoint.read(chunk).await?;
+        if count != chunk.len() {
+            return Err(EndpointError::BufferOverflow);
+        }
+    }
+    Ok(())
 }
 
 struct ControlHandler {
@@ -301,6 +407,8 @@ pub struct MscClass<'d, D: Driver<'d>> {
     endpoint_out: D::EndpointOut,
     endpoint_in: D::EndpointIn,
     shared: Rc<RefCell<SharedState>>,
+    cache: &'static mut BlockCache,
+    cache_generation: u32,
 }
 
 impl<'d, D: Driver<'d>> MscClass<'d, D> {
@@ -329,10 +437,17 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             shared: shared.clone(),
         })));
 
+        // SAFETY: `UsbDisk` builds the class once, so this is the only reference;
+        // an all-zero `BlockCache` is valid (invalid lines, zeroed blocks).
+        let cache = unsafe { (*ptr::addr_of_mut!(CACHE)).assume_init_mut() };
+        cache.invalidate();
+
         Self {
             endpoint_out,
             endpoint_in,
             shared,
+            cache,
+            cache_generation: 0,
         }
     }
 
@@ -376,6 +491,11 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
 
     async fn execute(&mut self, cbw: Cbw) -> (u32, CommandStatus) {
         let _command_len = cbw.command_len;
+        let generation = self.shared.borrow().generation;
+        if generation != self.cache_generation {
+            self.cache.invalidate();
+            self.cache_generation = generation;
+        }
         match cbw.command[0] {
             SCSI_TEST_UNIT_READY => self.test_unit_ready(cbw),
             SCSI_REQUEST_SENSE => self.request_sense(cbw).await,
@@ -565,20 +685,56 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             return (cbw.transfer_len, CommandStatus::Failed);
         }
 
+        // Small reads (FAT, directories) go through the LRU lines; large ones use
+        // the stream line so file data does not evict filesystem metadata.
+        let streaming = blocks as usize > LINE_BLOCKS;
+        let end = lba + blocks;
+        let mut current = lba;
         let mut residue = cbw.transfer_len;
-        let mut block = [0_u8; Block::LEN];
-        for index in 0..blocks {
-            let backend = self.shared.borrow().backend;
-            if !unsafe { (backend.read)(backend.context, lba + index, &mut block) } {
-                self.shared
-                    .borrow_mut()
-                    .set_sense(SENSE_MEDIUM_ERROR, ASC_UNRECOVERED_READ, 0);
-                return (residue, CommandStatus::Failed);
+        while current < end {
+            let (index, hit) = match self.cache.find(current) {
+                Some(index) => (index, true),
+                None => {
+                    let index = self.cache.victim(streaming);
+                    let start = current & !(LINE_BLOCKS as u32 - 1);
+                    let len = (LINE_BLOCKS as u32).min(count - start);
+                    let backend = self.shared.borrow().backend;
+                    let line = &mut self.cache.lines[index];
+                    line.valid = false;
+                    if !unsafe { (backend.read)(backend.context, start, &mut line.data[..len as usize]) } {
+                        self.shared
+                            .borrow_mut()
+                            .set_sense(SENSE_MEDIUM_ERROR, ASC_UNRECOVERED_READ, 0);
+                        return (residue, CommandStatus::Failed);
+                    }
+                    line.valid = true;
+                    line.start = start;
+                    line.len = len;
+                    self.cache.clock = self.cache.clock.wrapping_add(1);
+                    self.cache.lines[index].last_used = self.cache.clock;
+                    (index, false)
+                }
+            };
+
+            let line = &self.cache.lines[index];
+            let first = (current - line.start) as usize;
+            let last = ((end - line.start) as usize).min(line.len as usize);
+            let next = line.start + last as u32;
+            for block in &line.data[first..last] {
+                if write_packets(&mut self.endpoint_in, &block.contents).await.is_err() {
+                    return (residue, CommandStatus::PhaseError);
+                }
+                residue -= Block::LEN as u32;
             }
-            if self.write_all(&block).await.is_err() {
-                return (residue, CommandStatus::PhaseError);
+
+            let moved = (last - first) as u32;
+            let mut shared = self.shared.borrow_mut();
+            shared.stats.read_blocks = shared.stats.read_blocks.wrapping_add(moved);
+            if hit {
+                shared.stats.cache_hit_blocks = shared.stats.cache_hit_blocks.wrapping_add(moved);
             }
-            residue -= Block::LEN as u32;
+            drop(shared);
+            current = next;
         }
         (residue, CommandStatus::Passed)
     }
@@ -605,24 +761,42 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             return (cbw.transfer_len, CommandStatus::Failed);
         }
 
+        // Collect up to one line from USB, then write it with a single CMD25.
+        // The write completes on the card before the CSW reports success.
+        let end = lba + blocks;
+        let mut current = lba;
         let mut residue = cbw.transfer_len;
-        let mut block = [0_u8; Block::LEN];
-        for index in 0..blocks {
-            if self.read_exact(&mut block).await.is_err() {
-                return (residue, CommandStatus::PhaseError);
+        while current < end {
+            let count = ((end - current) as usize).min(LINE_BLOCKS);
+            let line = &mut self.cache.lines[STREAM_LINE];
+            line.valid = false;
+            for block in &mut line.data[..count] {
+                if read_packets(&mut self.endpoint_out, &mut block.contents).await.is_err() {
+                    return (residue, CommandStatus::PhaseError);
+                }
             }
+
             let backend = self.shared.borrow().backend;
-            if !unsafe { (backend.write)(backend.context, lba + index, &block) } {
+            let written = unsafe {
+                (backend.write)(backend.context, current, &self.cache.lines[STREAM_LINE].data[..count])
+            };
+            if !written {
                 self.shared
                     .borrow_mut()
                     .set_sense(SENSE_MEDIUM_ERROR, ASC_WRITE_ERROR, 0);
-                let remaining = residue.saturating_sub(Block::LEN as u32);
+                let remaining = residue - (count * Block::LEN) as u32;
                 if self.discard_out(remaining).await.is_err() {
                     return (residue, CommandStatus::PhaseError);
                 }
                 return (residue, CommandStatus::Failed);
             }
-            residue -= Block::LEN as u32;
+
+            self.cache.update_from_stream(current, count);
+            residue -= (count * Block::LEN) as u32;
+            let mut shared = self.shared.borrow_mut();
+            shared.stats.write_blocks = shared.stats.write_blocks.wrapping_add(count as u32);
+            drop(shared);
+            current += count as u32;
         }
         (residue, CommandStatus::Passed)
     }
@@ -632,7 +806,7 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             return (cbw.transfer_len, CommandStatus::PhaseError);
         }
         let count = data.len().min(cbw.transfer_len as usize);
-        if self.write_all(&data[..count]).await.is_err() {
+        if write_packets(&mut self.endpoint_in, &data[..count]).await.is_err() {
             return (cbw.transfer_len, CommandStatus::PhaseError);
         }
         if count < cbw.transfer_len as usize && count % BULK_PACKET_SIZE as usize == 0 {
@@ -641,23 +815,6 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             }
         }
         (cbw.transfer_len - count as u32, CommandStatus::Passed)
-    }
-
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), EndpointError> {
-        for chunk in data.chunks(BULK_PACKET_SIZE as usize) {
-            self.endpoint_in.write(chunk).await?;
-        }
-        Ok(())
-    }
-
-    async fn read_exact(&mut self, data: &mut [u8]) -> Result<(), EndpointError> {
-        for chunk in data.chunks_mut(BULK_PACKET_SIZE as usize) {
-            let count = self.endpoint_out.read(chunk).await?;
-            if count != chunk.len() {
-                return Err(EndpointError::BufferOverflow);
-            }
-        }
-        Ok(())
     }
 
     async fn discard_out(&mut self, mut length: u32) -> Result<(), EndpointError> {

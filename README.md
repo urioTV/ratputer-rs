@@ -116,7 +116,16 @@ The USB stack is entirely Rust. `esp-hal` drives the Synopsys DWC2 controller
 enumeration, and `src/msc.rs` implements the Mass Storage Bulk-Only Transport
 and the SCSI commands used by Windows, Linux and macOS. There is no executor: the
 USB future is polled from the main loop with a waker that the USB interrupt sets,
-in bursts of up to 40 ms, and sector I/O goes straight to `embedded-sdmmc`.
+in bursts of up to 40 ms.
+
+Sector I/O goes through a small **read cache** (16 KiB of static SRAM, outside the
+heap): three LRU lines of 8 blocks for filesystem metadata that hosts read over and
+over while mounting (boot sector, FAT, directories), plus one stream line for large
+sequential transfers so file data does not evict them. A miss reads a whole 4 KiB
+line with one SD multi-block command (CMD18). Writes are collected into 4 KiB
+chunks and written with CMD25 **before** the host is told they succeeded; there is
+no write-back caching, so an unplugged cable cannot lose acknowledged data. The
+screen shows host reads/writes and the cache hit rate (`R 1234K W 56K C 87%`).
 
 Only one side owns the card at a time. Entering USB DISK consumes the firmware's
 `VolumeManager`; leaving disconnects USB, recreates the FAT manager (discarding its
