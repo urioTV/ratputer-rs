@@ -40,6 +40,18 @@ nb = "1"                        # non-blocking ADC reads (esp-hal oneshot API)
 
 # SD-card credential storage and TOML serialization (all no_std + alloc)
 embedded-sdmmc = { version = "0.10", default-features = false, features = ["log"] }
+# FAT implementation with VFAT long-name read/write, vendored with a local
+# patch: directory iteration buffers a sliding 4 KiB window instead of the
+# whole cluster (32 KiB clusters on big cards OOM a 150 KiB heap). See
+# vendor/hadris-fat/PATCHES.md.
+hadris-fat = { path = "vendor/hadris-fat", default-features = false, features = [
+    "read",
+    "write",
+    "lfn",
+    "alloc",
+    "sync",
+] }
+embedded-io = "0.7"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 toml = { version = "0.9", default-features = false, features = ["display", "parse", "serde"] }
 
@@ -63,11 +75,6 @@ slint = { version = "1.18", default-features = false, features = [
 # Heap in internal SRAM (the ADV has no PSRAM!) — required by Slint (alloc)
 esp-alloc = { version = "0.11", features = ["esp32s3"] }
 esp-rom-sys = "0.1"             # ROM symbols (libc-ish) — kept defensively
-
-# Vendored with local fixes (deleting a file frees its clusters); see
-# vendor/embedded-sdmmc/PATCHES.md.
-[patch.crates-io]
-embedded-sdmmc = { path = "vendor/embedded-sdmmc" }
 
 [build-dependencies]
 # .slint -> Rust compiler; fonts are packed from ui/fonts into the image

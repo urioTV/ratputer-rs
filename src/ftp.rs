@@ -4,34 +4,32 @@
 //! once per step with a no-op waker, guarded by `can_recv()`/`can_send()`.
 //! The main loop polls this module every iteration, and burst-polls it while a
 //! transfer is in flight. One control connection at a time; the data channel
-//! uses a fixed passive listener on port 20.
+//! uses a fixed passive listener on port 50000.
 //!
-//! Limits (deliberate, from `embedded-sdmmc`): uploads and MKD accept 8.3 short
-//! names only (reading/listing long names works), no rename, and only empty
-//! directories can be removed. Timestamps are local time from the NTP clock.
+//! FAT access goes through `hadris-fat`. Open handles (`FatDir`, `FileReader`,
+//! `FileWriter`) borrow the volume, so they are created, used, and dropped
+//! within a single poll step; transfer state between polls is only paths and
+//! byte offsets. Writes are write-through (no FAT cache), so the 226 reply
+//! means the data physically reached the card.
 
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 use core::future::Future;
-use core::ops::ControlFlow;
 use core::task::{Context, Poll, Waker};
 
 use embassy_net::tcp::{State, TcpSocket};
 use embassy_net::{IpAddress, Ipv4Address, Stack};
 use embassy_time::Duration as NetDuration;
-use embedded_sdmmc::{
-    DirEntry, LfnBuffer, Mode, RawDirectory, RawFile, RawVolume, ShortFileName, Timestamp,
-    VolumeIdx,
-};
 use esp_hal::time::Instant;
+use hadris_fat::sync::{FatDir, FileEntry, SeekFrom};
+use hadris_fat::time::FatDateTime;
 
-use crate::storage::{FtpConfig, SdVolumeManager};
+use crate::storage::{fmt_fat_mtime, now_ymdhms, FtpConfig, SdBlock, SdVolume};
 
 pub const CONTROL_PORT: u16 = 21;
-/// Fixed passive-mode data listener, right next to the control port.
+/// Fixed passive-mode data listener.
 const DATA_PORT: u16 = 50_000;
 const CONTROL_RX_LEN: usize = 1024;
 const CONTROL_TX_LEN: usize = 1024;
@@ -42,12 +40,13 @@ const LIST_CHUNK_TARGET: usize = 3072;
 const MAX_COMMAND_LINE: usize = 512;
 /// Close idle control connections after 5 minutes.
 const IDLE_TIMEOUT_SECS: u64 = 300;
+/// Drop any session that received no bytes for this long, even mid-transfer
+/// (dead clients without FIN hold the single-client port otherwise).
+const LIVEN_TIMEOUT_SECS: u64 = 120;
 /// Give the client this long to open its data connection after PASV.
 const DATA_ACCEPT_TIMEOUT_SECS: u64 = 20;
-/// Worst-case UTF-8 expansion of a 255-code-unit FAT long name.
-const LFN_UTF8_LEN: usize = 1024;
-
-type Manager = SdVolumeManager;
+/// Bytes processed per poll for bulk file transfers.
+const FILE_CHUNK_LEN: usize = 4096;
 
 /// Poll a future exactly once with a no-op waker. `None` = would block.
 fn poll_once<F, O>(future: F) -> Option<O>
@@ -124,20 +123,22 @@ enum PendingAction {
 
 enum TransferKind {
     List {
-        /// `None` = single-entry listing of one file (`done` after one chunk).
-        dir: Option<RawDirectory>,
+        parent: Vec<String>,
         kind: ListKind,
         /// Entries already consumed from the directory across chunks.
         skip: usize,
         done: bool,
-        chunk: Vec<u8>,
-        chunk_sent: usize,
     },
     Retrieve {
-        file: RawFile,
+        parent: Vec<String>,
+        leaf: String,
+        offset: u64,
     },
     Store {
-        file: RawFile,
+        parent: Vec<String>,
+        leaf: String,
+        /// True once the entry exists and initial write succeeded.
+        initialized: bool,
     },
 }
 
@@ -147,7 +148,10 @@ struct Transfer {
     /// Wait until the preliminary 150 reply has left the control socket before
     /// sending any data (required FTP ordering).
     announced: bool,
-    /// Data production ended; waiting for the TCP queue to drain.
+    /// Outbound payload pending on the data socket, plus its send offset.
+    chunk: Vec<u8>,
+    chunk_sent: usize,
+    /// Data production ended; waiting to close the data stream.
     finishing: bool,
     failed: Option<&'static str>,
 }
@@ -157,6 +161,7 @@ struct Session {
     user: Option<String>,
     logged_in: bool,
     rest: Option<u64>,
+    rename_from: Option<(Vec<String>, String)>,
     line: Vec<u8>,
     out: String,
     peer: String,
@@ -178,6 +183,7 @@ impl Session {
             user: None,
             logged_in: false,
             rest: None,
+            rename_from: None,
             line: Vec::new(),
             out: String::new(),
             peer,
@@ -203,7 +209,6 @@ impl Session {
 pub struct FtpServer {
     control: TcpSocket<'static>,
     data: TcpSocket<'static>,
-    volume: Option<RawVolume>,
     session: Option<Session>,
     control_listening: bool,
     /// The fixed passive listener is armed for this session.
@@ -218,7 +223,7 @@ impl FtpServer {
     /// Socket buffers (18 KiB) live in the heap; the caller checks
     /// `esp_alloc::HEAP.free()` and constructs the server only when there is
     /// enough room. The server (and its buffers) persist across opens of the
-    /// FTP screen; `start`/`stop` only own the volume.
+    /// FTP screen; `start`/`stop` only open and close listeners.
     pub fn new(stack: Stack<'static>) -> Self {
         let control_rx = Box::leak(Box::new([0_u8; CONTROL_RX_LEN]));
         let control_tx = Box::leak(Box::new([0_u8; CONTROL_TX_LEN]));
@@ -227,12 +232,13 @@ impl FtpServer {
         let mut control = TcpSocket::new(stack, control_rx, control_tx);
         let mut data = TcpSocket::new(stack, data_rx, data_tx);
         // Reclaim sockets wedged in FIN_WAIT instead of leaking the fixed port.
-        control.set_timeout(Some(NetDuration::from_secs(IDLE_TIMEOUT_SECS + 60)));
-        data.set_timeout(Some(NetDuration::from_secs(60)));
+        // 45 s is well below the 5-minute session idle timeout, so a vanished
+        // client frees the control port quickly.
+        control.set_timeout(Some(NetDuration::from_secs(45)));
+        data.set_timeout(Some(NetDuration::from_secs(45)));
         Self {
             control,
             data,
-            volume: None,
             session: None,
             control_listening: false,
             data_listening: false,
@@ -243,40 +249,38 @@ impl FtpServer {
         }
     }
 
-    /// The caller must guarantee that the card is not exported over USB.
-    pub fn start(&mut self, manager: &Manager, stack: Stack<'static>) -> Result<(), ()> {
-        if self.volume.is_some() {
-            return Ok(());
-        }
-        let volume = manager.open_raw_volume(VolumeIdx(0)).map_err(|_| ())?;
-        self.volume = Some(volume);
-        self.ip = stack.config_v4().map(|config| config.address.address());
+    pub fn start(&mut self, stack: Stack<'static>) -> Result<(), ()> {
         self.stats = FtpStats::default();
-        self.status = FtpStatus::Offline;
         self.activity.clear();
+        self.ip = stack.config_v4().and_then(|config| {
+            (config.address.address() != Ipv4Address::UNSPECIFIED)
+                .then_some(config.address.address())
+        });
+        if self.ip.is_some() {
+            self.status = FtpStatus::Listening;
+        } else {
+            self.status = FtpStatus::Offline;
+        }
+        self.control_listening = false;
+        self.control.abort();
+        self.data_listening = false;
+        self.data.abort();
+        self.session = None;
         Ok(())
     }
 
-    pub fn stop(&mut self, manager: &Manager) {
-        self.end_session(manager);
+    pub fn stop(&mut self) {
         self.control.abort();
         self.data.abort();
         self.control_listening = false;
         self.data_listening = false;
-        if let Some(volume) = self.volume.take() {
-            let _ = manager.close_volume(volume);
-        }
-        self.ip = None;
+        self.session = None;
         self.status = FtpStatus::Stopped;
         self.activity.clear();
     }
 
     pub fn status(&self) -> FtpStatus {
         self.status
-    }
-
-    pub fn ip(&self) -> Option<Ipv4Address> {
-        self.ip
     }
 
     pub fn stats(&self) -> FtpStats {
@@ -291,75 +295,33 @@ impl FtpServer {
         self.session.as_ref().map(|session| session.peer.as_str())
     }
 
-    fn end_session(&mut self, manager: &Manager) {
-        if let Some(mut session) = self.session.take() {
-            if let Some(volume) = self.volume {
-                let _ = volume;
-                Self::close_transfer(manager, &mut session);
-            }
-            self.control.close();
-            self.control_listening = false;
-            self.data.abort();
-            self.data_listening = false;
-        }
+    pub fn ip(&self) -> Option<Ipv4Address> {
+        self.ip
     }
 
-    fn close_transfer(manager: &Manager, session: &mut Session) {
-        session.pending = None;
-        if let Some(mut transfer) = session.transfer.take() {
-            match &mut transfer.kind {
-                TransferKind::List { dir, .. } => {
-                    if let Some(dir) = dir.take() {
-                        let _ = manager.close_dir(dir);
-                    }
-                }
-                TransferKind::Retrieve { file } | TransferKind::Store { file } => {
-                    let _ = manager.close_file(*file);
-                }
-            }
-        }
-    }
+    /// Advance every socket and the session once. Called from the main loop;
+    /// additionally burst-called while a transfer is in flight.
+    pub fn poll(&mut self, volume: &SdVolume, stack: Stack<'static>, config: &FtpConfig) {
+        self.ip = stack.config_v4().and_then(|config| {
+            (config.address.address() != Ipv4Address::UNSPECIFIED)
+                .then_some(config.address.address())
+        });
 
-    /// One non-blocking round of server work per main-loop iteration.
-    pub fn poll(&mut self, manager: &Manager, stack: Stack<'static>, config: &FtpConfig) {
-        if self.volume.is_none() {
-            return;
-        }
-        self.ip = stack.config_v4().map(|config| config.address.address());
-        let online = stack.is_link_up() && stack.is_config_up();
-
-        if !online {
-            if self.session.is_some() {
-                log::warn!("FTP: Wi-Fi link lost, dropping the client");
-                self.end_session(manager);
-            } else if self.control_listening {
-                self.control.abort();
-                self.control_listening = false;
-            }
-            if self.data_listening {
-                self.data.abort();
-                self.data_listening = false;
-            }
-            self.status = FtpStatus::Offline;
-            return;
-        }
-
-        // (Re)arm the control listener.
         if !self.control_listening {
             match self.control.state() {
                 State::Closed => {
                     let _ = poll_once(self.control.accept(CONTROL_PORT));
                     self.control_listening = true;
                 }
-                // smoltcp refuses listen() from TIME_WAIT; abort skips it.
-                State::TimeWait | State::LastAck | State::FinWait1 | State::FinWait2 => {
-                    self.control.abort();
-                }
+                // smoltcp cannot listen from teardown states; abort back to Closed.
+                State::TimeWait
+                | State::LastAck
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait => self.control.abort(),
                 _ => {}
             }
-        }
-
-        if self.session.is_none() && self.control.state() == State::Established {
+        } else if self.session.is_none() && self.control.state() == State::Established {
             let peer = self
                 .control
                 .remote_endpoint()
@@ -381,16 +343,18 @@ impl FtpServer {
                     FtpStatus::Connected
                 }
             })
-            .unwrap_or(FtpStatus::Listening);
+            .unwrap_or(if self.ip.is_some() {
+                FtpStatus::Listening
+            } else {
+                FtpStatus::Offline
+            });
 
         if self.session.is_some() {
             let mut session = self.session.take().unwrap();
-            let dead = self.poll_session(manager, &mut session, config);
-            if dead {
-                if let Some(volume) = self.volume {
-                    let _ = volume;
-                }
-                Self::close_transfer(manager, &mut session);
+            if self.poll_session(volume, &mut session, config) {
+                // Session over: abort whatever survived and re-listen lazily.
+                let _ = session.transfer.take();
+                let _ = session.pending.take();
                 if !matches!(
                     self.control.state(),
                     State::Closed | State::TimeWait | State::LastAck
@@ -407,10 +371,10 @@ impl FtpServer {
         }
     }
 
-    /// Returns `true` when the session is over and its handles are released.
+    /// Returns `true` when the session is over.
     fn poll_session(
         &mut self,
-        manager: &Manager,
+        volume: &SdVolume,
         session: &mut Session,
         config: &FtpConfig,
     ) -> bool {
@@ -457,7 +421,7 @@ impl FtpServer {
                 if line.ends_with(b"\r") {
                     line.pop();
                 }
-                self.handle_command_line(manager, session, &line, config);
+                self.handle_command_line(volume, session, &line, config);
             }
         }
 
@@ -471,39 +435,65 @@ impl FtpServer {
             session.quit = true;
         }
 
-        // 5. Data channel and transfers.
-        if !fatal {
-            self.poll_data(manager, session);
-        }
-
-        // 6. Clean shutdown after QUIT: wait for queued replies to leave.
-        if session.quit && session.out.is_empty() && self.control.send_queue() == 0 {
-            self.control.close();
+        // 4b. Hard liveness limit: a client that vanished without FIN/RST
+        // (WSL mirrored-network artifacts, powered-off laptop) leaves the
+        // Established socket with an undeliverable reply forever. The
+        // smoltcp socket timeout did not prove reliable here, so drop the
+        // session after LIVEN_TIMEOUT_SECS without any received bytes.
+        if !fatal
+            && Instant::now() - session.last_activity
+                >= esp_hal::time::Duration::from_secs(LIVEN_TIMEOUT_SECS)
+        {
+            log::warn!("FTP session idle past limit; dropping client");
+            self.control.abort();
             self.control_listening = false;
             fatal = true;
         }
 
+        // 5. Data channel and transfers.
+        if !fatal {
+            self.poll_data(volume, session);
+        }
+
+        // 6. Clean shutdown after QUIT: wait for queued replies to leave.
+        // If the client went away first, the TX queue may never drain — abort
+        // instead of waiting forever.
+        if session.quit && session.out.is_empty() {
+            if self.control.send_queue() == 0 {
+                self.control.close();
+                self.control_listening = false;
+                fatal = true;
+            } else if !self.control.may_send() || !self.control.may_recv() {
+                self.control.abort();
+                self.control_listening = false;
+                fatal = true;
+            }
+        }
+
         // 7. The client hung up on us. After a peer FIN smoltcp enters
         // CloseWait: may_send() is still true, but may_recv() is false and an
-        // empty receive queue never makes can_recv() true, so read() cannot be
-        // used to discover EOF.
+        // empty receive queue never makes can_recv() true again.
         if !session.quit
             && ((!self.control.may_recv() && !self.control.can_recv())
                 || (!self.control.may_send()
                     && session.out.is_empty()
                     && self.control.send_queue() == 0))
         {
+            log::info!(
+                "FTP ctrl peer gone: state={:?} out={} queue={}",
+                self.control.state(),
+                session.out.len(),
+                self.control.send_queue()
+            );
             fatal = true;
         }
         fatal
     }
 
-    fn poll_data(&mut self, manager: &Manager, session: &mut Session) {
-        // Queue 227/229 into the established control socket *before* putting the
-        // second socket into Listen. With our executor-less polling, arming the
-        // data listener first can prevent the control reply from progressing.
-        // Once `out` is empty, the reply is safely in control's TCP TX buffer;
-        // the following network poll sends it with the listener already active.
+    fn poll_data(&mut self, volume: &SdVolume, session: &mut Session) {
+        // Queue 227/229 into the established control socket *before* putting
+        // the second socket into Listen, then keep one full network poll
+        // between those two events.
         if session.passive_requested && !self.data_listening {
             if !session.out.is_empty() {
                 return;
@@ -517,7 +507,6 @@ impl FtpServer {
                     let _ = poll_once(self.data.accept(DATA_PORT));
                     self.data_listening = true;
                 }
-                // smoltcp cannot re-listen from teardown states.
                 State::TimeWait
                 | State::LastAck
                 | State::FinWait1
@@ -527,8 +516,8 @@ impl FtpServer {
             }
         }
 
-        // Nothing to transfer: keep the passive socket armed if PASV was given,
-        // otherwise reset it.
+        // Nothing to transfer: keep the passive socket armed if PASV was
+        // given, otherwise reset it.
         if session.pending.is_none() && session.transfer.is_none() {
             if !session.passive_requested && self.data_listening {
                 self.data.abort();
@@ -541,7 +530,7 @@ impl FtpServer {
         // Accept phase: the data connection has not arrived yet.
         if let Some(pending) = session.pending.take() {
             if self.data.state() == State::Established {
-                match self.start_transfer(manager, session, &pending) {
+                match self.start_transfer(volume, session, &pending) {
                     Ok(greeting) => {
                         session.passive_requested = false;
                         session.reply(&greeting);
@@ -549,14 +538,14 @@ impl FtpServer {
                     Err(reply) => {
                         session.transfer = None;
                         session.reply(&reply);
-                        Self::abort_data(&mut self.data, &mut self.data_listening);
+                        self.abort_data();
                     }
                 }
             } else if Instant::now() - pending.since
                 >= esp_hal::time::Duration::from_secs(DATA_ACCEPT_TIMEOUT_SECS)
             {
                 session.reply("425 No data connection");
-                Self::abort_data(&mut self.data, &mut self.data_listening);
+                self.abort_data();
             } else {
                 session.pending = Some(pending);
             }
@@ -576,29 +565,17 @@ impl FtpServer {
             return;
         }
 
-        // All outgoing bytes are now queued. Close immediately: smoltcp sends
-        // FIN *after* the queued payload, which gives FTP clients their required
-        // data-channel EOF. Waiting for every ACK before close deadlocks WinSCP,
-        // which waits for EOF before it finishes the listing.
+        // All outbound bytes are queued. Close immediately: smoltcp sends FIN
+        // *after* the queued payload, giving the client its required
+        // data-channel EOF.
         if transfer.finishing || transfer.failed.is_some() {
             let failed = transfer.failed.is_some();
-            match &mut transfer.kind {
-                TransferKind::List { dir, .. } => {
-                    if let Some(dir) = dir.take() {
-                        let _ = manager.close_dir(dir);
-                    }
-                }
-                TransferKind::Retrieve { file } | TransferKind::Store { file } => {
-                    let _ = manager.close_file(*file);
-                }
-            }
             if failed {
                 self.data.abort();
                 session.reply("426 Transfer aborted");
                 session.reply("226 Data closed");
                 log::warn!("FTP transfer failed: {}", transfer.topic);
             } else {
-                // close() preserves buffered payload and appends FIN.
                 self.data.close();
                 session.reply(&format!("226 Finished {}", transfer.topic));
                 log::info!("FTP transfer finished: {}", transfer.topic);
@@ -607,397 +584,374 @@ impl FtpServer {
             return;
         }
 
-        // Active transfer: one pump per poll.
-        let socket_dead = !self.data.may_send() && !self.data.may_recv();
-        match &mut transfer.kind {
-            TransferKind::Retrieve { file } => {
-                if self.data.can_send() {
-                    match poll_once(self.data.write_with(
-                        |buffer| match manager.read(*file, buffer) {
-                            Ok(count) => (count, count),
-                            Err(_) => (0, usize::MAX),
-                        },
-                    )) {
-                        Some(Ok(usize::MAX)) | Some(Err(_)) => {
-                            transfer.failed = Some("read");
-                        }
-                        Some(Ok(0)) => {
-                            transfer.finishing = true;
-                        }
-                        Some(Ok(count)) => {
-                            self.stats.sent_bytes += count as u64;
-                        }
-                        None => {}
-                    }
-                } else if socket_dead {
-                    transfer.failed = Some("pipe");
-                }
-            }
-            TransferKind::Store { file } => {
-                while self.data.can_recv() {
-                    match poll_once(self.data.read_with(
-                        |buffer| match manager.write(*file, buffer) {
-                            Ok(()) => (buffer.len(), buffer.len()),
-                            Err(_) => (0, usize::MAX),
-                        },
-                    )) {
-                        Some(Ok(usize::MAX)) | Some(Err(_)) => {
-                            transfer.failed = Some("write");
-                            while self.data.can_recv() {
-                                let _ = poll_once(self.data.read_with(|buf| (buf.len(), ())));
-                            }
-                            break;
-                        }
-                        Some(Ok(count)) => {
-                            self.stats.received_bytes += count as u64;
-                        }
-                        None => break,
-                    }
-                }
-                if transfer.failed.is_none() && !self.data.may_recv() && !self.data.can_recv() {
-                    transfer.finishing = true;
-                }
-            }
-            TransferKind::List {
-                dir,
-                kind,
-                skip,
-                done,
-                chunk,
-                chunk_sent,
-            } => {
-                if *chunk_sent < chunk.len() {
-                    if self.data.can_send() {
-                        if let Some(Ok(count)) = poll_once(self.data.write(&chunk[*chunk_sent..])) {
-                            *chunk_sent += count;
-                            self.stats.sent_bytes += count as u64;
-                        }
-                    } else if socket_dead {
-                        transfer.failed = Some("pipe");
-                    }
-                } else if *done {
-                    transfer.finishing = true;
-                } else if let Some(dir) = *dir {
-                    match fill_listing(manager, dir, *kind, *skip, chunk) {
-                        Ok(produced) => {
-                            *skip += produced;
-                            *done = produced == 0;
-                            *chunk_sent = 0;
-                        }
-                        Err(()) => {
-                            transfer.failed = Some("list");
-                        }
-                    }
-                } else {
-                    // Single-file listing: chunk was pre-filled once.
-                    transfer.finishing = true;
-                }
-            }
-        }
-        if transfer.failed.is_none() && socket_dead && !transfer.finishing {
-            transfer.failed = Some("pipe");
-        }
+        self.step_transfer(volume, &mut transfer, session);
         self.activity = transfer.topic.clone();
         session.transfer = Some(transfer);
     }
 
-    fn abort_data(data: &mut TcpSocket<'static>, listening: &mut bool) {
-        data.abort();
-        *listening = false;
+    fn abort_data(&mut self) {
+        self.data.abort();
+        self.data_listening = false;
     }
 
-    /// Open the transfer's file/directory once the data connection is up.
+    /// Validate the requested transfer once the data connection is up and
+    /// produce the 150 greeting. No handles survive this call.
     fn start_transfer(
         &mut self,
-        manager: &Manager,
+        volume: &SdVolume,
         session: &mut Session,
         pending: &Pending,
     ) -> Result<String, String> {
-        let volume = self.volume.unwrap();
-        let _ = volume;
         match &pending.action {
             PendingAction::Retrieve {
                 parent,
                 leaf,
                 offset,
             } => {
-                let parent_dir = open_dir_path(manager, volume, parent)
-                    .ok_or_else(|| String::from("550 Path not found"))?;
-                let result = Self::open_read_transfer(manager, parent_dir, leaf, *offset);
-                let _ = manager.close_dir(parent_dir);
-                let (file, size) = result?;
+                let (entry, _dir) = find_in(volume, parent, leaf).ok_or_else(not_found)?;
+                if entry.is_directory() {
+                    return Err(String::from("550 Is a directory"));
+                }
+                let length = u64::from(entry.len());
+                if *offset > length || *offset > u64::from(u32::MAX) {
+                    return Err(String::from("550 Bad restart offset"));
+                }
                 session.transfer = Some(Transfer {
                     topic: format!("RETR {leaf}"),
-                    kind: TransferKind::Retrieve { file },
+                    kind: TransferKind::Retrieve {
+                        parent: parent.clone(),
+                        leaf: leaf.clone(),
+                        offset: *offset,
+                    },
                     announced: false,
+                    chunk: Vec::new(),
+                    chunk_sent: 0,
                     finishing: false,
                     failed: None,
                 });
-                Ok(format!("150 Sending {size} bytes"))
+                Ok(format!("150 Sending {} bytes", length - offset))
             }
             PendingAction::Store { parent, leaf } => {
-                let parent_dir = open_dir_path(manager, volume, parent)
-                    .ok_or_else(|| String::from("550 Path not found"))?;
-                let result = Self::open_store_transfer(manager, parent_dir, leaf);
-                let _ = manager.close_dir(parent_dir);
-                let file = result?;
+                if leaf.trim().is_empty() {
+                    return Err(String::from("501 Empty file name"));
+                }
+                if open_dir_path(volume, parent).is_none() {
+                    return Err(String::from("550 Path not found"));
+                }
                 session.transfer = Some(Transfer {
                     topic: format!("STOR {leaf}"),
-                    kind: TransferKind::Store { file },
+                    kind: TransferKind::Store {
+                        parent: parent.clone(),
+                        leaf: leaf.clone(),
+                        initialized: false,
+                    },
                     announced: false,
+                    chunk: Vec::new(),
+                    chunk_sent: 0,
                     finishing: false,
                     failed: None,
                 });
                 Ok(format!("150 Ready for {leaf}"))
             }
             PendingAction::List { parent, leaf, kind } => {
-                let setup = self.setup_listing(manager, parent, leaf.as_deref(), *kind)?;
-                session.transfer = Some(Transfer {
-                    topic: format!("LIST /{}", parent.join("/")),
-                    kind: setup,
-                    announced: false,
-                    finishing: false,
-                    failed: None,
-                });
+                if let Some(leaf) = leaf {
+                    let (entry, _dir) = find_in(volume, parent, leaf).ok_or_else(not_found)?;
+                    let line = listing_line(*kind, &entry);
+                    let mut chunk = Vec::with_capacity(line.len() + 2);
+                    chunk.extend_from_slice(line.as_bytes());
+                    chunk.extend_from_slice(b"\r\n");
+                    session.transfer = Some(Transfer {
+                        topic: format!("LIST {leaf}"),
+                        kind: TransferKind::List {
+                            parent: parent.clone(),
+                            kind: *kind,
+                            skip: 0,
+                            done: true,
+                        },
+                        announced: false,
+                        chunk,
+                        chunk_sent: 0,
+                        finishing: false,
+                        failed: None,
+                    });
+                } else {
+                    if open_dir_path(volume, parent).is_none() {
+                        return Err(String::from("550 No such directory"));
+                    }
+                    session.transfer = Some(Transfer {
+                        topic: format!("LIST /{}", parent.join("/")),
+                        kind: TransferKind::List {
+                            parent: parent.clone(),
+                            kind: *kind,
+                            skip: 0,
+                            done: false,
+                        },
+                        announced: false,
+                        chunk: Vec::new(),
+                        chunk_sent: 0,
+                        finishing: false,
+                        failed: None,
+                    });
+                }
                 Ok(String::from("150 Listing"))
             }
         }
     }
 
-    fn open_read_transfer(
-        manager: &Manager,
-        parent: RawDirectory,
-        leaf: &str,
-        offset: u64,
-    ) -> Result<(RawFile, u64), String> {
-        let entry = find_entry(manager, parent, leaf).ok_or_else(not_found)?;
-        if entry.attributes.is_directory() {
-            return Err(String::from("550 Is a directory"));
-        }
-        let length = u64::from(entry.size);
-        if offset > length || offset > u64::from(u32::MAX) {
-            return Err(String::from("550 Bad restart offset"));
-        }
-        let file = manager
-            .open_file_in_dir(parent, &entry.name, Mode::ReadOnly)
-            .map_err(|_| not_found())?;
-        if offset > 0 {
-            manager
-                .file_seek_from_start(file, offset as u32)
-                .map_err(|_| {
-                    let _ = manager.close_file(file);
-                    String::from("550 Bad restart offset")
-                })?;
-        }
-        Ok((file, length - offset))
-    }
-
-    fn open_store_transfer(
-        manager: &Manager,
-        parent: RawDirectory,
-        leaf: &str,
-    ) -> Result<RawFile, String> {
-        if leaf.trim().is_empty() {
-            return Err(String::from("501 Empty file name"));
-        }
-        let sfn = match find_entry(manager, parent, leaf) {
-            Some(entry) if entry.attributes.is_directory() => {
-                return Err(String::from("550 Is a directory"));
-            }
-            Some(entry) => entry.name,
-            None => ShortFileName::create_from_str(leaf)
-                .map_err(|_| String::from("553 Use 8.3 names (e.g. PHOTO.JPG)"))?,
-        };
-        manager
-            .open_file_in_dir(parent, &sfn, Mode::ReadWriteCreateOrTruncate)
-            .map_err(|_| String::from("550 Cannot create file"))
-    }
-
-    fn setup_listing(
+    /// One slice of work per poll: either send queued bytes or produce more.
+    fn step_transfer(
         &mut self,
-        manager: &Manager,
-        parent: &[String],
-        leaf: Option<&str>,
-        kind: ListKind,
-    ) -> Result<TransferKind, String> {
-        let parent_dir = open_dir_path(manager, self.volume.unwrap(), parent)
-            .ok_or_else(|| String::from("550 Path not found"))?;
-        let result = match leaf {
-            // LIST with no argument lists the directory itself.
-            None => Ok(TransferKind::List {
-                dir: Some(parent_dir),
-                kind,
-                skip: 0,
-                done: false,
-                chunk: Vec::new(),
-                chunk_sent: 0,
-            }),
-            Some(name) => match find_entry(manager, parent_dir, name) {
-                None => Err(String::from("550 Path not found")),
-                Some(entry) if entry.attributes.is_directory() => {
-                    let subdir = manager
-                        .open_dir(parent_dir, &entry.name)
-                        .map_err(|_| not_found())?;
-                    let _ = manager.close_dir(parent_dir);
-                    Ok(TransferKind::List {
-                        dir: Some(subdir),
-                        kind,
-                        skip: 0,
-                        done: false,
-                        chunk: Vec::new(),
-                        chunk_sent: 0,
-                    })
+        volume: &SdVolume,
+        transfer: &mut Transfer,
+        _session: &mut Session,
+    ) {
+        let socket_dead = !self.data.may_send() && !self.data.may_recv();
+
+        // Send what is already queued.
+        if transfer.chunk_sent < transfer.chunk.len() {
+            if self.data.can_send() {
+                match poll_once(self.data.write(&transfer.chunk[transfer.chunk_sent..])) {
+                    Some(Ok(count)) if count > 0 => {
+                        transfer.chunk_sent += count;
+                        self.stats.sent_bytes += count as u64;
+                    }
+                    Some(Ok(_)) | None => {}
+                    Some(Err(_)) => transfer.failed = Some("pipe"),
                 }
-                Some(entry) => {
-                    let _ = manager.close_dir(parent_dir);
-                    // Single-file listing: emit one pre-formatted chunk.
-                    let mut chunk = Vec::new();
-                    let line = listing_line(kind, &entry, name);
-                    chunk.extend_from_slice(line.as_bytes());
-                    chunk.extend_from_slice(b"\r\n");
-                    Ok(TransferKind::List {
-                        dir: None,
-                        kind,
-                        skip: 0,
-                        done: true,
-                        chunk,
-                        chunk_sent: 0,
-                    })
-                }
-            },
-        };
-        match result {
-            Err(err) => {
-                let _ = manager.close_dir(parent_dir);
-                Err(err)
+            } else if socket_dead {
+                transfer.failed = Some("pipe");
             }
-            ok => ok,
+            if transfer.chunk_sent >= transfer.chunk.len() {
+                transfer.chunk.clear();
+                transfer.chunk_sent = 0;
+            }
+            return;
+        }
+
+        match &mut transfer.kind {
+            TransferKind::List {
+                parent,
+                kind,
+                skip,
+                done,
+                ..
+            } => {
+                if *done {
+                    transfer.finishing = true;
+                    return;
+                }
+                match fill_listing(volume, parent, *kind, *skip, &mut transfer.chunk) {
+                    Ok(produced) => {
+                        *skip += produced;
+                        *done = produced == 0;
+                        transfer.chunk_sent = 0;
+                    }
+                    Err(()) => transfer.failed = Some("list"),
+                }
+            }
+            TransferKind::Retrieve {
+                parent,
+                leaf,
+                offset,
+            } => match read_file_slice(volume, parent, leaf, *offset, &mut transfer.chunk) {
+                Ok(read) => {
+                    *offset += read as u64;
+                    transfer.chunk_sent = 0;
+                    if read == 0 {
+                        transfer.finishing = true;
+                    }
+                }
+                Err(()) => transfer.failed = Some("read"),
+            },
+            TransferKind::Store {
+                parent,
+                leaf,
+                initialized,
+            } => {
+                // Receive first: the client pushes the stream.
+                if self.data.can_recv() {
+                    let mut buffer = [0_u8; FILE_CHUNK_LEN];
+                    match poll_once(self.data.read(&mut buffer)) {
+                        Some(Ok(count)) if count > 0 => {
+                            match append_file_slice(
+                                volume,
+                                parent,
+                                leaf,
+                                *initialized,
+                                &buffer[..count],
+                            ) {
+                                Ok(()) => {
+                                    *initialized = true;
+                                    self.stats.received_bytes += count as u64;
+                                }
+                                Err(()) => transfer.failed = Some("write"),
+                            }
+                        }
+                        Some(Err(_)) => transfer.failed = Some("pipe"),
+                        _ => {
+                            // EOF (Ok(0)) — fall through to the finishing check.
+                        }
+                    }
+                }
+                // A passive data connection half-closed by the client means
+                // upload complete: smoltcp reports may_send but not may_recv.
+                if !self.data.may_recv() && !self.data.can_recv() && transfer.failed.is_none() {
+                    transfer.finishing = *initialized;
+                    if !*initialized {
+                        // Client closed without bytes; drop the empty stub.
+                        let _ = delete_named(volume, parent, leaf);
+                        transfer.failed = Some("empty");
+                    }
+                }
+            }
+        }
+
+        if transfer.failed.is_none()
+            && socket_dead
+            && !matches!(transfer.kind, TransferKind::Store { .. })
+        {
+            transfer.failed = Some("pipe");
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Command dispatcher
-// ---------------------------------------------------------------------------
-
-/// Commands allowed before login (USER/PASS handled by the dispatcher).
-const PRE_LOGIN: &[&str] = &[
-    "SYST", "FEAT", "AUTH", "PBSZ", "PROT", "OPTS", "NOOP", "HELP", "QUIT", "STAT",
-];
-
-impl FtpServer {
     fn handle_command_line(
         &mut self,
-        manager: &Manager,
+        volume: &SdVolume,
         session: &mut Session,
         line: &[u8],
         config: &FtpConfig,
     ) {
         let Ok(text) = core::str::from_utf8(line) else {
-            session.reply("500 Bad command encoding");
+            session.reply("500 Bad encoding");
             return;
         };
         let text = text.trim();
         if text.is_empty() {
+            session.reply("500 Empty command");
             return;
         }
-        let (verb_raw, arg) = match text.find(' ') {
-            Some(space) => (&text[..space], text[space + 1..].trim()),
+        let (command, argument) = match text.split_once(' ') {
+            Some((command, rest)) => (command, rest.trim()),
             None => (text, ""),
         };
-        let verb = verb_raw.to_ascii_uppercase();
-        log::info!("FTP < {}", if verb == "PASS" { "PASS ***" } else { text });
-        let volume = self.volume.unwrap();
+        let command = command.to_ascii_uppercase();
+        let arg = argument;
+        // Options like `LIST -la` select the current directory.
+        let arg = strip_list_options(&command, arg);
+        log::debug!("FTP cmd {command} {arg}");
 
-        // While a transfer runs, only urgent/no-op commands are processed.
-        if session.busy() {
-            match verb.as_str() {
-                "ABOR" => {
-                    Self::close_transfer(manager, session);
-                    Self::abort_data(&mut self.data, &mut self.data_listening);
-                    session.reply("426 Transfer aborted by ABOR");
-                    session.reply("226 Abort done");
-                }
-                "STAT" => {
-                    let activity = self.activity.clone();
-                    session.reply(&format!("211 {activity}"));
-                }
-                "NOOP" => session.reply("200 OK"),
-                "QUIT" => session.quit = true,
-                _ => session.reply("450 Transfer in progress"),
-            }
-            return;
-        }
-
-        match verb.as_str() {
+        match command.as_str() {
             "USER" => {
-                session.user = Some(arg.to_string());
-                session.logged_in = false;
-                session.reply("331 Password required");
-                return;
+                if arg.eq_ignore_ascii_case(&config.user) {
+                    session.user = Some(arg.to_string());
+                    session.reply("331 Password required");
+                } else {
+                    let _ = arg;
+                    session.user = Some(String::new());
+                    session.reply("331 Password required");
+                }
             }
             "PASS" => {
-                let user_ok = session.user.as_deref() == Some(config.user.as_str());
-                if user_ok && arg == config.password {
+                if session
+                    .user
+                    .as_ref()
+                    .is_some_and(|user| !user.is_empty())
+                    && arg == config.password
+                {
                     session.logged_in = true;
                     session.reply("230 Logged in, SD card shared");
-                    log::info!("FTP: {} logged in", session.peer);
                 } else {
-                    session.reply("530 Wrong user or password");
+                    session.logged_in = false;
+                    session.reply("530 Login failed");
                 }
-                return;
             }
-            _ => {}
-        }
-
-        if !session.logged_in && !PRE_LOGIN.contains(&verb.as_str()) {
-            session.reply("530 Log in first");
-            return;
-        }
-
-        match verb.as_str() {
+            "SYST" => session.reply("215 UNIX Type: L8"),
+            "FEAT" => {
+                session.reply("211 Features:");
+                session.reply("MLST;MLSD;SIZE;MDTM;REST STREAM;UTF8");
+                session.reply("211 End");
+            }
+            "OPTS" => session.reply("200 OK"),
+            "NOOP" => session.reply("200 OK"),
+            "HELP" => session.reply("214 USER PASS QUIT PWD CWD CDUP PASV EPSV LIST NLST MLSD MLST SIZE MDTM RETR STOR DELE RMD MKD RNFR RNTO REST ABOR"),
             "QUIT" => {
                 session.reply("221 Bye");
                 session.quit = true;
             }
-            "SYST" => session.reply("215 UNIX Type: L8"),
-            "FEAT" => {
-                session.reply("211-Features:");
-                session.reply(" UTF8");
-                session.reply(" MLSD");
-                session.reply(" MDTM");
-                session.reply(" SIZE");
-                session.reply(" REST STREAM");
-                session.reply(" PASV");
-                session.reply("211 End");
+            "ABOR" if session.transfer.is_some() || session.pending.is_some() => {
+                session.pending = None;
+                let _ = session.transfer.take();
+                self.abort_data();
+                session.reply("226 Transfer aborted");
             }
-            "OPTS" => session.reply("200 OK"),
-            // Plain FTP only; no TLS. Tell clients to stop negotiating security.
-            "AUTH" | "PBSZ" | "PROT" => session.reply("502 Security not supported"),
-            "NOOP" => session.reply("200 OK"),
-            "HELP" => {
-                session.reply("214-Commands: USER PASS PWD CWD CDUP LIST NLST MLSD MLST");
-                session.reply(" RETR STOR DELE RMD MKD SIZE MDTM REST PASV EPSV QUIT");
-                session.reply("214 Uploads need 8.3 names; no rename");
-            }
-            "STAT" => {
-                session.reply(&format!(
-                    "211 OK, sent {} B, received {} B",
-                    self.stats.sent_bytes, self.stats.received_bytes
-                ));
+            _ if !session.logged_in => session.reply("530 Please login"),
+            "ABOR" => session.reply("226 Nothing to abort"),
+            // Data-transfer prefixes: always schedule through PASV/EPSV.
+            "LIST" | "NLST" | "MLSD" | "RETR" | "STOR" | "MLST" => {
+                if session.pending.is_some() || session.transfer.is_some() {
+                    session.reply("425 Transfer already in progress");
+                    return;
+                }
+                if !session.passive_requested {
+                    session.reply("425 Use PASV or EPSV first");
+                    return;
+                }
+                // The passive listener may already have accepted the client.
+                // Keep it; only PASV/EPSV aborts it when arming anew.
+                let action = match command.as_str() {
+                    "RETR" => {
+                        let Some((parent, leaf)) = need_leaf(&session.cwd, arg) else {
+                            session.reply("501 File name required");
+                            return;
+                        };
+                        PendingAction::Retrieve {
+                            parent,
+                            leaf,
+                            offset: session.rest.take().unwrap_or(0),
+                        }
+                    }
+                    "STOR" => {
+                        let Some((parent, leaf)) = need_leaf(&session.cwd, arg) else {
+                            session.reply("501 File name required");
+                            return;
+                        };
+                        session.rest = None;
+                        PendingAction::Store { parent, leaf }
+                    }
+                    kind_cmd => {
+                        session.rest = None;
+                        let kind = match kind_cmd {
+                            "NLST" => ListKind::Names,
+                            "MLSD" | "MLST" => ListKind::Machine,
+                            _ => ListKind::List,
+                        };
+                        let (parent, leaf) = split_path(&session.cwd, arg);
+                        if kind_cmd == "MLST" {
+                            PendingAction::List {
+                                parent: session.cwd.clone(),
+                                leaf: None,
+                                kind,
+                            }
+                        } else {
+                            PendingAction::List { parent, leaf, kind }
+                        }
+                    }
+                };
+                session.pending = Some(Pending {
+                    action,
+                    since: Instant::now(),
+                });
             }
             "PWD" | "XPWD" => {
                 session.reply(&format!("257 \"/{}\" is current", session.cwd.join("/")));
             }
             "CWD" | "XCWD" => {
                 let target = normalize(&session.cwd, arg);
-                match open_dir_path(manager, volume, &target) {
-                    Some(dir) => {
-                        let _ = manager.close_dir(dir);
-                        session.cwd = target;
-                        session.reply("250 Directory changed");
-                    }
-                    None => session.reply("550 No such directory"),
+                if open_dir_path(volume, &target).is_some() {
+                    session.cwd = target;
+                    session.reply("250 Directory changed");
+                } else {
+                    session.reply("550 No such directory");
                 }
             }
             "CDUP" | "XCUP" => {
@@ -1010,7 +964,7 @@ impl FtpServer {
             "PASV" => match self.ip {
                 Some(ip) => {
                     session.pending = None;
-                    Self::abort_data(&mut self.data, &mut self.data_listening);
+                    self.abort_data();
                     session.passive_requested = true;
                     session.passive_arm_delay = true;
                     let [a, b, c, d] = ip.octets();
@@ -1025,119 +979,29 @@ impl FtpServer {
             "EPSV" => match self.ip {
                 Some(_) => {
                     session.pending = None;
-                    Self::abort_data(&mut self.data, &mut self.data_listening);
+                    self.abort_data();
                     session.passive_requested = true;
                     session.passive_arm_delay = true;
                     session.reply(&format!("229 (|||{DATA_PORT}|)"));
                 }
                 None => session.reply("425 No IP yet"),
             },
-            "LIST" | "NLST" | "MLSD" => {
-                let path_arg = if verb == "LIST" || verb == "NLST" {
-                    strip_list_options(arg)
-                } else {
-                    arg
-                };
-                let (parent, leaf) = split_path(&session.cwd, path_arg);
-                if !session.passive_requested {
-                    session.reply("425 Use PASV or EPSV first");
-                    return;
-                }
-                let kind = match verb.as_str() {
-                    "NLST" => ListKind::Names,
-                    "MLSD" => ListKind::Machine,
-                    _ => ListKind::List,
-                };
-                session.pending = Some(Pending {
-                    action: PendingAction::List { parent, leaf, kind },
-                    since: Instant::now(),
-                });
-            }
-            "MLST" => {
-                let (parent, leaf) = split_path(&session.cwd, arg);
-                match open_dir_path(manager, volume, &parent) {
-                    None => session.reply("550 Path not found"),
-                    Some(dir) => {
-                        let result = match &leaf {
-                            None => Some(format!(
-                                "Type=dir;Modify={}; /{}",
-                                now_ymdhms(),
-                                parent.join("/")
-                            )),
-                            Some(name) => find_entry(manager, dir, name)
-                                .map(|entry| listing_line(ListKind::Machine, &entry, name)),
-                        };
-                        let _ = manager.close_dir(dir);
-                        match result {
-                            Some(line) => {
-                                session.reply(&format!("250- /{}", parent.join("/")));
-                                session.reply(&format!(" {line}"));
-                                session.reply("250 End");
-                            }
-                            None => session.reply("550 No such file or directory"),
-                        }
-                    }
-                }
-            }
-            "RETR" => {
-                let (parent, leaf) = match need_leaf(&session.cwd, arg) {
-                    Some(path) => path,
-                    None => {
-                        session.reply("501 File name required");
-                        return;
-                    }
-                };
-                if !session.passive_requested {
-                    session.reply("425 Use PASV or EPSV first");
-                    return;
-                }
-                let offset = session.rest.take().unwrap_or(0);
-                session.pending = Some(Pending {
-                    action: PendingAction::Retrieve {
-                        parent,
-                        leaf,
-                        offset,
-                    },
-                    since: Instant::now(),
-                });
-            }
-            "STOR" => {
-                let (parent, leaf) = match need_leaf(&session.cwd, arg) {
-                    Some(path) => path,
-                    None => {
-                        session.reply("501 File name required");
-                        return;
-                    }
-                };
-                if !session.passive_requested {
-                    session.reply("425 Use PASV or EPSV first");
-                    return;
-                }
-                if session.rest.take().is_some() {
-                    session.reply("504 Cannot resume uploads");
-                    return;
-                }
-                session.pending = Some(Pending {
-                    action: PendingAction::Store { parent, leaf },
-                    since: Instant::now(),
-                });
-            }
             "REST" => match arg.parse::<u64>() {
                 Ok(offset) => {
                     session.rest = Some(offset);
-                    session.reply("350 Restart stored");
+                    session.reply(&format!("350 Restart at {offset}"));
                 }
-                Err(_) => session.reply("501 Bad offset"),
+                Err(_) => session.reply("501 Bad restart offset"),
             },
-            "SIZE" => match find_for(&session.cwd, manager, volume, arg) {
-                Some(entry) if !entry.attributes.is_directory() => {
-                    session.reply(&format!("213 {}", entry.size));
+            "SIZE" => match find_for(&session.cwd, volume, arg) {
+                Some(entry) if !entry.is_directory() => {
+                    session.reply(&format!("213 {}", entry.len()));
                 }
                 Some(_) => session.reply("550 Is a directory"),
                 None => session.reply(&not_found()),
             },
-            "MDTM" => match find_for(&session.cwd, manager, volume, arg) {
-                Some(entry) => session.reply(&format!("213 {}", timestamp_ymdhms(entry.mtime))),
+            "MDTM" => match find_for(&session.cwd, volume, arg) {
+                Some(entry) => session.reply(&fmt_fat_mtime_prefixed(&entry)),
                 None => session.reply(&not_found()),
             },
             "DELE" => {
@@ -1145,19 +1009,19 @@ impl FtpServer {
                     session.reply("501 File name required");
                     return;
                 };
-                let removed = open_dir_path(manager, volume, &parent).map(|dir| {
-                    let result = match find_entry(manager, dir, &leaf) {
-                        Some(entry) if entry.attributes.is_directory() => false,
-                        Some(entry) => manager.delete_entry_in_dir(dir, entry.name).is_ok(),
-                        None => false,
-                    };
-                    let _ = manager.close_dir(dir);
-                    result
-                });
-                if removed == Some(true) {
-                    session.reply("250 Deleted");
-                } else {
-                    session.reply("550 Cannot delete");
+                match find_in(volume, &parent, &leaf) {
+                    Some((entry, dir)) if entry.is_directory() => {
+                        let _ = dir;
+                        session.reply("550 Is a directory");
+                    }
+                    Some((entry, _dir)) => {
+                        if volume.delete(&entry).is_ok() {
+                            session.reply("250 Deleted");
+                        } else {
+                            session.reply("550 Cannot delete");
+                        }
+                    }
+                    None => session.reply(&not_found()),
                 }
             }
             "RMD" | "XRMD" => {
@@ -1173,20 +1037,16 @@ impl FtpServer {
                     session.reply("550 Cannot remove current directory");
                     return;
                 }
-                let removed = open_dir_path(manager, volume, &parent).is_some_and(|dir| {
-                    let entry = find_entry(manager, dir, &leaf)
-                        .filter(|entry| entry.attributes.is_directory());
-                    let ok = match entry {
-                        Some(entry) => manager.delete_entry_in_dir(dir, entry.name).is_ok(),
-                        None => false,
-                    };
-                    let _ = manager.close_dir(dir);
-                    ok
-                });
-                if removed {
-                    session.reply("250 Directory removed");
-                } else {
-                    session.reply("550 Not empty or not found");
+                match find_in(volume, &parent, &leaf) {
+                    Some((entry, _dir)) if entry.is_directory() => {
+                        if volume.delete(&entry).is_ok() {
+                            session.reply("250 Directory removed");
+                        } else {
+                            session.reply("550 Not empty or not found");
+                        }
+                    }
+                    Some(_) => session.reply("550 Not a directory"),
+                    None => session.reply(&not_found()),
                 }
             }
             "MKD" | "XMKD" => {
@@ -1197,37 +1057,249 @@ impl FtpServer {
                         return;
                     }
                 };
-                let created = open_dir_path(manager, volume, &parent).is_some_and(|dir| {
-                    let ok = match ShortFileName::create_from_str(&leaf) {
-                        Ok(name) => manager.make_dir_in_dir(dir, name).is_ok(),
-                        Err(_) => false,
-                    };
-                    let _ = manager.close_dir(dir);
-                    ok
+                let created = open_dir_path(volume, &parent).is_some_and(|dir| {
+                    let result = volume.create_dir(&dir, &leaf);
+                    result.is_ok()
                 });
                 if created {
                     session.reply(&format!(
                         "257 \"/{}\" created",
                         normalize(&session.cwd, arg).join("/")
                     ));
-                } else if ShortFileName::create_from_str(&leaf).is_err() {
-                    session.reply("553 Use 8.3 names for new directories");
                 } else {
                     session.reply("550 Cannot create directory");
                 }
             }
-            "RNFR" | "RNTO" => session.reply("502 Rename not supported (8.3)"),
+            "RNFR" => {
+                let Some((parent, leaf)) = need_leaf(&session.cwd, arg) else {
+                    session.reply("501 File name required");
+                    return;
+                };
+                if find_in(volume, &parent, &leaf).is_some() {
+                    session.rename_from = Some((parent, leaf));
+                    session.reply("350 Ready for RNTO");
+                } else {
+                    session.rename_from = None;
+                    session.reply(&not_found());
+                }
+            }
+            "RNTO" => {
+                let Some((src_parent, src_leaf)) = session.rename_from.take() else {
+                    session.reply("503 RNFR first");
+                    return;
+                };
+                let Some((dst_parent, dst_leaf)) = need_leaf(&session.cwd, arg) else {
+                    session.reply("501 Target name required");
+                    return;
+                };
+                let renamed = (|| {
+                    let (entry, _dir) = find_in(volume, &src_parent, &src_leaf)?;
+                    let dest = open_dir_path(volume, &dst_parent)?;
+                    volume.rename(&entry, &dest, &dst_leaf).ok()
+                })();
+                if renamed.is_some() {
+                    session.reply("250 Renamed");
+                } else {
+                    session.reply("550 Rename failed");
+                }
+            }
             "SITE" | "CHMOD" => session.reply("502 Not implemented"),
             _ => session.reply("502 Not implemented"),
         }
     }
 }
 
+fn fmt_fat_mtime_prefixed(entry: &FileEntry) -> String {
+    format!("213 {}", fmt_fat_mtime(entry.modified()))
+}
+
+fn not_found() -> String {
+    String::from("550 No such file or directory")
+}
+
+/// Open the directory at absolute components. Handle is borrowed for this poll.
+fn open_dir_path<'a>(volume: &'a SdVolume, components: &[String]) -> Option<FatDir<'a, SdBlock>> {
+    let mut current = volume.root_dir();
+    for component in components {
+        current = current.open_dir(component).ok()?;
+    }
+    Some(current)
+}
+
+/// Find an entry by name inside a directory addressed by components.
+fn find_in<'a>(
+    volume: &'a SdVolume,
+    parent: &[String],
+    leaf: &str,
+) -> Option<(FileEntry, FatDir<'a, SdBlock>)> {
+    let dir = open_dir_path(volume, parent)?;
+    let entry = dir.find(leaf).ok().flatten()?;
+    Some((entry, dir))
+}
+
+fn find_for(cwd: &[String], volume: &SdVolume, arg: &str) -> Option<FileEntry> {
+    let (parent, leaf) = split_path(cwd, arg);
+    find_in(volume, &parent, &leaf?).map(|(entry, _)| entry)
+}
+
+/// Delete by name — used for STOR overwrite preparation and empty-STOR cleanup.
+fn delete_named(volume: &SdVolume, parent: &[String], leaf: &str) -> Result<(), ()> {
+    let (entry, _dir) = find_in(volume, parent, leaf).ok_or(())?;
+    volume.delete(&entry).map_err(|_| ())
+}
+
+/// Read up to `FILE_CHUNK_LEN` bytes from a file at `offset`, appending them
+/// to `chunk` (which must be empty). 0 bytes at offset means end of file.
+fn read_file_slice(
+    volume: &SdVolume,
+    parent: &[String],
+    leaf: &str,
+    offset: u64,
+    chunk: &mut Vec<u8>,
+) -> Result<usize, ()> {
+    let dir = open_dir_path(volume, parent).ok_or(())?;
+    let mut reader = dir.open_file(leaf).map_err(|_| ())?;
+    reader.seek(SeekFrom::Start(offset)).map_err(|_| ())?;
+    let mut buffer = [0_u8; FILE_CHUNK_LEN];
+    let read = reader.read(&mut buffer).map_err(|_| ())?;
+    chunk.extend_from_slice(&buffer[..read]);
+    Ok(read)
+}
+
+/// Append bytes to a file, creating it (or truncating an existing entry) on
+/// the first call. The writer commits size and timestamps before return, so a
+/// 226 later means data reached the card.
+fn append_file_slice(
+    volume: &SdVolume,
+    parent: &[String],
+    leaf: &str,
+    initialized: bool,
+    data: &[u8],
+) -> Result<(), ()> {
+    let dir = open_dir_path(volume, parent).ok_or(())?;
+    let entry = match dir.find(leaf) {
+        Ok(Some(entry)) if !entry.is_directory() => {
+            if initialized {
+                entry
+            } else {
+                // Overwrite: start from a fresh empty chain.
+                volume.delete(&entry).map_err(|_| ())?;
+                volume.create_file(&dir, leaf).map_err(|_| ())?
+            }
+        }
+        Ok(Some(_)) => return Err(()), // directory collision
+        Ok(None) => volume.create_file(&dir, leaf).map_err(|_| ())?,
+        Err(_) => return Err(()),
+    };
+    let mut writer =
+        hadris_fat::sync::write::FileWriter::new_append(volume, &entry).map_err(|_| ())?;
+    writer.write(data).map_err(|_| ())?;
+    writer.finish().map_err(|_| ())
+}
+
+/// Append up to `LIST_CHUNK_TARGET` bytes of entry lines, skipping the first
+/// `skip` entries. Returns how many entries were consumed; 0 = done.
+fn fill_listing(
+    volume: &SdVolume,
+    parent: &[String],
+    kind: ListKind,
+    mut skip: usize,
+    chunk: &mut Vec<u8>,
+) -> Result<usize, ()> {
+    chunk.clear();
+    let dir = open_dir_path(volume, parent).ok_or(())?;
+    let mut produced = 0_usize;
+    let mut iter = dir.entries();
+    loop {
+        match iter.next_entry() {
+            Some(Ok(hadris_fat::dir::DirectoryEntry::Entry(entry))) => {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                let name = entry.name().into_owned();
+                if name == "." || name == ".." || name.contains('\r') || name.contains('\n') {
+                    continue;
+                }
+                let line = listing_line(kind, &entry);
+                if chunk.len() + line.len() + 2 > LIST_CHUNK_TARGET && produced > 0 {
+                    break;
+                }
+                chunk.extend_from_slice(line.as_bytes());
+                chunk.extend_from_slice(b"\r\n");
+                produced += 1;
+            }
+            Some(Err(_)) => return Err(()),
+            None => break,
+        }
+    }
+    Ok(produced)
+}
+
+/// Unix-ish factory line for LIST / NLST / MLSD.
+fn listing_line(kind: ListKind, entry: &FileEntry) -> String {
+    let name = entry.name();
+    match kind {
+        ListKind::Names => name.into_owned(),
+        ListKind::Machine => {
+            let entry_type = if entry.is_directory() { "dir" } else { "file" };
+            format!(
+                "Type={};Size={};Modify={};Perm=ftp; {}",
+                entry_type,
+                entry.len(),
+                fmt_fat_mtime(entry.modified()),
+                name
+            )
+        }
+        ListKind::List => {
+            let (year, month, day, hour, minute) = unpack_fat(entry.modified());
+            let permissions = if entry.is_directory() {
+                "drwxr-xr-x"
+            } else {
+                "-rw-r--r--"
+            };
+            let month_name = MONTHS[(month as usize).saturating_sub(1).min(11)];
+            let current_year = now_ymdhms();
+            let same_year = current_year.starts_with(&format!("{year:04}"));
+            let when = if same_year {
+                format!("{hour:02}:{minute:02}")
+            } else {
+                format!("{year:>5}")
+            };
+            format!(
+                "{} 1 rat rat {:>13} {} {:>2} {} {}",
+                permissions,
+                entry.len(),
+                month_name,
+                day,
+                when,
+                name
+            )
+        }
+    }
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Unpack a FAT datetime into (year, month, day, hour, minute).
+fn unpack_fat(dt: FatDateTime) -> (u16, u8, u8, u8, u8) {
+    let (date, time, _) = dt.to_raw();
+    (
+        ((date >> 9) & 0x7F) + 1980,
+        ((date >> 5) & 0x0F) as u8,
+        (date & 0x1F) as u8,
+        ((time >> 11) & 0x1F) as u8,
+        ((time >> 5) & 0x3F) as u8,
+    )
+}
+
 /// Split a path argument into (parent components, optional leaf name).
 fn split_path(cwd: &[String], arg: &str) -> (Vec<String>, Option<String>) {
     let mut components = normalize(cwd, arg);
     match arg.trim() {
-        "" | "." => (components, None),
+        "" | "." | "/" => (components, None),
         _ => {
             let leaf = components.pop();
             (components, leaf)
@@ -1240,60 +1312,7 @@ fn need_leaf(cwd: &[String], arg: &str) -> Option<(Vec<String>, String)> {
     leaf.map(|leaf| (parent, leaf))
 }
 
-fn find_for(cwd: &[String], manager: &Manager, volume: RawVolume, arg: &str) -> Option<DirEntry> {
-    let (parent, leaf) = split_path(cwd, arg);
-    let leaf = leaf?;
-    let dir = open_dir_path(manager, volume, &parent)?;
-    let entry = find_entry(manager, dir, &leaf);
-    let _ = manager.close_dir(dir);
-    entry
-}
-
-/// Current local time for MLST/listing fallbacks, 1980-01-01 before NTP sync.
-fn now_ymdhms() -> String {
-    match crate::storage::local_now_seconds() {
-        Some(now) => {
-            let time = crate::clock::date_time(now);
-            format!(
-                "{:04}{:02}{:02}{:02}{:02}{:02}",
-                time.year, time.month, time.day, time.hour, time.minute, time.second
-            )
-        }
-        None => String::from("19800101000000"),
-    }
-}
-
-fn not_found() -> String {
-    String::from("550 No such file or directory")
-}
-
-fn format_tcp_endpoint(addr: IpAddress, port: u16) -> String {
-    let IpAddress::Ipv4(ip) = addr;
-    format!(
-        "{}.{}.{}.{}:{port}",
-        ip.octets()[0],
-        ip.octets()[1],
-        ip.octets()[2],
-        ip.octets()[3]
-    )
-}
-
-fn strip_list_options(mut arg: &str) -> &str {
-    arg = arg.trim();
-    while arg.starts_with('-') {
-        arg = arg
-            .split_once(' ')
-            .map(|(_, rest)| rest.trim_start())
-            .unwrap_or("");
-    }
-    arg
-}
-
-// ---------------------------------------------------------------------------
-// Path and directory helpers
-// ---------------------------------------------------------------------------
-
-/// Normalize `arg` against `cwd`: absolute when it starts with `/`, `..` pops.
+/// Normalize an FTP path relative to the session cwd, respecting `..`.
 fn normalize(cwd: &[String], arg: &str) -> Vec<String> {
     let arg = arg.trim().trim_matches('"').replace('\\', "/");
     let mut result: Vec<String> = if arg.starts_with('/') {
@@ -1313,51 +1332,6 @@ fn normalize(cwd: &[String], arg: &str) -> Vec<String> {
     result
 }
 
-/// Open the directory at absolute components. The caller must close it.
-fn open_dir_path(
-    manager: &Manager,
-    volume: RawVolume,
-    components: &[String],
-) -> Option<RawDirectory> {
-    let mut current = manager.open_root_dir(volume).ok()?;
-    for component in components {
-        let entry = find_entry(manager, current, component);
-        let next = match entry {
-            Some(entry) if entry.attributes.is_directory() => {
-                manager.open_dir(current, &entry.name).ok()
-            }
-            _ => None,
-        };
-        let _ = manager.close_dir(current);
-        current = next?;
-    }
-    Some(current)
-}
-
-/// Find an entry by long or short name (case-insensitive) in an open directory.
-fn find_entry(manager: &Manager, dir: RawDirectory, name: &str) -> Option<DirEntry> {
-    let mut found = None;
-    let mut storage = [0_u8; LFN_UTF8_LEN];
-    let mut lfn = LfnBuffer::new(&mut storage);
-    let mut short = String::new();
-    let _ = manager.iterate_dir_lfn(dir, &mut lfn, |entry, long| {
-        if found.is_some() || entry.attributes.is_volume() {
-            return ControlFlow::Continue(());
-        }
-        short.clear();
-        write!(short, "{}", entry.name).ok();
-        let matches_short = short.eq_ignore_ascii_case(name);
-        let matches_long = matches!(long, Some(long_name) if long_name.eq_ignore_ascii_case(name));
-        if matches_short || matches_long {
-            found = Some(entry.clone());
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
-    found
-}
-
 /// `true` when `target` is the current directory or one of its ancestors.
 fn path_covers_cwd(cwd: &[String], target: &[String]) -> bool {
     target.len() <= cwd.len()
@@ -1367,117 +1341,28 @@ fn path_covers_cwd(cwd: &[String], target: &[String]) -> bool {
             .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
-// ---------------------------------------------------------------------------
-// Listing formatting
-// ---------------------------------------------------------------------------
-
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-fn timestamp_ymdhms(time: Timestamp) -> String {
-    format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}",
-        i32::from(time.year_since_1970) + 1970,
-        time.zero_indexed_month + 1,
-        time.zero_indexed_day + 1,
-        time.hours,
-        time.minutes,
-        time.seconds
-    )
-}
-
-/// Format one listing line; the year/time rule follows the BSD ls convention.
-fn listing_line(kind: ListKind, entry: &DirEntry, name: &str) -> String {
-    let is_dir = entry.attributes.is_directory();
-    match kind {
-        ListKind::Names => name.to_string(),
-        ListKind::Machine => {
-            let mut line = String::new();
-            if is_dir {
-                line.push_str("Type=dir;");
-            } else {
-                write!(line, "Type=file;Size={};", entry.size).ok();
-            }
-            write!(line, "Modify={}; {}", timestamp_ymdhms(entry.mtime), name).ok();
-            line
+/// `LIST -a`, `LIST -la`, `LIST --full-time` etc. all mean "plain listing".
+fn strip_list_options<'a>(command: &str, arg: &'a str) -> &'a str {
+    if !matches!(command, "LIST" | "NLST" | "MLSD") {
+        return arg;
+    }
+    if arg.starts_with('-') {
+        match arg.split_once(' ') {
+            Some((_options, rest)) => rest.trim(),
+            None => "",
         }
-        ListKind::List => {
-            let permissions = if is_dir { "drwxr-xr-x" } else { "-rw-r--r--" };
-            let month = MONTHS[(entry.mtime.zero_indexed_month.min(11)) as usize];
-            // RFC 959 has no date rules; hosts use the BSD convention where a
-            // file from a different year shows the year instead of the time.
-            let year = i32::from(entry.mtime.year_since_1970) + 1970;
-            let when = match crate::storage::local_now_seconds() {
-                Some(now) => {
-                    let current = crate::clock::date_time(now).year as i32;
-                    if current == year {
-                        format!("{:02}:{:02}", entry.mtime.hours, entry.mtime.minutes)
-                    } else {
-                        format!("{year:>5}")
-                    }
-                }
-                None => format!("{year:>5}"),
-            };
-            format!(
-                "{} 1 rat rat {:>13} {} {:>2} {} {}",
-                permissions,
-                entry.size,
-                month,
-                entry.mtime.zero_indexed_day + 1,
-                when,
-                name
-            )
-        }
+    } else {
+        arg
     }
 }
 
-/// Append up to `LIST_CHUNK_TARGET` bytes of entry lines, skipping the first
-/// `skip` directory entries. Returns how many entries were consumed; 0 = done.
-fn fill_listing(
-    manager: &Manager,
-    dir: RawDirectory,
-    kind: ListKind,
-    mut skip: usize,
-    chunk: &mut Vec<u8>,
-) -> Result<usize, ()> {
-    // The same allocation is reused for successive directory chunks. Remove
-    // the previous chunk before deciding whether the iterator reached EOF.
-    chunk.clear();
-    let mut produced = 0_usize;
-    let mut storage = [0_u8; LFN_UTF8_LEN];
-    let mut lfn = LfnBuffer::new(&mut storage);
-    let mut short = String::new();
-    manager
-        .iterate_dir_lfn(dir, &mut lfn, |entry, long| {
-            if entry.attributes.is_volume() {
-                return ControlFlow::Continue(());
-            }
-            short.clear();
-            write!(short, "{}", entry.name).ok();
-            if short == "." || short == ".." {
-                return ControlFlow::Continue(());
-            }
-            if skip > 0 {
-                skip -= 1;
-                return ControlFlow::Continue(());
-            }
-            let name: String = match long {
-                Some(long_name) => long_name.to_string(),
-                None => short.clone(),
-            };
-            if name.contains('\r') || name.contains('\n') {
-                return ControlFlow::Continue(());
-            }
-            let line = listing_line(kind, entry, &name);
-            if chunk.len() + line.len() + 2 > LIST_CHUNK_TARGET && produced > 0 {
-                return ControlFlow::Break(());
-            }
-            chunk.extend_from_slice(line.as_bytes());
-            chunk.extend_from_slice(b"\r\n");
-            produced += 1;
-            ControlFlow::Continue(())
-        })
-        .map_err(|_| ())?;
-    Ok(produced)
+fn format_tcp_endpoint(addr: IpAddress, port: u16) -> String {
+    let IpAddress::Ipv4(ip) = addr;
+    format!(
+        "{}.{}.{}.{}:{port}",
+        ip.octets()[0],
+        ip.octets()[1],
+        ip.octets()[2],
+        ip.octets()[3]
+    )
 }

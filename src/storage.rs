@@ -1,3 +1,12 @@
+//! SD-card Wi-Fi/FTP configuration (`RATPUTER/WIFI.CFG`, TOML) and the FAT
+//! volume mounted with `hadris-fat`.
+//!
+//! Ownership: one mounted `FatVolume` owns the raw SD card. Opening the USB
+//! DISK screen moves the card out via `into_inner()`; leaving it mounts a
+//! fresh volume (the USB host may have rewritten the MBR/FAT). Writes are
+//! `hadris-fat` write-through by default — the optional FAT-sector cache is
+//! write-back and deliberately not enabled.
+
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -6,9 +15,12 @@ use esp_hal::delay::Delay;
 use esp_hal::gpio::Output;
 use esp_hal::spi::master::Spi;
 use esp_hal::Blocking;
+use hadris_fat::time::{FatDateTime, TimeProvider};
 
-use embedded_sdmmc::{BlockDevice, Mode, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use embedded_sdmmc::SdCard;
 use serde::{Deserialize, Serialize};
+
+use crate::sdblock::SdBlockDevice;
 
 const CONFIG_DIR: &str = "RATPUTER";
 const CONFIG_FILE: &str = "WIFI.CFG";
@@ -189,28 +201,44 @@ pub enum StorageError {
     UnsupportedVersion,
 }
 
-pub fn load<D, T, const DIRS: usize, const FILES: usize, const VOLUMES: usize>(
-    manager: &VolumeManager<D, T, DIRS, FILES, VOLUMES>,
-) -> Result<WifiConfig, StorageError>
-where
-    D: BlockDevice,
-    T: TimeSource,
-{
-    let volume = manager
-        .open_volume(VolumeIdx(0))
-        .map_err(|_| StorageError::Sd)?;
-    let root = volume.open_root_dir().map_err(|_| StorageError::Sd)?;
+/// The raw SD card on the Cardputer ADV's dedicated SPI3 bus.
+pub type SdCardDevice =
+    SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>;
+/// Seekable first-partition view of that card.
+pub type SdBlock = SdBlockDevice<SdCardDevice>;
+/// Mounted FAT volume; owns the card while mounted.
+pub type SdVolume = hadris_fat::sync::FatVolume<SdBlock>;
+
+/// Mount the card's first partition with the firmware clock provider.
+pub fn mount(card: SdCardDevice) -> Option<SdVolume> {
+    let block = SdBlockDevice::mount(card).ok()?;
+    hadris_fat::sync::FatVolume::builder(block)
+        .time_provider(&FatClock)
+        .open()
+        .ok()
+}
+
+/// Return the raw card so USB Mass Storage can export it sector-by-sector.
+pub fn free(volume: SdVolume) -> SdCardDevice {
+    volume.into_inner().into_inner()
+}
+
+pub fn load(volume: &SdVolume) -> Result<WifiConfig, StorageError> {
+    let root = volume.root_dir();
     let directory = root
         .open_dir(CONFIG_DIR)
         .map_err(|_| StorageError::Missing)?;
-    let file = directory
-        .open_file_in_dir(CONFIG_FILE, Mode::ReadOnly)
+    let mut reader = directory
+        .open_file(CONFIG_FILE)
         .map_err(|_| StorageError::Missing)?;
 
     let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 128];
-    while !file.is_eof() {
-        let count = file.read(&mut chunk).map_err(|_| StorageError::Sd)?;
+    let mut chunk = [0_u8; 256];
+    loop {
+        let count = reader.read(&mut chunk).map_err(|_| StorageError::Sd)?;
+        if count == 0 {
+            break;
+        }
         if bytes.len() + count > MAX_CONFIG_BYTES {
             return Err(StorageError::TooLarge);
         }
@@ -222,40 +250,33 @@ where
     config.validate()
 }
 
-pub fn save<D, T, const DIRS: usize, const FILES: usize, const VOLUMES: usize>(
-    manager: &VolumeManager<D, T, DIRS, FILES, VOLUMES>,
-    config: &WifiConfig,
-) -> Result<(), StorageError>
-where
-    D: BlockDevice,
-    T: TimeSource,
-{
+pub fn save(volume: &SdVolume, config: &WifiConfig) -> Result<(), StorageError> {
     let text = toml::to_string(config).map_err(|_| StorageError::InvalidToml)?;
     if text.len() > MAX_CONFIG_BYTES {
         return Err(StorageError::TooLarge);
     }
 
-    let volume = manager
-        .open_volume(VolumeIdx(0))
+    let root = volume.root_dir();
+    let directory = match root.open_dir(CONFIG_DIR) {
+        Ok(directory) => directory,
+        Err(_) => volume
+            .create_dir(&root, CONFIG_DIR)
+            .map_err(|_| StorageError::Sd)?,
+    };
+    let entry = match directory.find(CONFIG_FILE) {
+        Ok(Some(entry)) if !entry.is_directory() => entry,
+        Ok(Some(_)) | Ok(None) => volume
+            .create_file(&directory, CONFIG_FILE)
+            .map_err(|_| StorageError::Sd)?,
+        Err(_) => return Err(StorageError::Sd),
+    };
+    let mut writer =
+        hadris_fat::sync::write::FileWriter::new(volume, &entry).map_err(|_| StorageError::Sd)?;
+    writer
+        .write(text.as_bytes())
         .map_err(|_| StorageError::Sd)?;
-    let root = volume.open_root_dir().map_err(|_| StorageError::Sd)?;
-    if root.open_dir(CONFIG_DIR).is_err() {
-        root.make_dir_in_dir(CONFIG_DIR)
-            .map_err(|_| StorageError::Sd)?;
-    }
-    let directory = root.open_dir(CONFIG_DIR).map_err(|_| StorageError::Sd)?;
-    let file = directory
-        .open_file_in_dir(CONFIG_FILE, Mode::ReadWriteCreateOrTruncate)
-        .map_err(|_| StorageError::Sd)?;
-    file.write(text.as_bytes()).map_err(|_| StorageError::Sd)?;
-    file.flush().map_err(|_| StorageError::Sd)
+    writer.finish().map_err(|_| StorageError::Sd)
 }
-
-/// The concrete SD volume manager type used by the whole firmware.
-pub type SdVolumeManager = embedded_sdmmc::VolumeManager<
-    embedded_sdmmc::SdCard<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, Delay>, Delay>,
-    FatClock,
->;
 
 /// Local wall-clock time for FAT timestamps, published by the main loop once
 /// SNTP has synced (seconds since 1970-01-01 local time; 0 = not synced yet).
@@ -268,38 +289,66 @@ pub fn set_local_time(local_seconds: i64) {
     );
 }
 
-/// FAT time source: the synced local time, or 2026-01-01 before the first sync.
-/// Last published local time (0 = not synced yet).
+/// Last published local time (None = no SNTP sync yet).
 pub fn local_now_seconds() -> Option<i64> {
     let seconds = LOCAL_TIME.load(Ordering::Relaxed);
     (seconds != 0).then_some(i64::from(seconds))
 }
 
-#[derive(Clone, Copy)]
+/// FAT timestamp provider: current local time after SNTP sync, otherwise a
+/// fixed 2026-01-01 fallback date so uploads still get a sane, monotonic date.
+#[derive(Debug)]
 pub struct FatClock;
 
-impl TimeSource for FatClock {
-    fn get_timestamp(&self) -> Timestamp {
+impl TimeProvider for FatClock {
+    fn now(&self) -> FatDateTime {
         let seconds = LOCAL_TIME.load(Ordering::Relaxed);
         if seconds == 0 {
-            return Timestamp {
-                year_since_1970: 56,
-                zero_indexed_month: 0,
-                zero_indexed_day: 0,
-                hours: 0,
-                minutes: 0,
-                seconds: 0,
-            };
+            return FatDateTime::new(2026, 1, 1, 0, 0, 0);
         }
         let time = crate::clock::date_time(i64::from(seconds));
-        Timestamp {
-            // FAT dates cover 1980..=2107.
-            year_since_1970: (time.year - 1970).clamp(10, 137) as u8,
-            zero_indexed_month: (time.month - 1) as u8,
-            zero_indexed_day: (time.day - 1) as u8,
-            hours: time.hour as u8,
-            minutes: time.minute as u8,
-            seconds: time.second as u8,
+        FatDateTime::new(
+            time.year as u16,
+            time.month as u8,
+            time.day as u8,
+            time.hour as u8,
+            time.minute as u8,
+            time.second as u8,
+        )
+    }
+}
+
+/// Format a FAT timestamp as `YYYYMMDDHHMMSS` (used by FTP MDTM/MLST) with the
+/// pre-sync fallback date.
+pub fn fmt_fat_mtime(date: FatDateTime) -> String {
+    let (raw_date, raw_time, _) = date.to_raw();
+    let year = ((raw_date >> 9) & 0x7F) + 1980;
+    alloc::format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        year,
+        (raw_date >> 5) & 0x0F,
+        raw_date & 0x1F,
+        (raw_time >> 11) & 0x1F,
+        (raw_time >> 5) & 0x3F,
+        (raw_time & 0x1F) * 2
+    )
+}
+
+/// Current local time for FTP LIST/MLSD fallbacks, 1980-01-01 before NTP sync.
+pub fn now_ymdhms() -> String {
+    match local_now_seconds() {
+        Some(now) => {
+            let time = crate::clock::date_time(now);
+            alloc::format!(
+                "{:04}{:02}{:02}{:02}{:02}{:02}",
+                time.year,
+                time.month,
+                time.day,
+                time.hour,
+                time.minute,
+                time.second
+            )
         }
+        None => String::from("19800101000000"),
     }
 }

@@ -170,11 +170,12 @@ login/session commands. `LIST -a`/`-la` options are accepted. Network and FTP
 futures run without an executor; during a transfer the main loop burst-polls TCP
 for up to 15 ms at a time, then returns to input and display rendering.
 
-`embedded-sdmmc` can read/list long FAT names, but version 0.10 cannot create or
-rename them. Consequently, downloads and listings preserve long names, while new
-uploads and directories must use DOS 8.3 names such as `PHOTO001.JPG`; rename is
-reported as unsupported. `DELE` and empty-directory `RMD` use a local vendored
-fix that releases their FAT cluster chains instead of leaking space.
+Long (VFAT) filenames are fully supported for read and write. Uploads and
+directories may use long, spacing names up to 255 UTF-16 code units — the
+filesystem layer (`hadris-fat` 2.4) writes the VFAT entries and generates the
+8.3 alias itself. `RNFR`/`RNTO` rename and `DELE` of LFN entries work the same
+as for short names. Writes are write-through: the 226 reply means the data
+came to the card, and deletion frees the whole cluster chain.
 
 FTP credentials and all file contents travel in **plain text**. Use this only on
 a trusted LAN; the shared card contains `RATPUTER/WIFI.CFG` with Wi-Fi passwords.
@@ -319,9 +320,9 @@ variant from mipidsi 0.7 for the same panel).
    write a test file, eject it on the host, then press Backspace and verify that
    `WIFI.CFG` is reloaded.
 10. Open **FTP SERVER**, connect a passive FTP client to the displayed address with
-    `rat` / `cheese`, then test listing, an 8.3 upload, download, delete, mkdir/rmdir,
-    resume download, disconnect, and password editing. Confirm USB DISK is unavailable
-    until the FTP screen is closed.
+    `rat` / `cheese`, then test listing, an upload with a long filename, download,
+    delete, mkdir/rmdir, rename, resume download, disconnect, and password editing.
+    Confirm USB DISK is unavailable until the FTP screen is closed.
 11. Top bar: after connecting, the clock switches from `--:--` to local time within a
     few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
     the clock keeps counting; compare the battery % against the charge level.

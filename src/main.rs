@@ -36,12 +36,13 @@ mod clock;
 mod ftp;
 mod msc;
 mod net;
+mod sdblock;
 mod storage;
 mod usbdisk;
 mod wifi;
 
 use cardputer_adv_keyboard::{Arrow, KeyInput, Keyboard};
-use storage::{FatClock, SavedNetwork, StorageError, WifiConfig};
+use storage::{SavedNetwork, StorageError, WifiConfig};
 
 use mipidsi::interface::SpiInterface;
 use mipidsi::models::ST7789;
@@ -337,10 +338,14 @@ fn main() -> ! {
     } else {
         log::warn!("SD initialization failed at 400 kHz");
     }
-    // `None` means the raw card has been moved to USB MSC. Reconstructing the
-    // manager after detach also invalidates its FAT block cache.
-    let mut storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, FatClock));
-    let (mut wifi_config, storage_available) = match storage::load(storage.as_ref().unwrap()) {
+    // `None` means the raw card has been moved to USB MSC. Re-mounting after
+    // detach re-parses the MBR/FAT because the host may have rewritten them.
+    let mut storage = storage::mount(sd_card);
+    let (mut wifi_config, storage_available) = match storage
+        .as_ref()
+        .ok_or(StorageError::Sd)
+        .and_then(|volume| storage::load(volume))
+    {
         Ok(config) => (config, true),
         Err(StorageError::Missing) => (WifiConfig::default(), true),
         Err(error) => {
@@ -697,16 +702,15 @@ fn main() -> ! {
                         .as_ref()
                         .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped) =>
                 {
-                    if let Some(manager) = storage.take() {
-                        let (sd_card, _) = manager.free();
-                        let card = Box::new(sd_card);
+                    if let Some(volume) = storage.take() {
+                        let card = Box::new(storage::free(volume));
                         if usb_disk.attach(card.as_ref()) {
                             log::info!("SD card exported over USB MSC");
                             usb_sd = Some(card);
                             shown_usb_state = None;
                             usb_force_exit_armed = false;
                         } else {
-                            storage = Some(embedded_sdmmc::VolumeManager::new(*card, FatClock));
+                            storage = storage::mount(*card);
                             ui.set_usb_disk_status("USB INIT ERROR".into());
                         }
                     } else {
@@ -726,8 +730,12 @@ fn main() -> ! {
                         }
                         usb_disk.detach();
                         let sd_card = *usb_sd.take().unwrap();
-                        storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, FatClock));
-                        let reload_ok = match storage::load(storage.as_ref().unwrap()) {
+                        storage = storage::mount(sd_card);
+                        let reload_ok = match storage
+                            .as_ref()
+                            .ok_or(StorageError::Sd)
+                            .and_then(|volume| storage::load(volume))
+                        {
                             Ok(config) => {
                                 wifi_config = config;
                                 true
@@ -993,15 +1001,16 @@ fn set_ftp_login_text(ui: &MainWindow, config: &WifiConfig) {
 
 fn start_ftp(
     server: &mut Option<ftp::FtpServer>,
-    storage: &Option<storage::SdVolumeManager>,
+    storage: &Option<storage::SdVolume>,
     network: &Option<net::Network>,
     config: &WifiConfig,
     ui: &MainWindow,
 ) {
-    let (Some(manager), Some(network)) = (storage.as_ref(), network.as_ref()) else {
+    if storage.is_none() || network.is_none() {
         ui.set_ftp_status("SD OR WI-FI UNAVAILABLE".into());
         return;
-    };
+    }
+    let network = network.as_ref().unwrap();
     if server.is_none() {
         // Socket buffers consume 10 KiB plus allocator overhead. Keep ample
         // margin for Slint redraws and Wi-Fi control allocations.
@@ -1011,7 +1020,7 @@ fn start_ftp(
         }
         *server = Some(ftp::FtpServer::new(network.stack()));
     }
-    match server.as_mut().unwrap().start(manager, network.stack()) {
+    match server.as_mut().unwrap().start(network.stack()) {
         Ok(()) => {
             set_ftp_login_text(ui, config);
             ui.set_ftp_status("WAITING FOR WI-FI".into());
@@ -1020,10 +1029,10 @@ fn start_ftp(
     }
 }
 
-fn stop_ftp(server: &mut Option<ftp::FtpServer>, storage: &Option<storage::SdVolumeManager>) {
-    if let (Some(server), Some(manager)) = (server.as_mut(), storage.as_ref()) {
+fn stop_ftp(server: &mut Option<ftp::FtpServer>, storage: &Option<storage::SdVolume>) {
+    if let (Some(server), Some(_)) = (server.as_mut(), storage.as_ref()) {
         if server.status() != ftp::FtpStatus::Stopped {
-            server.stop(manager);
+            server.stop();
         }
     }
 }

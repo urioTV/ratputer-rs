@@ -2,7 +2,8 @@
 
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A): a **no_std** Rust
 firmware with a **Slint 1.18** UI (software renderer), pixel-art animation, a TCA8418
-keyboard, Wi-Fi (esp-radio), and an SD card (embedded-sdmmc) for credentials. This file
+keyboard, Wi-Fi (esp-radio), and an SD card (hadris-fat + embedded-sdmmc block
+driver) for credentials. This file
 documents hard-won, project-specific knowledge so that future work does not rediscover
 the same pitfalls.
 
@@ -27,7 +28,7 @@ the same pitfalls.
 ```
 src/main.rs        esp-hal init, LCD, SD SPI3, esp-rtos, Slint platform, main loop/state
 src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (blocking block_on)
-src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12) + [clock]
+src/storage.rs     hadris-fat volume + toml/serde: /RATPUTER/WIFI.CFG (max 12) + [ftp]
 src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY switching
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
@@ -36,7 +37,7 @@ src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + 
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
 ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/FTP/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
-vendor/embedded-sdmmc/  0.10.0 + local FAT delete/free-chain fixes
+src/sdblock.rs     seekable first-partition adapter: MBR translate + sector RMW
 build.rs           compiles Slint resources
 xtask/             host helper: builds release, creates and verifies merged binary
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
@@ -127,7 +128,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   entry chars stay punctuation. Enter connects; Escape (Fn+backtick) is "back";
   Delete (Fn+Backspace) forgets a saved network.
 
-## Wi-Fi (esp-radio 1.0.0-beta.1) + SD (embedded-sdmmc 0.10)
+## Wi-Fi (esp-radio 1.0.0-beta.1) + SD (hadris-fat 2.4 over embedded-sdmmc 0.10 blocks)
 
 - **`esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0)` MUST run before
   `WifiController::new`**; the internal Wi-Fi tasks/timers depend on it. We do NOT use
@@ -147,9 +148,10 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - SD: dedicated SPI3, SCLK=G40 MOSI=G14 MISO=G39 CS=G12. Initialize at **400 kHz**,
   call `get_card_type()` to complete identification, then use `SdCard::spi` →
   `ExclusiveDevice::bus_mut()` → `Spi::apply_config` to switch to **20 MHz**.
-  `embedded_sdmmc::SdCard::new(SpiDevice,...)` + `VolumeManager` (RefCell inside →
-  all methods `&self`). Files: 8.3 uppercase FAT
-  names (`RATPUTER/WIFI.CFG`), `embedded_io::Write` + `flush` required.
+  `embedded_sdmmc::SdCard::new(SpiDevice,...)` is the block driver only; the FAT
+  volume is `hadris_fat::sync::FatVolume<SdBlockDevice>` (see `storage::mount`),
+  which owns the card until `storage::free()` hands it to USB MSC. Files:
+  `RATPUTER/WIFI.CFG`; writes commit with `FileWriter::finish()`.
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
 
@@ -217,13 +219,21 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   login is `rat` / `cheese`; `[ftp]` in `WIFI.CFG` persists it and Tab on the FTP
   screen opens the password editor. Credentials and data are plaintext: LAN only.
 - Supported file operations: LIST/NLST/MLSD/MLST, PWD/CWD/CDUP, SIZE/MDTM,
-  RETR (+ REST), STOR, DELE, MKD, empty RMD and ABOR. `LIST -a`/`-la` works.
-  Downloads/listings preserve LFNs, but new files/directories are 8.3 only and
-  rename is unsupported because embedded-sdmmc 0.10 cannot write LFNs.
-- `vendor/embedded-sdmmc` is patched through `[patch.crates-io]`: DELE/RMD free
-  their FAT cluster chains, delete adjacent LFN entries in the same directory
-  block, and correctly update the FSInfo free-cluster count for the final cluster.
-  Keep `PATCHES.md` in sync with local changes.
+  RETR (+ REST), STOR, DELE, MKD, empty RMD, RNFR/RNTO and ABOR. `LIST -a`/`-la`
+  works. Full VFAT long filenames (255 UTF-16 units) for read AND write are
+  provided by `hadris-fat` 2.4, which generates the 8.3 alias itself.
+- FAT implementation: `hadris-fat` with features read/write/lfn/alloc/sync and
+  NO `cache` feature (its cache is write-back; this project is write-through).
+  `src/sdblock.rs` adapts the raw `embedded_sdmmc::BlockDevice` to
+  `embedded_io` 0.7 with MBR partition translation and sub-sector
+  read-modify-write (max 16 blocks per card command). `embedded-sdmmc` remains
+  only as the SD/BlockDevice driver; its VolumeManager is unused.
+- `hadris-fat` handles delete-empty-dir validation, cluster-chain freeing,
+  FSInfo updates, LFN runs across cluster boundaries, and stale-handle
+  revalidation. Do not reintroduce hand-written FAT entry patching.
+- Open FAT handles (`FatDir`, `FileReader`, `FileWriter`) borrow the volume,
+  so FTP creates/uses/drops them within one poll step. Transfer state kept
+  between polls is only paths + byte offsets (see src/ftp.rs header).
 - The FTP screen owns one raw volume for its lifetime. Stop FTP and close all
   RawFile/RawDirectory handles before USB MSC can call `VolumeManager::free()`.
   `main.rs` enforces FTP↔USB exclusion and defensively stops FTP on navigation.
