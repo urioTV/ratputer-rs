@@ -31,6 +31,7 @@ src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (block
 src/storage.rs     hadris-fat volume + toml/serde: /RATPUTER/WIFI.CFG (max 12) + [ftp]
 src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY switching
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
+src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
@@ -40,6 +41,7 @@ ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 src/sdblock.rs     seekable first-partition adapter: MBR translate + sector RMW
 build.rs           compiles Slint resources
 xtask/             host helper: builds release, creates and verifies merged binary
+tools/ratctl.py    stdlib-only host CLI for the USB debug command protocol
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 ```
 
@@ -155,6 +157,30 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
 
+## USB debug console
+
+- `src/debug.rs` owns `USB_DEVICE` and polls the built-in USB Serial/JTAG CDC RX
+  endpoint from the main loop. It shares the endpoint with `esp-println` logs.
+- Host requests are `RAT <id> <command>\n`; every response line starts with
+  `@RAT <id>`, allowing `tools/ratctl.py` to filter normal logs. Supported commands:
+  `PING`, `HELP`, `STATUS`, `KEY`, `TEXT`, `CLEAR`, and `REBOOT`.
+- Responses use a fixed 4 KiB software queue and `write_byte_nb`/`flush_tx_nb`.
+  Never replace this with blocking USB writes: a disconnected host must not freeze
+  the UI or network loop.
+- `STATUS` may expose local operational state and SSIDs, but must never emit Wi-Fi
+  or FTP passwords. `TEXT` accepts credentials from a physically attached host but
+  does not echo them in its response.
+- `KEY` invokes the same root Slint `key-pressed` callback as the keyboard;
+  `backspace` has password-editor semantics. Input is rejected during splash and
+  blocking radio work, matching physical input draining.
+- `ratctl` is a Nix devshell command wrapping the Python-standard-library host tool.
+  It defaults to the only `/dev/ttyACM*`; use `--port` when several are present.
+- USB Serial/JTAG and USB-OTG MSC share the ESP32-S3 PHY. The debug port disappears
+  while USB DISK is active and only returns after firmware-side detach. Debug
+  `KEY enter` is deliberately rejected when USB DISK is selected, preventing an
+  unattended session from losing its only control channel; MSC testing still
+  requires physical input.
+
 ## USB Mass Storage (pure Rust)
 
 - `esp-hal` 1.2 exposes ESP32-S3 USB-OTG through `embassy-usb-driver`, but
@@ -233,7 +259,15 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   revalidation. Do not reintroduce hand-written FAT entry patching.
 - Open FAT handles (`FatDir`, `FileReader`, `FileWriter`) borrow the volume,
   so FTP creates/uses/drops them within one poll step. Transfer state kept
-  between polls is only paths + byte offsets (see src/ftp.rs header).
+  between polls is paths + byte offsets + opaque validated FAT cursors
+  (`AppendCursor`/`ReadCursor`, see src/ftp.rs header and vendor/hadris-fat
+  PATCHES.md) — without the cursors every 4 KiB chunk would re-walk the FAT
+  chain, making large transfers quadratic.
+- Socket timeouts: the control socket has NO transport timeout; dead clients
+  are reaped by the session liveness timer (120 s without control OR data
+  progress) and the 5-minute idle timeout. A transport timeout on the control
+  socket resets any transfer outlasting it; only the passive data socket keeps
+  a 45 s transport timeout. Data progress refreshes `last_activity`.
 - The FTP screen owns one raw volume for its lifetime. Stop FTP and close all
   RawFile/RawDirectory handles before USB MSC can call `VolumeManager::free()`.
   `main.rs` enforces FTP↔USB exclusion and defensively stops FTP on navigation.

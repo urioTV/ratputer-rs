@@ -16,8 +16,9 @@ everything in **Slint (no_std)**. 🐀
 | Memory | `esp-alloc` 0.11 — 150 KB heap in **internal SRAM** (the ADV has no PSRAM!) |
 | Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
-| Storage | `embedded-sdmmc`, FAT card on SPI3, TOML credentials |
+| Storage | `hadris-fat` (vendored) FAT volumes + TOML credentials; `embedded-sdmmc` is only the SD/BlockDevice driver on SPI3 |
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
+| USB debug | Line-oriented control/status protocol (`src/debug.rs`) over the built-in USB Serial/JTAG CDC port; host CLI: `ratctl` |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
@@ -135,9 +136,9 @@ chunks and written with CMD25 **before** the host is told they succeeded; there 
 no write-back caching, so an unplugged cable cannot lose acknowledged data. The
 screen shows host reads/writes and the cache hit rate (`R 1234K W 56K C 87%`).
 
-Only one side owns the card at a time. Entering USB DISK consumes the firmware's
-`VolumeManager`; leaving disconnects USB, recreates the FAT manager (discarding its
-old cache), and reloads `RATPUTER/WIFI.CFG`. Wi-Fi credential writes are therefore
+Only one side owns the card at a time. Entering USB DISK frees the mounted
+`hadris-fat` volume (`storage::free`); leaving disconnects USB, re-mounts a fresh
+FAT volume, and reloads `RATPUTER/WIFI.CFG`. Wi-Fi credential writes are therefore
 impossible while the host owns the card.
 
 **Always eject/unmount `RATPUTER SD` on the computer before pressing Enter or
@@ -168,7 +169,11 @@ supports `LIST`, `NLST`, `MLSD`, `MLST`, `PWD`, `CWD`, `CDUP`, `SIZE`, `MDTM`,
 `REST` for downloads, `RETR`, `STOR`, `DELE`, `MKD`, `RMD`, `ABOR`, and the usual
 login/session commands. `LIST -a`/`-la` options are accepted. Network and FTP
 futures run without an executor; during a transfer the main loop burst-polls TCP
-for up to 15 ms at a time, then returns to input and display rendering.
+for up to 15 ms at a time, then returns to input and rendering. Transfers have no
+time cap — control-connection liveness is refreshed by data progress — while a
+stalled data connection is dropped after 45 s. Multi-megabyte uploads/downloads
+are verified checksum-clean on hardware (about 70–90 KiB/s up, 130–205 KiB/s
+down depending on file size and card fragmentation).
 
 Long (VFAT) filenames are fully supported for read and write. Uploads and
 directories may use long, spacing names up to 255 UTF-16 code units — the
@@ -258,6 +263,49 @@ For manual flashing of an existing image (espflash verifies writes by default):
 espflash write-bin 0x0 ratputer-adv.bin
 ```
 
+### USB debug console
+
+The firmware accepts machine-readable commands on the built-in USB Serial/JTAG CDC
+port. This lets a host inspect runtime state and drive the Slint UI without touching
+the Cardputer keyboard. Enter the dev shell and use `ratctl`; it auto-detects a
+single `/dev/ttyACM*` device:
+
+```bash
+ratctl PING
+ratctl STATUS
+ratctl KEY down
+ratctl KEY enter
+ratctl TEXT "password with spaces"
+ratctl CLEAR
+ratctl REBOOT
+```
+
+`STATUS` reports the current view and selection indices, Wi-Fi/radio/network state,
+IPv4 address, mounted-storage/USB/FTP state, clock, battery, free heap, and saved or
+scanned SSIDs. It deliberately never returns Wi-Fi or FTP passwords. `KEY` accepts
+`up`, `down`, `left`, `right`, `enter`, `back`, `backspace`, `delete`, `tab`, and
+`space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor is
+open; `CLEAR` clears that active editor.
+
+The wire format is `RAT <request-id> <command>\n`; response lines begin with
+`@RAT <request-id>` so the host can separate them from normal firmware logs on the
+same CDC stream. Firmware transmission is queued and non-blocking, so disconnecting
+a host cannot freeze the UI. Commands require physical USB access and provide no
+separate authentication.
+
+The ESP32-S3 USB-OTG and USB-Serial-JTAG controllers share one PHY. Consequently,
+the debug console disappears while **USB DISK** is active and re-enumerates only
+after the firmware exits that screen. To avoid stranding a remote-only session,
+`ratctl KEY enter` is rejected when USB DISK is selected in the main menu. Testing
+MSC still requires physical input because the command transport cannot coexist
+with it on this hardware.
+
+Select a port explicitly when more than one CDC device is attached:
+
+```bash
+ratctl --port /dev/ttyACM0 STATUS
+```
+
 ### Dev-loop flash (with UART monitor)
 
 ```bash
@@ -309,21 +357,23 @@ variant from mipidsi 0.7 for the same panel).
 ## Hardware test checklist
 
 1. Format an SD card as FAT32, insert it, then run `flash`.
-2. Confirm the splash, main menu, rat animation, and full keyboard navigation.
-3. Open **WI-FI → SCAN NETWORKS** and confirm visible SSIDs and RSSI values appear.
-4. Select a WPA/WPA2 network, type its password, and press Enter.
-5. Confirm `CONNECTED: <SSID>` and `/RATPUTER/WIFI.CFG` on the SD card.
-6. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
-7. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
-8. Test an incorrect password, an open network, no SD card, and an empty scan.
-9. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and
-   write a test file, eject it on the host, then press Backspace and verify that
-   `WIFI.CFG` is reloaded.
-10. Open **FTP SERVER**, connect a passive FTP client to the displayed address with
+2. Run `ratctl STATUS`, then use `ratctl KEY enter` / `ratctl KEY back` and confirm
+   that the reported view changes without physical keyboard input.
+3. Confirm the splash, main menu, rat animation, and full keyboard navigation.
+4. Open **WI-FI → SCAN NETWORKS** and confirm visible SSIDs and RSSI values appear.
+5. Select a WPA/WPA2 network, type its password, and press Enter.
+6. Confirm `CONNECTED: <SSID>` and `/RATPUTER/WIFI.CFG` on the SD card.
+7. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
+8. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
+9. Test an incorrect password, an open network, no SD card, and an empty scan.
+10. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and
+    write a test file, eject it on the host, then press Backspace and verify that
+    `WIFI.CFG` is reloaded.
+11. Open **FTP SERVER**, connect a passive FTP client to the displayed address with
     `rat` / `cheese`, then test listing, an upload with a long filename, download,
     delete, mkdir/rmdir, rename, resume download, disconnect, and password editing.
     Confirm USB DISK is unavailable until the FTP screen is closed.
-11. Top bar: after connecting, the clock switches from `--:--` to local time within a
+12. Top bar: after connecting, the clock switches from `--:--` to local time within a
     few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
     the clock keeps counting; compare the battery % against the charge level.
 
