@@ -14,3 +14,19 @@ unchanged apart from the change below, marked `RATPUTER PATCH`.
    position now adds `buffer_base`, and the refill condition triggers whenever
    the read offset leaves the current window (previously it only did so for
    fixed FAT12/16 roots).
+
+2. `FileWriter` exposes an opaque, validated `AppendCursor` plus
+   `new_append_from_cursor`. FTP receives a file in separate main-loop polls and
+   cannot retain a `FileWriter` borrowing the volume between polls. Upstream's
+   `new_append` walks the whole FAT chain every time; reopening it for every
+   4 KiB socket chunk therefore makes uploads quadratic. The cursor caches the
+   committed tail cluster and offset, while revalidating the directory slot,
+   identity, first cluster, size, tail, and offset before each reuse. Both sync
+   and async APIs carry the patch through the shared transformed source.
+
+3. `FileReader` exposes an analogous `ReadCursor` plus `new_from_cursor` for
+   the same reason on the download path: each 4 KiB poll step reopens the file,
+   and upstream would restart every open at the file's first cluster, walking
+   the FAT once per cluster (quadratic in file size). The cursor caches the
+   current cluster and offset, revalidating identity, first cluster, committed
+   size, position, and cluster-offset bounds on each reuse.

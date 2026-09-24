@@ -16,6 +16,34 @@ use super::{
     io::{Cluster, ClusterLike, ErrorKind, Read, Seek, SeekFrom},
 };
 
+/// Opaque position for resuming a sequential read without walking the FAT
+/// chain from the beginning.
+///
+/// Obtain this from [`FileReader::cursor`] and pass it to
+/// [`FileReader::new_from_cursor`] after reopening the same directory entry.
+/// The constructor revalidates the file identity and size before trusting the
+/// cached cluster position.
+///
+/// RATPUTER PATCH: FTP reads are independently polled and cannot retain a
+/// borrowing `FileReader`; this cursor keeps sequential transfers linear-time.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadCursor {
+    first_cluster: Cluster<usize>,
+    cluster: Cluster<usize>,
+    offset_in_cluster: usize,
+    position: u64,
+    size: usize,
+    cluster_steps: u32,
+    #[cfg(feature = "write")]
+    entry_parent: Cluster<usize>,
+    #[cfg(feature = "write")]
+    entry_offset: usize,
+    #[cfg(feature = "write")]
+    entry_short_name: ShortFileName,
+    #[cfg(feature = "write")]
+    entry_created: crate::time::FatDateTime,
+}
+
 /// A reader for file content in a FAT filesystem.
 ///
 /// This struct provides a `Read` implementation that follows the cluster chain
@@ -102,6 +130,84 @@ impl<'a, DATA: Read + Seek> FileReader<'a, DATA> {
             #[cfg(feature = "write")]
             entry_created: entry.created,
         })
+    }
+
+    /// Resume a sequential reader from a cursor returned by [`Self::cursor`].
+    ///
+    /// This does not walk the cluster chain. A cursor is rejected if the file's
+    /// directory identity, first cluster, committed size, position, or cluster
+    /// offset no longer match valid bounds.
+    pub fn new_from_cursor(
+        fs: &'a FatVolume<DATA>,
+        entry: &FileEntry,
+        cursor: ReadCursor,
+    ) -> Result<Self> {
+        if entry.is_directory() {
+            return Err(Error::NotAFile);
+        }
+        let identity_matches = entry.cluster() == cursor.first_cluster
+            && entry.len() as usize == cursor.size
+            && cursor.position <= cursor.size as u64
+            && cursor.offset_in_cluster <= fs.info.cluster_size
+            && (cursor.size == 0 || cursor.cluster.0 >= 2);
+        #[cfg(feature = "write")]
+        let identity_matches = identity_matches
+            && entry.parent_clus == cursor.entry_parent
+            && entry.offset_within_cluster == cursor.entry_offset
+            && entry.short_name == cursor.entry_short_name
+            && entry.created == cursor.entry_created;
+        if !identity_matches {
+            #[cfg(feature = "write")]
+            return Err(Error::StaleEntry);
+            #[cfg(not(feature = "write"))]
+            return Err(Error::CorruptFilesystem {
+                context: "read cursor does not match file entry",
+            });
+        }
+
+        Ok(Self {
+            fs,
+            first_cluster: cursor.first_cluster,
+            cluster: cursor.cluster,
+            offset_in_cluster: cursor.offset_in_cluster,
+            position: cursor.position,
+            size: cursor.size,
+            cluster_steps: cursor.cluster_steps,
+            #[cfg(feature = "alloc")]
+            cluster_buffer: None,
+            #[cfg(feature = "alloc")]
+            cached_chain: None,
+            #[cfg(feature = "alloc")]
+            chain_index: 0,
+            #[cfg(feature = "write")]
+            entry_parent: cursor.entry_parent,
+            #[cfg(feature = "write")]
+            entry_offset: cursor.entry_offset,
+            #[cfg(feature = "write")]
+            entry_short_name: cursor.entry_short_name,
+            #[cfg(feature = "write")]
+            entry_created: cursor.entry_created,
+        })
+    }
+
+    /// Capture the current position for a later [`Self::new_from_cursor`] call.
+    pub fn cursor(&self) -> ReadCursor {
+        ReadCursor {
+            first_cluster: self.first_cluster,
+            cluster: self.cluster,
+            offset_in_cluster: self.offset_in_cluster,
+            position: self.position,
+            size: self.size,
+            cluster_steps: self.cluster_steps,
+            #[cfg(feature = "write")]
+            entry_parent: self.entry_parent,
+            #[cfg(feature = "write")]
+            entry_offset: self.entry_offset,
+            #[cfg(feature = "write")]
+            entry_short_name: self.entry_short_name,
+            #[cfg(feature = "write")]
+            entry_created: self.entry_created,
+        }
     }
 
     /// Returns the total size of the file in bytes.
