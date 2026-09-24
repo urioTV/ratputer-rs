@@ -2,8 +2,9 @@
 
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
 Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
-a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, and SD-backed
-credentials, everything in **Slint (no_std)**. 🐀
+a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, SD-backed
+credentials, and USB Mass Storage export of the SD card, everything in **Slint
+(no_std)**. 🐀
 
 ## Stack
 
@@ -16,6 +17,7 @@ credentials, everything in **Slint (no_std)**. 🐀
 | Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
 | Storage | `embedded-sdmmc`, FAT card on SPI3, TOML credentials |
+| USB disk | TinyUSB 0.21 MSC/SCSI (isolated C component, no ESP-IDF/FreeRTOS) over ESP32-S3 USB-OTG |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
@@ -31,9 +33,10 @@ credentials, everything in **Slint (no_std)**. 🐀
   `--:--` until the first NTP sync), Wi-Fi signal bars + SSID (`CONNECTING`/`OFFLINE`),
   and the battery percentage with a gauge icon (red below 15 %);
 - The template defines **two top-level screens** driven by the `splash-done` property
-  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus seven
+  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus eight
   mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
-  4=scan results, 5=password, 6=about) and a **`key-pressed(string)`** callback:
+  4=scan results, 5=password, 6=about, 7=USB disk) and a
+  **`key-pressed(string)`** callback:
   - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
     128×80 px; frames: bob / step / blink / tail-up) + header `RATPUTER · BOOTING`
     + footer `MODE STALKING/SNIFFING/HUNTING/LOITERING` with a spinner;
@@ -44,13 +47,15 @@ credentials, everything in **Slint (no_std)**. 🐀
     (frames keep cycling while the view is active);
   - **Wi-Fi views** — saved-network list, scan results, masked password entry,
     connection status, and forgetting credentials;
+  - **USB disk** (`view-state == 7`) — exports the whole physical SD card to the
+    connected computer and reports waiting/mounted/ejected state;
   - **about view** (`view-state == 6`) — technical info;
 - The firmware (`src/main.rs`) polls the TCA8418 FIFO. Navigation keys are sent to
   Slint while printable characters are appended to the password in Rust. Wi-Fi
   commands are emitted by Slint and processed on the next main-loop iteration;
-- Main loop: `update_timers_and_animations()` → `draw_if_needed(render_by_line)` →
-  every **250 ms** `ui.set_frame_index(i)` (in the splash **and** in the rat view),
-  after `SPLASH_AFTER_MS` → `ui.set_splash_done(true)`;
+- Main loop: input → scheduled radio/USB work → network/top-bar updates → the
+  250 ms frame ticker → `draw_if_needed(render_by_line)` at the bottom. After
+  `SPLASH_AFTER_MS`, it calls `ui.set_splash_done(true)`;
 
 ### Keyboard — TCA8418RTWR via I2C0
 
@@ -97,6 +102,36 @@ SD wiring uses the ADV's dedicated SPI3 bus:
 
 The bus stays at 400 kHz for standards-compliant card initialization and because
 the credential file is only a few kilobytes.
+
+### USB Mass Storage
+
+Open **USB DISK** from the main menu to expose the complete physical SD card as a
+standard writable USB Mass Storage/SCSI device. The native ESP32-S3 USB-OTG pins
+are fixed: D−=GPIO19 and D+=GPIO20, both already connected to the Cardputer ADV
+USB-C socket.
+
+The USB implementation is a deliberately isolated C component: a vendored subset
+of **TinyUSB 0.21.0** (device core, MSC/SCSI and Synopsys DWC2 controller) compiled
+by `build.rs`. It uses no ESP-IDF or FreeRTOS. Rust polls the controller and TinyUSB
+event queue from the normal firmware loop and provides sector callbacks backed by
+`embedded-sdmmc`.
+
+Only one side owns the card at a time. Entering USB DISK consumes the firmware's
+`VolumeManager`; leaving disconnects USB, recreates the FAT manager (discarding its
+old cache), and reloads `RATPUTER/WIFI.CFG`. Wi-Fi credential writes are therefore
+impossible while the host owns the card.
+
+**Always eject/unmount `RATPUTER SD` on the computer before pressing Enter or
+Backspace to exit.** The first exit attempt while the host is still mounted shows
+a warning; pressing exit again forces disconnection for recovery after an
+unplugged cable and can corrupt pending host writes. SPI3 currently remains at
+400 kHz, so this mode prioritizes compatibility over transfer speed.
+
+The USB-OTG controller shares its PHY with ESP32-S3 USB-Serial-JTAG. The firmware
+switches to OTG only when USB DISK opens and restores Serial/JTAG when it closes;
+the serial port will disappear and re-enumerate during that interval. Descriptors
+currently use TinyUSB's development VID `0xCAFE` with PID `0x4002` and are not
+intended as production USB identifiers.
 
 ### Top bar: clock, Wi-Fi, battery
 
@@ -231,7 +266,10 @@ variant from mipidsi 0.7 for the same panel).
 6. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
 7. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
 8. Test an incorrect password, an open network, no SD card, and an empty scan.
-9. Top bar: after connecting, the clock switches from `--:--` to local time within a
+9. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and
+   write a test file, eject it on the host, then press Backspace and verify that
+   `WIFI.CFG` is reloaded.
+10. Top bar: after connecting, the clock switches from `--:--` to local time within a
    few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
    the clock keeps counting; compare the battery % against the charge level.
 

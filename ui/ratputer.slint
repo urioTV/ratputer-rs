@@ -9,7 +9,8 @@ export component MainWindow inherits Window {
     in property <bool> splash-done: false;
     in-out property <int> frame-index: 0;
 
-    // 0 menu, 1 rat, 2 Wi-Fi menu, 3 saved, 4 scan, 5 password, 6 about.
+    // 0 menu, 1 rat, 2 Wi-Fi menu, 3 saved, 4 scan, 5 password,
+    // 6 about, 7 USB disk.
     in-out property <int> view-state: 0;
     in-out property <int> menu-index: 0;
     in-out property <int> wifi-menu-index: 0;
@@ -29,6 +30,10 @@ export component MainWindow inherits Window {
     // Spinner popup shown over the current view while the radio is busy.
     in-out property <bool> wifi-connecting: false;
 
+    // Firmware polls and clears this command: 1 attach/export SD, 2 detach.
+    in-out property <int> usb-disk-action: 0;
+    in property <string> usb-disk-status: "USB NOT ACTIVE";
+
     // Top bar (main screen only): clock, Wi-Fi link, battery.
     in property <string> clock-text: "--:--";
     in property <bool> clock-synced: false;
@@ -38,7 +43,7 @@ export component MainWindow inherits Window {
     // -1 = no reading yet.
     in property <int> battery-percent: -1;
 
-    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "ABOUT"];
+    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "USB DISK", "ABOUT"];
     property <[string]> wifi-menu-labels: ["SAVED NETWORKS", "SCAN NETWORKS"];
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
@@ -58,6 +63,8 @@ export component MainWindow inherits Window {
                 root.view-state = 4;
             } else if (root.view-state == 3 || root.view-state == 4) {
                 root.view-state = 2;
+            } else if (root.view-state == 7) {
+                root.usb-disk-action = 2;
             } else if (root.view-state != 0) {
                 root.view-state = 0;
             }
@@ -68,9 +75,16 @@ export component MainWindow inherits Window {
             root.wifi-action = 5;
         } else if (key == "enter" || key == "space") {
             if (root.view-state == 0) {
-                root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : 6;
+                if (root.menu-index == 2) {
+                    root.usb-disk-action = 1;
+                    root.view-state = 7;
+                } else {
+                    root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : 6;
+                }
             } else if (root.view-state == 1 || root.view-state == 6) {
                 root.view-state = 0;
+            } else if (root.view-state == 7) {
+                root.usb-disk-action = 2;
             } else if (root.view-state == 2) {
                 if (root.wifi-menu-index == 0) {
                     root.view-state = 3;
@@ -433,6 +447,38 @@ export component MainWindow inherits Window {
                     Text { text: wifi-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
                     Rectangle { height: 1px; background: #0d2b16; }
                     Text { text: "TYPE  ENTER CONNECT  ESC BACK"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
+                }
+            }
+
+            usb-disk-view := Rectangle {
+                visible: view-state == 7;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 5px;
+                    Text { text: "USB DISK"; color: #7dffa9; font-size: 12px; horizontal-alignment: center; height: 18px; vertical-alignment: center; }
+                    Rectangle { height: 1px; background: #0d2b16; }
+                    Text {
+                        text: "SD CARD IS EXCLUSIVE TO USB\nWHILE THIS SCREEN IS OPEN";
+                        color: #46a06a;
+                        font-size: 8px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 24px;
+                        border-width: 1px;
+                        border-color: #2b5c3b;
+                        background: #030903;
+                        Text {
+                            text: root.usb-disk-status;
+                            color: #7dffa9;
+                            font-size: 8px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text { text: "EJECT ON PC BEFORE EXIT"; color: #ffb347; font-size: 8px; horizontal-alignment: center; }
+                    Text { text: "ENTER/BS = EXIT"; color: #39684a; font-size: 8px; horizontal-alignment: center; height: 12px; }
                 }
             }
 

@@ -62,6 +62,8 @@ esp-rom-sys = "0.1"             # ROM symbols (libc-ish) — kept defensively
 [build-dependencies]
 # .slint -> Rust compiler; fonts are packed from ui/fonts into the image
 slint-build = "1.18"
+# Compile the isolated TinyUSB MSC C component for the Xtensa target.
+cc = "1"
 
 [profile.dev]
 opt-level = "z"

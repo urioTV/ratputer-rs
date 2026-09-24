@@ -4556,6 +4556,7 @@ name = "ratputer-rs"
 version = "0.1.0"
 dependencies = [
  "cardputer-adv-keyboard",
+ "cc",
  "embassy-futures",
  "embassy-net",
  "embassy-time",

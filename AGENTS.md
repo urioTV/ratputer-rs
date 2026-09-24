@@ -28,12 +28,15 @@ the same pitfalls.
 src/main.rs        esp-hal init, LCD, SD SPI3, esp-rtos, Slint platform, main loop/state
 src/wifi.rs        esp-radio 1.0.0-beta.1 wrapper: scan (max 8) + connect (blocking block_on)
 src/storage.rs     embedded-sdmmc + toml/serde: /RATPUTER/WIFI.CFG credentials (max 12) + [clock]
+src/usbdisk.rs     TinyUSB FFI, exclusive SD sector backend, USB-OTG PHY switching
+src/usb/           bare-metal TinyUSB config + C MSC/descriptors/callback bridge
+vendor/tinyusb/    pinned TinyUSB 0.21.0 device/MSC/DWC2 subset (MIT)
 src/net.rs         embassy-net stack (DHCP/DNS/UDP) + one-shot SNTP job, polled without executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
-ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/about)
+ui/ratputer.slint  All UI (splash → menu/rat/wifi-menu/saved/scan/password/USB/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
-build.rs           slint-build: compiles ui/ratputer.slint, embeds fonts+images
+build.rs           compiles Slint resources and the isolated TinyUSB C library
 xtask/             host helper: builds release, creates and verifies merged binary
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 ```
@@ -94,8 +97,9 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   pattern for any new slow operation. While `radio_pending.is_some()`, keyboard input
   is drained and discarded — otherwise queued keys replay after the radio unblocks.
   The same drain-and-ignore guard covers the splash screen.
-- Main-loop order matters: input → scheduled actions/step executor → network poll +
-  top-bar refresh → animation ticker → **draw at the BOTTOM of the iteration**. This makes the `wifi-connecting` spinner
+- Main-loop order matters: input → scheduled actions/step executor → USB poll/actions →
+  network poll + top-bar refresh → animation ticker → **draw at the BOTTOM of the
+  iteration**. This makes the `wifi-connecting` spinner
   pop-up appear in the same frame as the Enter press, BEFORE the first blocking radio
   call; a step scheduled in iteration N executes at iteration N+1. Do not move the
   draw back to the top, or every connect/scan will look like an input lag.
@@ -145,6 +149,37 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   names (`RATPUTER/WIFI.CFG`), `embedded_io::Write` + `flush` required.
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
+
+## USB Mass Storage (TinyUSB C island)
+
+- `esp-hal` 1.2 exposes ESP32-S3 USB-OTG through `embassy-usb-driver`, but
+  `embassy-usb` still has no stable **device-side MSC class**. Do not confuse this
+  with `embassy-usb-host::class::msc` (wrong USB direction). `usbd-storage` targets
+  the incompatible blocking `usb-device::UsbBus` API.
+- The firmware therefore vendors the minimum **TinyUSB 0.21.0** subset: device core,
+  MSC/SCSI class and Synopsys DWC2 device controller. `build.rs` compiles it with
+  `xtensa-esp32s3-elf-gcc`. It does NOT link ESP-IDF or FreeRTOS.
+- `vendor/tinyusb/src/portable/synopsys/dwc2/dwc2_esp32.h` is intentionally replaced
+  by a polling bare-metal port. Its interrupt allocation hooks are no-ops;
+  `UsbDisk::poll()` calls `dcd_int_handler(0)` and `tud_task_ext(0, false)` every main
+  loop. DMA stays disabled to avoid ESP-IDF cache helpers.
+- USB-OTG and USB-Serial-JTAG share the ESP32-S3 PHY. Delay OTG PHY selection until
+  the user opens USB DISK, otherwise espflash monitor disappears at boot. On exit,
+  select Serial/JTAG again; the host port re-enumerates. Native pins are fixed:
+  D−=GPIO19, D+=GPIO20.
+- The SD card has **exactly one owner**. Entering USB DISK consumes
+  `VolumeManager::free()`, boxes the raw `SdCard` at a stable address and registers
+  the sector callbacks. Exit disconnects TinyUSB before clearing that pointer, then
+  reconstructs `VolumeManager` to invalidate its FAT cache and reloads `WIFI.CFG`.
+  Never let filesystem methods run while MSC owns the card.
+- Host eject is observed through SCSI START STOP UNIT. Normal exit is rejected while
+  the host is mounted. A second EXIT forces disconnect because forced B-valid means
+  cable removal cannot always be detected; this is recovery-only and can lose host
+  writes. Block writes themselves are synchronous; SYNCHRONIZE CACHE succeeds.
+- Keep TinyUSB's vendored `LICENSE` and `VERSION`. Development descriptors currently
+  use VID:PID `CAFE:4002`; obtain real identifiers before product distribution.
+- SPI3 is still 400 kHz, so USB disk transfer is slow. Any speed increase must keep
+  card initialization ≤400 kHz and switch to a faster clock only after SD init.
 
 ## Network, clock, battery (top bar)
 

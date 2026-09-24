@@ -35,6 +35,7 @@ mod battery;
 mod clock;
 mod net;
 mod storage;
+mod usbdisk;
 mod wifi;
 
 use cardputer_adv_keyboard::{Arrow, KeyInput, Keyboard};
@@ -257,6 +258,11 @@ fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     let mut delay = Delay::new();
 
+    // Native USB-OTG uses the ESP32-S3's fixed D+=GPIO20 / D-=GPIO19 pins.
+    let usb =
+        esp_hal::usb::otg::Usb::new_fs(peripherals.USB_FS, peripherals.GPIO20, peripherals.GPIO19);
+    let mut usb_disk = usbdisk::UsbDisk::new(usb);
+
     // --- LCD ST7789V2 on SPI2 (Cardputer ADV) ---
     let dc = Output::new(peripherals.GPIO34, Level::Low, OutputConfig::default());
     let cs = Output::new(peripherals.GPIO37, Level::High, OutputConfig::default());
@@ -316,8 +322,10 @@ fn main() -> ! {
     .with_miso(peripherals.GPIO39);
     let sd_device = ExclusiveDevice::new(sd_spi, sd_cs, Delay::new()).unwrap();
     let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
-    let storage = embedded_sdmmc::VolumeManager::new(sd_card, BuildTime);
-    let (mut wifi_config, storage_available) = match storage::load(&storage) {
+    // `None` means the raw card has been moved to USB MSC. Reconstructing the
+    // manager after detach also invalidates its FAT block cache.
+    let mut storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, BuildTime));
+    let (mut wifi_config, storage_available) = match storage::load(storage.as_ref().unwrap()) {
         Ok(config) => (config, true),
         Err(StorageError::Missing) => (WifiConfig::default(), true),
         Err(error) => {
@@ -375,6 +383,14 @@ fn main() -> ! {
         }
         .into(),
     );
+    ui.set_usb_disk_status(
+        if usb_disk.available() {
+            "CONNECT USB CABLE"
+        } else {
+            "USB INIT ERROR"
+        }
+        .into(),
+    );
 
     // Single-line buffer (ReusedBuffer) — 240 px RGB565
     let mut line_buffer: [Rgb565Pixel; LCD_WIDTH] = [Rgb565Pixel(0); LCD_WIDTH];
@@ -393,6 +409,9 @@ fn main() -> ! {
     let mut shown_clock: Option<Option<(u8, u8)>> = None;
     let mut shown_link_state = -1;
     let mut last_battery_at: Option<Instant> = None;
+    let mut usb_sd = None;
+    let mut shown_usb_state = None;
+    let mut usb_force_exit_armed = false;
     loop {
         slint::platform::update_timers_and_animations();
 
@@ -501,7 +520,10 @@ fn main() -> ! {
                             ui.set_link_ssid(truncate_ascii(&ssid, TOP_BAR_SSID_CHARS).into());
                             wifi_config.upsert(network);
                             ui.set_saved_networks(saved_network_model(&wifi_config));
-                            if storage::save(&storage, &wifi_config).is_err() {
+                            if storage
+                                .as_ref()
+                                .is_none_or(|manager| storage::save(manager, &wifi_config).is_err())
+                            {
                                 ui.set_wifi_status("CONNECTED - SD SAVE FAILED".into());
                             } else {
                                 ui.set_wifi_status(
@@ -611,7 +633,10 @@ fn main() -> ! {
                     if wifi_config.remove(index) {
                         ui.set_saved_index(0);
                         ui.set_saved_networks(saved_network_model(&wifi_config));
-                        if storage::save(&storage, &wifi_config).is_err() {
+                        if storage
+                            .as_ref()
+                            .is_none_or(|manager| storage::save(manager, &wifi_config).is_err())
+                        {
                             ui.set_wifi_status("SD SAVE FAILED".into());
                         } else {
                             ui.set_wifi_status("NETWORK FORGOTTEN".into());
@@ -619,6 +644,99 @@ fn main() -> ! {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // --- USB MSC: temporarily move the raw SD card out of the FAT manager ---
+        // Poll before handling EXIT so a just-received host eject is observed.
+        if usb_sd.is_some() {
+            usb_disk.poll();
+        }
+        let usb_action = ui.get_usb_disk_action();
+        if usb_action != 0 {
+            ui.set_usb_disk_action(0);
+            match usb_action {
+                1 if usb_sd.is_none() => {
+                    if let Some(manager) = storage.take() {
+                        let (sd_card, _) = manager.free();
+                        let card = Box::new(sd_card);
+                        if usb_disk.attach(card.as_ref()) {
+                            log::info!("SD card exported over USB MSC");
+                            usb_sd = Some(card);
+                            shown_usb_state = None;
+                            usb_force_exit_armed = false;
+                        } else {
+                            storage = Some(embedded_sdmmc::VolumeManager::new(*card, BuildTime));
+                            ui.set_usb_disk_status("USB INIT ERROR".into());
+                        }
+                    } else {
+                        ui.set_usb_disk_status("SD ALREADY IN USE".into());
+                    }
+                }
+                2 if usb_sd.is_some() => {
+                    if usb_disk.can_detach() || usb_force_exit_armed {
+                        if usb_force_exit_armed && !usb_disk.can_detach() {
+                            log::warn!("Forcing USB MSC disconnect without host eject");
+                        }
+                        usb_disk.detach();
+                        let sd_card = *usb_sd.take().unwrap();
+                        storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, BuildTime));
+                        let reload_ok = match storage::load(storage.as_ref().unwrap()) {
+                            Ok(config) => {
+                                wifi_config = config;
+                                true
+                            }
+                            Err(StorageError::Missing) => {
+                                wifi_config = WifiConfig::default();
+                                true
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "Unable to reload Wi-Fi credentials after USB: {error:?}"
+                                );
+                                false
+                            }
+                        };
+                        ui.set_saved_networks(saved_network_model(&wifi_config));
+                        ui.set_saved_index(0);
+                        ui.set_wifi_status(
+                            if reload_ok {
+                                "SD RELOADED"
+                            } else {
+                                "SD ERROR AFTER USB"
+                            }
+                            .into(),
+                        );
+                        ui.set_view_state(0);
+                        ui.set_usb_disk_status("CONNECT USB CABLE".into());
+                        shown_usb_state = None;
+                        usb_force_exit_armed = false;
+                        log::info!("USB MSC stopped; firmware regained the SD card");
+                    } else {
+                        // VBUS sensing is forced on this bare-metal port, so a cable
+                        // unplug cannot always be distinguished from a mounted host.
+                        // A second press provides an explicit (unsafe) escape hatch.
+                        ui.set_usb_disk_status("EJECT OR PRESS EXIT AGAIN".into());
+                        usb_force_exit_armed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if usb_sd.is_some() {
+            let state = usb_disk.state();
+            if shown_usb_state != Some(state) {
+                ui.set_usb_disk_status(
+                    match state {
+                        usbdisk::UsbDiskState::Waiting => "CONNECT USB CABLE",
+                        usbdisk::UsbDiskState::Mounted => "SD MOUNTED ON PC",
+                        usbdisk::UsbDiskState::Ejected => "SAFE TO EXIT",
+                        usbdisk::UsbDiskState::Inactive => "USB NOT ACTIVE",
+                    }
+                    .into(),
+                );
+                shown_usb_state = Some(state);
             }
         }
 
@@ -679,9 +797,7 @@ fn main() -> ! {
             shown_clock = Some(clock_hh_mm);
         }
 
-        if last_battery_at
-            .is_none_or(|at| now - at >= Duration::from_millis(BATTERY_EVERY_MS))
-        {
+        if last_battery_at.is_none_or(|at| now - at >= Duration::from_millis(BATTERY_EVERY_MS)) {
             if let Some(percent) = battery.sample_percent() {
                 ui.set_battery_percent(i32::from(percent));
             }
