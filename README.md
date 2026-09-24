@@ -113,9 +113,9 @@ USB-C socket.
 
 The USB implementation is a deliberately isolated C component: a vendored subset
 of **TinyUSB 0.21.0** (device core, MSC/SCSI and Synopsys DWC2 controller) compiled
-by `build.rs`. It uses no ESP-IDF or FreeRTOS. Rust polls the controller and TinyUSB
-event queue from the normal firmware loop and provides sector callbacks backed by
-`embedded-sdmmc`.
+by `build.rs`. It uses no ESP-IDF or FreeRTOS. The DWC2 controller moves endpoint
+buffers with its internal DMA; Rust polls completion events and TinyUSB's queue from
+the normal firmware loop and provides sector callbacks backed by `embedded-sdmmc`.
 
 Only one side owns the card at a time. Entering USB DISK consumes the firmware's
 `VolumeManager`; leaving disconnects USB, recreates the FAT manager (discarding its

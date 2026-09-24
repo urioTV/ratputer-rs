@@ -17,9 +17,11 @@
 #define CFG_TUD_VENDOR 0
 #define CFG_TUD_MSC_EP_BUFSIZE 512
 
-// ESP32-S3 uses FIFO/slave mode here. DMA would require cache maintenance
-// and ESP-IDF helpers that the bare-metal firmware deliberately does not link.
-#define CFG_TUD_DWC2_DMA_ENABLE 0
+// Use the DWC2's internal buffer DMA. Espressif makes this the default: slave
+// mode is IRQ-driven and cannot reliably drain bulk FIFOs from our cooperative
+// polling loop. All USB buffers live in directly accessible internal SRAM; the
+// ADV has no cached PSRAM, so ESP-IDF cache-maintenance hooks are unnecessary.
+#define CFG_TUD_DWC2_DMA_ENABLE 1
 #define CFG_TUSB_MEM_ALIGN __attribute__((aligned(4)))
 
 #endif

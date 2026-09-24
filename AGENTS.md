@@ -164,7 +164,11 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - `vendor/tinyusb/src/portable/synopsys/dwc2/dwc2_esp32.h` is intentionally replaced
   by a polling bare-metal port. Its interrupt allocation hooks are no-ops;
   `UsbDisk::poll()` calls `dcd_int_handler(0)` and `tud_task_ext(0, false)` every main
-  loop. DMA stays disabled to avoid ESP-IDF cache helpers.
+  loop. **DWC2 buffer DMA must stay enabled**: slave mode is IRQ-driven and polling
+  it once per firmware loop leaves bulk FIFO service late enough for Windows I/O to
+  time out and block Explorer. Espressif also defaults its current TinyUSB port to
+  DMA. USB buffers are static internal SRAM (the ADV has no cached PSRAM), so S3
+  needs no ESP-IDF cache-maintenance hooks.
 - USB-OTG and USB-Serial-JTAG share the ESP32-S3 PHY. Delay OTG PHY selection until
   the user opens USB DISK, otherwise espflash monitor disappears at boot. On exit,
   select Serial/JTAG again; the host port re-enumerates. Native pins are fixed:
