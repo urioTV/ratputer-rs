@@ -143,9 +143,11 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   Association is flaky; `connect()` retries 3× (disconnect between attempts).
   Station auth is `AuthenticationMethodConfig`
   (Open/Wep/Wpa/Wpa2Personal/WpaWpa2Personal) — WPA3-only APs are marked unsupported.
-- SD: dedicated SPI3, SCLK=G40 MOSI=G14 MISO=G39 CS=G12 @ **400 kHz** (proper card
-  init speed; file is a few KB anyway). `embedded_sdmmc::SdCard::new(SpiDevice,...)` +
-  `VolumeManager` (RefCell inside → all methods `&self`). Files: 8.3 uppercase FAT
+- SD: dedicated SPI3, SCLK=G40 MOSI=G14 MISO=G39 CS=G12. Initialize at **400 kHz**,
+  call `get_card_type()` to complete identification, then use `SdCard::spi` →
+  `ExclusiveDevice::bus_mut()` → `Spi::apply_config` to switch to **10 MHz**.
+  `embedded_sdmmc::SdCard::new(SpiDevice,...)` + `VolumeManager` (RefCell inside →
+  all methods `&self`). Files: 8.3 uppercase FAT
   names (`RATPUTER/WIFI.CFG`), `embedded_io::Write` + `flush` required.
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
   the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
@@ -178,8 +180,10 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   writes. Block writes themselves are synchronous; SYNCHRONIZE CACHE succeeds.
 - Keep TinyUSB's vendored `LICENSE` and `VERSION`. Development descriptors currently
   use VID:PID `CAFE:4002`; obtain real identifiers before product distribution.
-- SPI3 is still 400 kHz, so USB disk transfer is slow. Any speed increase must keep
-  card initialization ≤400 kHz and switch to a faster clock only after SD init.
+- USB sector traffic uses the 10 MHz post-init SPI clock. Never construct the card
+  at 10 MHz: identification must remain ≤400 kHz, and only `apply_config` after a
+  successful `get_card_type()` may raise it. The default-speed SD limit is 25 MHz;
+  10 MHz leaves margin for the ADV's GPIO-matrix routing.
 
 ## Network, clock, battery (top bar)
 

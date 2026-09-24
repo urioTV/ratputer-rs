@@ -309,8 +309,8 @@ fn main() -> ! {
     let mut keyboard = Keyboard::new(i2c).expect("TCA8418 keyboard initialization failed");
 
     // --- SD card on dedicated SPI3: SCLK=G40, MOSI=G14, MISO=G39, CS=G12 ---
-    // The fixed 400 kHz clock is deliberately conservative and valid during card startup.
-    // Credential files are tiny, so higher transfer speed is unnecessary here.
+    // SD identification MUST run at <=400 kHz. After it succeeds, switch to a
+    // conservative 10 MHz data clock (the SPI default-speed limit is 25 MHz).
     let sd_cs = Output::new(peripherals.GPIO12, Level::High, OutputConfig::default());
     let sd_spi = Spi::new(
         peripherals.SPI3,
@@ -322,6 +322,19 @@ fn main() -> ! {
     .with_miso(peripherals.GPIO39);
     let sd_device = ExclusiveDevice::new(sd_spi, sd_cs, Delay::new()).unwrap();
     let sd_card = embedded_sdmmc::SdCard::new(sd_device, Delay::new());
+    if let Some(card_type) = sd_card.get_card_type() {
+        let fast_config = SpiConfig::default().with_frequency(Rate::from_mhz(10));
+        if sd_card
+            .spi(|device| device.bus_mut().apply_config(&fast_config))
+            .is_ok()
+        {
+            log::info!("SD initialized as {card_type:?}; SPI clock raised to 10 MHz");
+        } else {
+            log::warn!("SD initialized, but SPI remained at 400 kHz");
+        }
+    } else {
+        log::warn!("SD initialization failed at 400 kHz");
+    }
     // `None` means the raw card has been moved to USB MSC. Reconstructing the
     // manager after detach also invalidates its FAT block cache.
     let mut storage = Some(embedded_sdmmc::VolumeManager::new(sd_card, BuildTime));

@@ -100,8 +100,9 @@ SD wiring uses the ADV's dedicated SPI3 bus:
 | G39 | MISO |
 | G12 | CS |
 
-The bus stays at 400 kHz for standards-compliant card initialization and because
-the credential file is only a few kilobytes.
+The card is identified at the standards-compliant 400 kHz startup clock. After
+successful initialization, SPI3 switches to a conservative 10 MHz data clock
+(the SD default-speed limit is 25 MHz).
 
 ### USB Mass Storage
 
@@ -124,8 +125,8 @@ impossible while the host owns the card.
 **Always eject/unmount `RATPUTER SD` on the computer before pressing Enter or
 Backspace to exit.** The first exit attempt while the host is still mounted shows
 a warning; pressing exit again forces disconnection for recovery after an
-unplugged cable and can corrupt pending host writes. SPI3 currently remains at
-400 kHz, so this mode prioritizes compatibility over transfer speed.
+unplugged cable and can corrupt pending host writes. USB sector traffic uses the
+post-initialization 10 MHz SD data clock.
 
 The USB-OTG controller shares its PHY with ESP32-S3 USB-Serial-JTAG. The firmware
 switches to OTG only when USB DISK opens and restores Serial/JTAG when it closes;
