@@ -103,23 +103,6 @@ write = [
 name = "hadris_fat"
 path = "src/lib.rs"
 
-[[example]]
-name = "shared_volume"
-path = "examples/shared_volume.rs"
-
-[[test]]
-name = "exfat_roundtrip"
-path = "tests/exfat_roundtrip.rs"
-required-features = [
-    "unstable-exfat",
-    "write",
-]
-
-[[test]]
-name = "exfat_upcase_dos"
-path = "tests/exfat_upcase_dos.rs"
-required-features = ["unstable-exfat"]
-
 [dependencies.bitflags]
 version = "2.9.0"
 

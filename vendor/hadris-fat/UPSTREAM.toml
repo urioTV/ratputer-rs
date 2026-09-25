@@ -1,0 +1,8 @@
+# Source provenance for the vendored hadris-fat crate.
+# Update this file only through tools/update-hadris-fat.sh.
+repository = "https://github.com/hxyulin/hadris"
+crate = "hadris-fat"
+version = "2.4.0"
+tag = "v2.4.0"
+commit = "fae5e477e7d9ad000fd3a07bf4b5943e8c3b84f5"
+crate_sha256 = "e90944e25592823e8512521f20bad5984eeddc4d4b0d4a688c379a3860c9deb7"

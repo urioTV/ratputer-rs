@@ -1,0 +1,133 @@
+diff --git a/src/write.rs b/src/write.rs
+index f0353bf..2efcc7f 100644
+--- a/src/write.rs
++++ b/src/write.rs
+@@ -20,6 +20,29 @@ use super::{
+ #[cfg(feature = "write")]
+ use hadris_common::types::endian::{Endian, LittleEndian};
+ 
++/// Opaque position for resuming an append without walking the FAT chain again.
++///
++/// Obtain this from [`FileWriter::append_cursor`] immediately before finishing
++/// a writer, then pass it to [`FileWriter::new_append_from_cursor`] after the
++/// directory entry has been reopened. The constructor revalidates the file
++/// identity and committed length before trusting the cached cluster position.
++///
++/// RATPUTER PATCH: FTP writes arrive in independently-polled chunks and cannot
++/// retain a borrowing `FileWriter` between polls. A cursor keeps those chunks
++/// linear-time without exposing FAT cluster internals to the caller.
++#[cfg(feature = "write")]
++#[derive(Clone, Copy, Debug)]
++pub struct AppendCursor {
++    first_cluster: Option<Cluster<usize>>,
++    current_cluster: Option<Cluster<usize>>,
++    offset_in_cluster: usize,
++    total_written: usize,
++    entry_parent: Cluster<usize>,
++    entry_offset: usize,
++    entry_short_name: ShortFileName,
++    entry_created: crate::time::FatDateTime,
++}
++
+ /// A writer for file content in a FAT filesystem.
+ #[cfg(feature = "write")]
+ pub struct FileWriter<'a, DATA: Read + Write + Seek> {
+@@ -235,6 +258,73 @@ entry_created: entry.created,
+         })
+     }
+ 
++    /// Resume appending from a cursor returned by [`Self::append_cursor`].
++    ///
++    /// Unlike [`Self::new_append`], this performs only constant-time
++    /// validation and does not walk from the file's first cluster to its tail.
++    /// The cursor is rejected if the directory slot, identity, first cluster,
++    /// committed size, cluster offset, or chain tail no longer match.
++    pub async fn new_append_from_cursor(
++        fs: &'a FatVolume<DATA>,
++        entry: &FileEntry,
++        cursor: AppendCursor,
++    ) -> Result<Self> {
++        if entry.is_directory() {
++            return Err(Error::NotAFile);
++        }
++
++        let first_cluster = if entry.cluster().0 >= 2 {
++            Some(entry.cluster())
++        } else {
++            None
++        };
++        if entry.parent_clus != cursor.entry_parent
++            || entry.offset_within_cluster != cursor.entry_offset
++            || entry.short_name != cursor.entry_short_name
++            || entry.created != cursor.entry_created
++            || first_cluster != cursor.first_cluster
++            || entry.len() as usize != cursor.total_written
++            || cursor.offset_in_cluster > fs.info.cluster_size
++            || (cursor.total_written > 0 && cursor.current_cluster.is_none())
++        {
++            return Err(Error::StaleEntry);
++        }
++
++        if let Some(current) = cursor.current_cluster {
++            if fs.next_cluster_routed(current.0).await?.is_some() {
++                return Err(Error::StaleEntry);
++            }
++        }
++
++        let fixed_root = if entry.parent_clus.0 == 0 {
++            fs.fixed_root_dir_info()
++        } else {
++            None
++        };
++        fs.register_writer(entry.parent_clus, entry.offset_within_cluster)?;
++
++        Ok(Self {
++            fs,
++            first_cluster: cursor.first_cluster,
++            current_cluster: cursor.current_cluster,
++            offset_in_cluster: cursor.offset_in_cluster,
++            total_written: cursor.total_written,
++            first_allocated_cluster: None,
++            allocation_predecessor: None,
++            allocation_start_offset: 0,
++            allocation_start_total_written: 0,
++            entry_parent: cursor.entry_parent,
++            entry_offset: cursor.entry_offset,
++            entry_short_name: cursor.entry_short_name,
++            entry_created: cursor.entry_created,
++            fixed_root,
++            pending_modified: None,
++            pending_accessed: None,
++            pending_created: None,
++            finished: false,
++        })
++    }
++
+     /// Write data to the file.
+     ///
+     /// Allocates new clusters as needed.
+@@ -356,6 +446,24 @@ entry_created: entry.created,
+         Ok(())
+     }
+ 
++    /// Capture the current append position for a later
++    /// [`Self::new_append_from_cursor`] call.
++    ///
++    /// The current writer must still be committed with [`Self::finish`]. Only
++    /// reuse the returned cursor if that commit succeeds.
++    pub fn append_cursor(&self) -> AppendCursor {
++        AppendCursor {
++            first_cluster: self.first_cluster,
++            current_cluster: self.current_cluster,
++            offset_in_cluster: self.offset_in_cluster,
++            total_written: self.total_written,
++            entry_parent: self.entry_parent,
++            entry_offset: self.entry_offset,
++            entry_short_name: self.entry_short_name,
++            entry_created: self.entry_created,
++        }
++    }
++
+     /// Get the total number of bytes written.
+     pub fn bytes_written(&self) -> usize {
+         self.total_written

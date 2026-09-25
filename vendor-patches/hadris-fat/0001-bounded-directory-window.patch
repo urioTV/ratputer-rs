@@ -1,0 +1,112 @@
+diff --git a/src/dir.rs b/src/dir.rs
+index 891d25e..175f126 100644
+--- a/src/dir.rs
++++ b/src/dir.rs
+@@ -315,29 +315,30 @@ impl<DATA: Read + Seek> FatDirIter<'_, DATA> {
+             // Read the entry - use buffering when alloc is available
+             #[cfg(feature = "alloc")]
+             let raw_entry = {
+-                // Refill when the buffer is stale or, for a fixed root, when
+-                // the read offset has walked past the buffered window — the
+-                // window slides forward in 4 KiB chunks instead of ending the
+-                // directory at the first 4096 bytes.
++                // Refill when the buffer is stale or when the read offset has
++                // walked past the buffered window — the window slides forward
++                // in 4 KiB chunks instead of buffering the whole cluster.
+                 let needs_refill = !self.buffer_valid
+                     || self.cluster_buffer.is_none()
+-                    || (self.fixed_root_remaining.is_some()
+-                        && (self.offset < self.buffer_base
+-                            || self.offset + entry_size
+-                                > self.buffer_base + self.cluster_buffer.as_ref().unwrap().len()));
++                    || self.offset < self.buffer_base
++                    || self.offset + entry_size
++                        > self.buffer_base + self.cluster_buffer.as_ref().unwrap().len();
+                 if needs_refill {
++                    // RATPUTER PATCH: cap the directory buffer at 4 KiB and
++                    // slide a window through cluster-based directories, the
++                    // same way fixed roots already do. Upstream buffers the
++                    // entire cluster here, which is 32 KiB on large FAT32
++                    // cards — fatal on small-heap devices (allocation failure
++                    // mid-listing panics the firmware).
++                    const DIR_WINDOW: usize = 4096;
+                     let buffer_size = if let Some(remaining) = self.fixed_root_remaining {
+                         // For fixed root, buffer the remaining bytes (up to a reasonable size)
+-                        remaining.min(4096)
++                        remaining.min(DIR_WINDOW)
+                     } else {
+-                        cluster_size
++                        cluster_size.min(DIR_WINDOW)
+                     };
+ 
+-                    self.buffer_base = if self.fixed_root_remaining.is_some() {
+-                        self.offset
+-                    } else {
+-                        0
+-                    };
++                    self.buffer_base = self.offset;
+                     let seek_pos = if self.fixed_root_remaining.is_some() {
+                         let start = self.fixed_root_start.unwrap();
+                         (start + self.buffer_base) as u64
+@@ -345,6 +346,7 @@ impl<DATA: Read + Seek> FatDirIter<'_, DATA> {
+                         self.cluster
+                             .to_bytes(self.data.info.data_start, cluster_size)
+                             as u64
++                            + self.buffer_base as u64
+                     };
+ 
+                     if let Err(e) = data.seek(SeekFrom::Start(seek_pos)).await {
+@@ -759,29 +761,30 @@ impl<DATA: Read + Seek> Iterator for FatDirIter<'_, DATA> {
+             // Read the entry - use buffering when alloc is available
+             #[cfg(feature = "alloc")]
+             let raw_entry = {
+-                // Refill when the buffer is stale or, for a fixed root, when
+-                // the read offset has walked past the buffered window — the
+-                // window slides forward in 4 KiB chunks instead of ending the
+-                // directory at the first 4096 bytes.
++                // Refill when the buffer is stale or when the read offset has
++                // walked past the buffered window — the window slides forward
++                // in 4 KiB chunks instead of buffering the whole cluster.
+                 let needs_refill = !self.buffer_valid
+                     || self.cluster_buffer.is_none()
+-                    || (self.fixed_root_remaining.is_some()
+-                        && (self.offset < self.buffer_base
+-                            || self.offset + entry_size
+-                                > self.buffer_base + self.cluster_buffer.as_ref().unwrap().len()));
++                    || self.offset < self.buffer_base
++                    || self.offset + entry_size
++                        > self.buffer_base + self.cluster_buffer.as_ref().unwrap().len();
+                 if needs_refill {
++                    // RATPUTER PATCH: cap the directory buffer at 4 KiB and
++                    // slide a window through cluster-based directories, the
++                    // same way fixed roots already do. Upstream buffers the
++                    // entire cluster here, which is 32 KiB on large FAT32
++                    // cards — fatal on small-heap devices (allocation failure
++                    // mid-listing panics the firmware).
++                    const DIR_WINDOW: usize = 4096;
+                     let buffer_size = if let Some(remaining) = self.fixed_root_remaining {
+                         // For fixed root, buffer the remaining bytes (up to a reasonable size)
+-                        remaining.min(4096)
++                        remaining.min(DIR_WINDOW)
+                     } else {
+-                        cluster_size
++                        cluster_size.min(DIR_WINDOW)
+                     };
+ 
+-                    self.buffer_base = if self.fixed_root_remaining.is_some() {
+-                        self.offset
+-                    } else {
+-                        0
+-                    };
++                    self.buffer_base = self.offset;
+                     let seek_pos = if self.fixed_root_remaining.is_some() {
+                         let start = self.fixed_root_start.unwrap();
+                         (start + self.buffer_base) as u64
+@@ -789,6 +792,7 @@ impl<DATA: Read + Seek> Iterator for FatDirIter<'_, DATA> {
+                         self.cluster
+                             .to_bytes(self.data.info.data_start, cluster_size)
+                             as u64
++                            + self.buffer_base as u64
+                     };
+ 
+                     if let Err(e) = data.seek(SeekFrom::Start(seek_pos)) {
