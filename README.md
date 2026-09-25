@@ -18,7 +18,7 @@ everything in **Slint (no_std)**. 🐀
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
 | Storage | `hadris-fat` (vendored) FAT volumes + TOML credentials; `embedded-sdmmc` is only the SD/BlockDevice driver on SPI3 |
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
-| USB debug | Line-oriented control/status protocol (`src/debug.rs`) over the built-in USB Serial/JTAG CDC port; host CLI: `ratctl` |
+| USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
@@ -263,21 +263,34 @@ For manual flashing of an existing image (espflash verifies writes by default):
 espflash write-bin 0x0 ratputer-adv.bin
 ```
 
-### USB debug console
+### USB command console
 
-The firmware accepts machine-readable commands on the built-in USB Serial/JTAG CDC
-port. This lets a host inspect runtime state and drive the Slint UI without touching
-the Cardputer keyboard. Enter the dev shell and use `ratctl`; it auto-detects a
-single `/dev/ttyACM*` device:
+The built-in USB Serial/JTAG CDC port carries both firmware logs and an interactive
+command shell. Open it with the same `espflash` installation used for flashing:
 
-```bash
-ratctl PING
-ratctl STATUS
-ratctl KEY down
-ratctl KEY enter
-ratctl TEXT "password with spaces"
-ratctl CLEAR
-ratctl REBOOT
+Open it with any serial terminal — **not** with `espflash monitor`, which resets
+the chip into ROM download mode (dark screen) or fails against the running app:
+
+```text
+Windows : PuTTY -> Serial -> COM5, 115200 8N1 (or any serial monitor tool)
+Linux   : picocom /dev/ttyACM0 -b 115200   (or: screen /dev/ttyACM0 115200)
+macOS   : screen /dev/tty.usbmodem* 115200
+```
+
+Open the terminal without changing the DTR/RTS handshaking lines where possible.
+Opening the port can emit one reset edge; the firmware reboots and prints the
+banner plus a `rat> ` prompt within a couple of seconds. Commands are case-insensitive and
+are entered directly — no separate host utility is required:
+
+```text
+rat> ping
+[rat] OK PONG protocol=1
+rat> status
+rat> key down
+rat> key enter
+rat> text password with spaces
+rat> clear
+rat> reboot
 ```
 
 `STATUS` reports the current view and selection indices, Wi-Fi/radio/network state,
@@ -285,26 +298,20 @@ IPv4 address, mounted-storage/USB/FTP state, clock, battery, free heap, and save
 scanned SSIDs. It deliberately never returns Wi-Fi or FTP passwords. `KEY` accepts
 `up`, `down`, `left`, `right`, `enter`, `back`, `backspace`, `delete`, `tab`, and
 `space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor is
-open; `CLEAR` clears that active editor.
+open; `CLEAR` clears that active editor. Type `help` to list the commands.
 
-The wire format is `RAT <request-id> <command>\n`; response lines begin with
-`@RAT <request-id>` so the host can separate them from normal firmware logs on the
-same CDC stream. Firmware transmission is queued and non-blocking, so disconnecting
-a host cannot freeze the UI. Commands require physical USB access and provide no
-separate authentication.
+The shell accepts CR, LF, and CRLF line endings, echoes printable input, supports
+Backspace and Ctrl+U, and ignores terminal cursor-key escape sequences. Press
+Ctrl+U if stray bytes from an earlier session (for example commands typed while
+the chip sat in ROM download mode) polluted the current line. Its own output
+starts with `[rat]` so it can be distinguished from normal logs. Transmission
+uses a fixed non-blocking queue, so disconnecting the terminal cannot freeze the
+UI. Commands require physical USB access and provide no separate authentication.
 
 The ESP32-S3 USB-OTG and USB-Serial-JTAG controllers share one PHY. Consequently,
-the debug console disappears while **USB DISK** is active and re-enumerates only
-after the firmware exits that screen. To avoid stranding a remote-only session,
-`ratctl KEY enter` is rejected when USB DISK is selected in the main menu. Testing
-MSC still requires physical input because the command transport cannot coexist
-with it on this hardware.
-
-Select a port explicitly when more than one CDC device is attached:
-
-```bash
-ratctl --port /dev/ttyACM0 STATUS
-```
+the console disappears while **USB DISK** is active and re-enumerates only after the
+firmware exits that screen. To avoid stranding a console-only session, `key enter`
+is rejected when USB DISK is selected; MSC testing still requires physical input.
 
 ### Dev-loop flash (with UART monitor)
 
@@ -357,8 +364,9 @@ variant from mipidsi 0.7 for the same panel).
 ## Hardware test checklist
 
 1. Format an SD card as FAT32, insert it, then run `flash`.
-2. Run `ratctl STATUS`, then use `ratctl KEY enter` / `ratctl KEY back` and confirm
-   that the reported view changes without physical keyboard input.
+2. Open a serial terminal on the CDC port (for example PuTTY on Windows or
+   `picocom` on Linux), run `status`, then use `key enter` / `key back` and
+   confirm that the reported view changes without physical keyboard input.
 3. Confirm the splash, main menu, rat animation, and full keyboard navigation.
 4. Open **WI-FI → SCAN NETWORKS** and confirm visible SSIDs and RSSI values appear.
 5. Select a WPA/WPA2 network, type its password, and press Enter.

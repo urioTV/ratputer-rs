@@ -41,7 +41,7 @@ ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 src/sdblock.rs     seekable first-partition adapter: MBR translate + sector RMW
 build.rs           compiles Slint resources
 xtask/             host helper: builds release, creates and verifies merged binary
-tools/ratctl.py    stdlib-only host CLI for the USB debug command protocol
+tools/              maintenance scripts (for example the hadris-fat updater)
 flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 ```
 
@@ -161,9 +161,13 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 
 - `src/debug.rs` owns `USB_DEVICE` and polls the built-in USB Serial/JTAG CDC RX
   endpoint from the main loop. It shares the endpoint with `esp-println` logs.
-- Host requests are `RAT <id> <command>\n`; every response line starts with
-  `@RAT <id>`, allowing `tools/ratctl.py` to filter normal logs. Supported commands:
-  `PING`, `HELP`, `STATUS`, `KEY`, `TEXT`, `CLEAR`, and `REBOOT`.
+- The endpoint is a human-readable shell opened with any serial terminal (PuTTY,
+  picocom, screen). `espflash monitor` is unsuitable: its reset sequence can
+  strand the S3 in ROM download mode and its bootloader protocol bytes pollute
+  the console input. It accepts case-insensitive line commands:
+  `PING`, `HELP`,
+  `STATUS`, `KEY`, `TEXT`, `CLEAR`, and `REBOOT`; Enter may be CR, LF, or CRLF.
+  Console output starts with `[rat]` so it remains recognizable among firmware logs.
 - Responses use a fixed 4 KiB software queue and `write_byte_nb`/`flush_tx_nb`.
   Never replace this with blocking USB writes: a disconnected host must not freeze
   the UI or network loop.
@@ -173,8 +177,9 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - `KEY` invokes the same root Slint `key-pressed` callback as the keyboard;
   `backspace` has password-editor semantics. Input is rejected during splash and
   blocking radio work, matching physical input draining.
-- `ratctl` is a Nix devshell command wrapping the Python-standard-library host tool.
-  It defaults to the only `/dev/ttyACM*`; use `--port` when several are present.
+- Input editing echoes printable ASCII, handles Backspace and Ctrl+U (which also
+  recovers a line polluted by stray bytes from earlier sessions), and ignores
+  ANSI cursor-key sequences. Keep the parser allocation-free and bounded.
 - USB Serial/JTAG and USB-OTG MSC share the ESP32-S3 PHY. The debug port disappears
   while USB DISK is active and only returns after firmware-side detach. Debug
   `KEY enter` is deliberately rejected when USB DISK is selected, preventing an
@@ -263,6 +268,11 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   (`AppendCursor`/`ReadCursor`, see src/ftp.rs header and vendor/hadris-fat
   PATCHES.md) — without the cursors every 4 KiB chunk would re-walk the FAT
   chain, making large transfers quadratic.
+- The vendor is reproducible: `vendor/hadris-fat/UPSTREAM.toml` records the
+  upstream release, commit, and checksum, while `vendor-patches/hadris-fat/`
+  contains the three local changes. Update only with
+  `./tools/update-hadris-fat.sh <version>`; review patch conflicts instead of
+  bypassing them manually.
 - Socket timeouts: the control socket has NO transport timeout; dead clients
   are reaped by the session liveness timer (120 s without control OR data
   progress) and the 5-minute idle timeout. A transport timeout on the control

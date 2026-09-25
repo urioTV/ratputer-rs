@@ -40,10 +40,9 @@ nb = "1"                        # non-blocking ADC reads (esp-hal oneshot API)
 
 # SD-card credential storage and TOML serialization (all no_std + alloc)
 embedded-sdmmc = { version = "0.10", default-features = false, features = ["log"] }
-# FAT implementation with VFAT long-name read/write, vendored with a local
-# patch: directory iteration buffers a sliding 4 KiB window instead of the
-# whole cluster (32 KiB clusters on big cards OOM a 150 KiB heap). See
-# vendor/hadris-fat/PATCHES.md.
+# FAT implementation with VFAT long-name read/write, vendored with bounded
+# directory buffering and resumable read/write cursors for FTP. Upstream
+# provenance and the update procedure live in vendor/hadris-fat/PATCHES.md.
 hadris-fat = { path = "vendor/hadris-fat", default-features = false, features = [
     "read",
     "write",
