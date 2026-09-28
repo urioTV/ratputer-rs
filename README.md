@@ -3,8 +3,8 @@
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
 Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
 a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, SD-backed
-credentials, USB Mass Storage export, and a Wi-Fi FTP server for the SD card,
-everything in **Slint (no_std)**. 🐀
+credentials, USB Mass Storage export, a Wi-Fi FTP server, and an on-device SD
+file manager, everything in **Slint (no_std)**. 🐀
 
 ## Stack
 
@@ -20,6 +20,7 @@ everything in **Slint (no_std)**. 🐀
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
 | USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
+| File manager | On-device FAT browser (`src/filemanager.rs`), bounded directory pages and streamed file/directory copying |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
@@ -35,9 +36,10 @@ everything in **Slint (no_std)**. 🐀
   `--:--` until the first NTP sync), Wi-Fi signal bars + SSID (`CONNECTING`/`OFFLINE`),
   and the battery percentage with a gauge icon (red below 15 %);
 - The template defines **two top-level screens** driven by the `splash-done` property
-  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus ten
+  (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus fourteen
   mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
-  4=scan results, 5=password, 6=about, 7=USB disk, 8=FTP server, 9=FTP password) and a
+  4=scan results, 5=password, 6=about, 7=USB disk, 8=FTP server, 9=FTP password,
+  10–13=SD browser/actions/name/delete) and a
   **`key-pressed(string)`** callback:
   - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
     128×80 px; frames: bob / step / blink / tail-up) + header `RATPUTER · BOOTING`
@@ -54,6 +56,8 @@ everything in **Slint (no_std)**. 🐀
   - **FTP server** (`view-state == 8`) — shares the SD over Wi-Fi and reports its
     address, login, client/transfer state, byte counters and free heap; Tab opens
     the password editor (`view-state == 9`);
+  - **SD files** (`view-state == 10–13`) — browse, copy, move, rename, create and
+    delete files or empty directories; no text preview or editor;
   - **about view** (`view-state == 6`) — technical info;
 - The firmware (`src/main.rs`) polls the TCA8418 FIFO. Navigation keys are sent to
   Slint while printable characters are appended to the password in Rust. Wi-Fi
@@ -69,6 +73,34 @@ Cardputer ADV keymap, including Shift/Fn layers. In password entry, printable AS
 Space and Backspace edit the value; Enter connects; Escape (Fn+backtick) returns.
 Navigation uses the bare `,` / `;` / `.` / `/` keys for left/up/down/right (Fn+those
 keys yields the same arrows). Delete (Fn+Backspace) forgets the selected saved network.
+
+### On-device SD file manager
+
+Open **SD FILES** from the main menu. Up/Down select an entry, Enter enters a
+directory (or displays a file's size), Backspace goes to the parent/menu, and
+Left/Right switch between pages of 24 entries. Tab opens the action list:
+**COPY**, **MOVE**, **PASTE**, **RENAME**, **NEW FILE**, **NEW DIR**, **DELETE**.
+Copy or Move marks the selected entry; navigate to the destination directory and
+choose Paste. Copying files is streamed in 2 KiB FAT-committed steps (no whole-file
+buffer), including directory trees up to 12 levels deep. Move is a filesystem
+rename, not a bytewise copy. Existing destination names are **never overwritten**.
+Delete also has a direct Delete-key shortcut and always asks for confirmation;
+non-empty directories cannot be deleted. New filenames are ASCII and at most 80
+bytes (existing VFAT names are displayed and operated on without that input limit).
+
+A directory that cannot be read and cannot be deleted because its first slot is
+not a valid `.` entry (left behind by firmware before this fix, which aborted
+while creating a directory on cards with 32 KiB clusters) is repaired on Delete:
+its single cluster is re-zeroed and it is removed (`BROKEN DIR REPAIRED+DELETED`).
+Do not delete such a directory recursively on a PC or let `chkdsk` "recover" its
+contents: its stale bytes can look like entries pointing at live files.
+
+The UI has **no file-content preview or text editor**. Copy errors leave the
+source untouched, but may leave a **partial destination**; the screen reports
+this explicitly, so inspect the destination before retrying. Never remove the
+card during a copy. SD FILES is unavailable while USB DISK owns the card, and FTP
+is stopped outside its own screen. The console's `KEY`, `TEXT`, and `CLEAR` can
+also operate the filename input; `TEXT` never echoes the name in its response.
 
 ### Wi-Fi credentials on SD
 
@@ -93,9 +125,12 @@ password = "secret"
 auth = "wpa2"
 ```
 
-The file can hold up to 12 networks. The firmware never connects automatically:
-open **WI-FI → SAVED NETWORKS** and select one, or use **SCAN NETWORKS** to add a
-network after a successful connection. Only scan-visible SSIDs are supported.
+The file can hold up to 12 networks. After the splash screen, the firmware tries
+saved networks from newest to oldest, then waits 60 seconds before another pass.
+If the link drops, it retries after 5 seconds. It does not interrupt Wi-Fi editors,
+USB DISK, or FTP, and it does not rewrite the card on an automatic reconnect.
+You can still select a saved network manually or use **SCAN NETWORKS** to add one
+after a successful connection. Only scan-visible SSIDs are supported.
 Passwords are plain text on the removable card; TOML is a portable configuration
 format, not encrypted storage. The current radio API supports open, WEP, WPA, WPA2,
 and WPA/WPA2 networks; unsupported scan results are marked `!`.
@@ -127,8 +162,8 @@ and the SCSI commands used by Windows, Linux and macOS. There is no executor: th
 USB future is polled from the main loop with a waker that the USB interrupt sets,
 in bursts of up to 40 ms.
 
-Sector I/O goes through a small **read cache** (16 KiB of static SRAM, outside the
-heap): three LRU lines of 8 blocks for filesystem metadata that hosts read over and
+Sector I/O goes through a small **read cache** (~12 KiB of static SRAM, outside the
+heap): two LRU lines of 8 blocks for filesystem metadata that hosts read over and
 over while mounting (boot sector, FAT, directories), plus one stream line for large
 sequential transfers so file data does not evict them. A miss reads a whole 4 KiB
 line with one SD multi-block command (CMD18). Writes are collected into 4 KiB
@@ -223,6 +258,11 @@ so the firmware uses a 50–250 ms dwell and merges **two scan passes** (status:
   line** (240 Rgb565 ≈ 480 B) and pushes it via `LineBufferProvider` →
   `mipidsi::Display::set_pixels(...)`;
 - Fonts and images are packaged into flash by `build.rs` (embed resources);
+- `STATUS` reports sampled `heap_free_min` since the main loop began. For an
+  allocator-tracked peak estimate (including short-lived allocations), build with
+  `RATPUTER_FEATURES=heap-profiling build` and read `heap_peak_used` from `STATUS`.
+  Profiling updates counters at every allocation; use the normal build for speed.
+  Exercise Wi-Fi, FTP transfers, and USB MSC before lowering the 150 KiB heap;
 - Previous version: 4 ASCII-art frames (by Gio) — in git history.
 
 ## Development environment
@@ -257,11 +297,16 @@ To build and immediately flash the connected device with verification:
 flash
 ```
 
-For manual flashing of an existing image (espflash verifies writes by default):
+On WSL, `flash` finds the ESP32-S3 USB Serial/JTAG Windows COM port, uses Windows
+`espflash.exe` to flash the WSL image, requests a watchdog reset and confirms
+firmware boot by sending `PING` over COM. If that fails, it retries one explicit
+reset and reports an error rather than silently leaving the board in ROM mode.
+Set `ESPFLASH_PORT=COM5` to select a port explicitly. With USB passthrough to WSL,
+set `RATPUTER_FLASH_TRANSPORT=linux` to use Linux `espflash` instead. On native
+Linux, `flash` uses `espflash` directly and asks you to check the screen.
 
-```bash
-espflash write-bin 0x0 ratputer-adv.bin
-```
+To flash a pre-built image without rebuilding, run `bash tools/flash.sh
+ratputer-adv.bin`. Both transports verify writes and use a watchdog reset.
 
 ### USB command console
 
@@ -294,10 +339,10 @@ rat> reboot
 ```
 
 `STATUS` reports the current view and selection indices, Wi-Fi/radio/network state,
-IPv4 address, mounted-storage/USB/FTP state, clock, battery, free heap, and saved or
+IPv4 address, mounted-storage/USB/FTP state, clock, battery, free/minimum heap, and saved or
 scanned SSIDs. It deliberately never returns Wi-Fi or FTP passwords. `KEY` accepts
 `up`, `down`, `left`, `right`, `enter`, `back`, `backspace`, `delete`, `tab`, and
-`space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor is
+`space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor or the SD filename input is
 open; `CLEAR` clears that active editor. Type `help` to list the commands.
 
 The shell accepts CR, LF, and CRLF line endings, echoes printable input, supports
@@ -313,15 +358,11 @@ the console disappears while **USB DISK** is active and re-enumerates only after
 firmware exits that screen. To avoid stranding a console-only session, `key enter`
 is rejected when USB DISK is selected; MSC testing still requires physical input.
 
-### Dev-loop flash (with UART monitor)
+### Dev-loop flash
 
-```bash
-nix develop
-cargo run --release     # flash + UART monitor (espflash monitor)
-```
-
-espflash auto-detects the device over USB-C.
-Download mode (if the port doesn't appear): hold G0 while connecting USB.
+Run `flash` in the Nix shell. Avoid `cargo run --release --monitor` on the USB
+Serial/JTAG port: the monitor's reset sequence can leave this board in ROM
+mode. Download mode (if the port doesn't appear): hold G0 while connecting USB.
 
 ## LCD pins (Cardputer ADV, per the M5Stack ST7789V2 pin map)
 
@@ -371,7 +412,8 @@ variant from mipidsi 0.7 for the same panel).
 4. Open **WI-FI → SCAN NETWORKS** and confirm visible SSIDs and RSSI values appear.
 5. Select a WPA/WPA2 network, type its password, and press Enter.
 6. Confirm `CONNECTED: <SSID>` and `/RATPUTER/WIFI.CFG` on the SD card.
-7. Reboot, open **SAVED NETWORKS**, and connect without re-entering the password.
+7. Reboot and confirm automatic association with the most recently saved network;
+   **SAVED NETWORKS** should still allow manual selection without a password.
 8. Press Fn+Backspace on the saved entry and confirm it is removed from the TOML.
 9. Test an incorrect password, an open network, no SD card, and an empty scan.
 10. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and

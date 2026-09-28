@@ -12,8 +12,8 @@ the same pitfalls.
 ## Golden rules
 
 1. **Build & flash are the only verification you have.** There is no emulator. After any
-   UI change, run `nix develop -c build`, then have the user flash with
-   `espflash write-bin 0x0 ratputer-adv.bin` (writes are verified by default). The
+   UI change, run `nix develop -c build`, then use `nix develop -c flash` for the
+   connected Cardputer (writes are verified and WSL boot is checked over COM). The
    xtask verifies the merged image headers automatically: `0x0` = `e9`, `0x2` = `02`
    (DIO), `0x8000` = `aa 50`, `0x10000` = `e9`, `0x10002` = `02` (DIO).
 2. **Never raise SPI above 40 MHz.** See "LCD quirks" — 80 MHz visibly scrambles the
@@ -33,10 +33,11 @@ src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY 
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
 src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
+src/filemanager.rs on-device SD browser: paged listing, file operations, streamed copy jobs
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
-ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/FTP/about)
+ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/FTP/SD files/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 src/sdblock.rs     seekable first-partition adapter: MBR translate + sector RMW
 build.rs           compiles Slint resources
@@ -100,7 +101,10 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   rendering between the blocking steps and retried attempts. Keep this step-machine
   pattern for any new slow operation. While `radio_pending.is_some()`, keyboard input
   is drained and discarded — otherwise queued keys replay after the radio unblocks.
-  The same drain-and-ignore guard covers the splash screen.
+  The same drain-and-ignore guard covers the splash screen. After splash,
+  auto-connect tries saved networks newest-first, then backs off for 60 s;
+  after link loss it retries after 5 s. It runs only on menu/rat/about views,
+  never during password entry, USB DISK, or FTP, and must not rewrite WIFI.CFG.
 - Main-loop order matters: input → scheduled actions/step executor → USB poll/actions →
   network poll + top-bar refresh → animation ticker → **draw at the BOTTOM of the
   iteration**. This makes the `wifi-connecting` spinner
@@ -154,8 +158,11 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   volume is `hadris_fat::sync::FatVolume<SdBlockDevice>` (see `storage::mount`),
   which owns the card until `storage::free()` hands it to USB MSC. Files:
   `RATPUTER/WIFI.CFG`; writes commit with `FileWriter::finish()`.
-- Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. If you grow
-  the heap, re-verify on hardware; every `build`/`flash` is the only test we have.
+- Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. `STATUS`
+  reports sampled `heap_free_min`; use `RATPUTER_FEATURES=heap-profiling nix develop -c build`
+  to include the allocator's peak-usage estimate `heap_peak_used` (allocation overhead).
+  Flash and exercise Wi-Fi, FTP, and USB on hardware before shrinking the heap;
+  never infer safe headroom from an ELF build alone.
 
 ## USB debug console
 
@@ -169,11 +176,18 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   `STATUS`, `KEY`, `TEXT`, `CLEAR`, and `REBOOT`; Enter may be CR, LF, or CRLF.
   Console output starts with `[rat]` so it remains recognizable among firmware logs.
 - Responses use a fixed 4 KiB software queue and `write_byte_nb`/`flush_tx_nb`.
-  Never replace this with blocking USB writes: a disconnected host must not freeze
-  the UI or network loop.
+  Keep this capacity: STATUS can list 12 saved and 8 scanned networks and may
+  overflow a 2 KiB queue. Never replace this with blocking USB writes: a
+  disconnected host must not freeze the UI or network loop.
 - `STATUS` may expose local operational state and SSIDs, but must never emit Wi-Fi
   or FTP passwords. `TEXT` accepts credentials from a physically attached host but
   does not echo them in its response.
+- Hardware test scripts must keep the RAW serial stream and abort on
+  `RATPUTER (Slint) start`, `panicked`, or a decreasing `uptime_ms`. Filtering
+  to `[rat]` lines once hid an OOM panic + reboot and a test was misreported as
+  passing. Wait out `ERROR input_busy` (post-boot auto-connect) before judging.
+- `REBOOT` resets after the reply drained OR 500 ms: a host that closes the
+  port can leave the final flush pending forever.
 - `KEY` invokes the same root Slint `key-pressed` callback as the keyboard;
   `backspace` has password-editor semantics. Input is rejected during splash and
   blocking radio work, matching physical input draining.
@@ -207,8 +221,8 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   would time out and Explorer would hang.
 - **Never call `BlockDevice::num_blocks()` per SCSI command**: embedded-sdmmc re-reads
   the CSD over SPI every time. The capacity is cached in `SharedState` at attach.
-- Read cache (`BlockCache` in `src/msc.rs`): 3 LRU lines + 1 stream line, 8 blocks
-  each, one `static` (16 KiB .bss, not heap; it shrinks `.stack` from ~114 to ~98 KiB).
+- Read cache (`BlockCache` in `src/msc.rs`): 2 LRU lines + 1 stream line, 8 blocks
+  each, one `static` (~12 KiB .bss, not heap).
   Misses read an aligned line via CMD18; READ(10) larger than one line uses the
   stream line only. Writes are chunked into the stream line and written with CMD25
   before the CSW, then patched into any cached LRU copy. The cache is invalidated on
@@ -270,7 +284,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   chain, making large transfers quadratic.
 - The vendor is reproducible: `vendor/hadris-fat/UPSTREAM.toml` records the
   upstream release, commit, and checksum, while `vendor-patches/hadris-fat/`
-  contains the three local changes. Update only with
+  contains the four local changes. Update only with
   `./tools/update-hadris-fat.sh <version>`; review patch conflicts instead of
   bypassing them manually.
 - Socket timeouts: the control socket has NO transport timeout; dead clients
@@ -286,12 +300,60 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   transfers, main burst-polls `Network::poll_stack()` + `FtpServer::poll()` for
   up to 15 ms, then returns to input/rendering. Do not consume `Network::poll()`
   inside the burst or an SNTP completion result will be lost.
-- `Network` uses `StackResources<8>` for DHCP/DNS/SNTP plus two persistent FTP
-  sockets. FTP allocates 1 KiB RX/TX control + 4 KiB RX/TX data buffers once and
-  refuses first creation when heap free is below 32 KiB. UI refresh is 2 Hz.
+- `Network` uses `StackResources<10>` for DHCP/DNS/SNTP plus five persistent
+  FTP sockets (four control listeners, one data). `FtpServer` is created eagerly
+  right after `Network::new`, BEFORE any UI screen consumes heap: first renders
+  permanently allocate ~20 KiB. Lazy creation with a 32 KiB free threshold
+  made FTP unreachable after browsing. The control listeners have 512 B RX/TX
+  each; the data socket has 2 KiB RX/TX. Increasing the listener count without
+  increasing `StackResources` panics at boot (`adding a socket to a full
+  SocketSet`, black screen). Six control sockets with larger buffers left just
+  ~9 KiB minimum heap during browsing; four yielded 40/40 successful rapid
+  reconnects (both zero- and 20-ms pacing) with ~21 KiB minimum on FTP. Keep
+  `FtpServer::busy()` false after `stop()` or the main loop idles at 1 ms forever.
+  Do not reintroduce lazy creation or a free-heap threshold. UI refresh is 2 Hz.
+- LIST/NLST/MLSD with a directory argument list that directory's contents (RFC
+  959); a file argument still filters the parent listing by that name.
 - FAT timestamps use `storage::FatClock`, backed by the SNTP-derived local time;
   before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
   the 226 reply. Do not add write-back caching.
+
+## On-device SD file manager
+
+- `src/filemanager.rs` drives views 10–13 (browser/actions/name/delete). Main-loop
+  input bypasses Slint's navigation callback on those views. The browser shows
+  24 entries per page; Left/Right change pages, Tab opens COPY/MOVE/PASTE/RENAME/
+  NEW FILE/NEW DIR/DELETE, and Delete prompts before removing a selected entry.
+  The FAT layer rejects deletion of non-empty directories. Filename input is
+  ASCII-only and capped at 80 bytes; existing VFAT names are not truncated for
+  filesystem operations, only for display.
+- COPY processes one 2 KiB chunk or one directory entry per loop iteration using
+  `ReadCursor`/`AppendCursor` across steps. FAT handles never survive a loop
+  iteration; file writes call `finish()` before the next step. The progress
+  text updates only every 16 KiB; rows are at most 28 chars and truncate the
+  name with `~` so the complete `1234B`-style size suffix stays visible. A 15-ms
+  multi-step copy burst was tried but the device stopped responding during a
+  208 KB copy test before a destination file appeared; the exact cause is NOT
+  confirmed. It was reverted to one step per loop. Do not restore a burst
+  without a captured raw serial trace and another controlled hardware test.
+  Directory copy
+  has a depth cap of 12 and refuses a destination inside its own source tree.
+  Destinations are never overwritten. A failed copy may leave a partial target
+  but does not delete or alter the source; the UI warns about partial results.
+  MOVE uses FAT `rename()` and refuses moving a directory into itself.
+- Slint receives only the 6 rows that fit the viewport, through ONE persistent
+  `VecModel` updated in place. A full 24-row model, rebuilt on every key, left
+  the heap so fragmented that the renderer's scene `Vec` failed a 4 KiB
+  allocation (panic). Keep rows windowed and never recreate the model per key.
+- Deleting a directory that fails for any reason tries
+  `repair_uninitialized_dir` (vendor patch 0004): it acts only on a single-
+  cluster directory without a valid `.` slot — the remnant of the old
+  `create_dir` OOM — and never frees chains its stale bytes point at. Do not
+  replace it with recursive deletion: stale entries may alias live files.
+- The file manager is dropped when leaving its screen; it never owns the SD
+  card or keeps open FAT handles. USB MSC transfers ownership only from the
+  menu, FTP runs only on its screen. Do not start either while a copy is active.
+  No file-content preview or editor is included.
 
 ## Network, clock, battery (top bar)
 
@@ -334,11 +396,16 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   load only the first bootloader segment and then reset with `ets_loader.c 78` /
   `TG0WDT_SYS_RST`, before either the second-stage bootloader or application starts.
 - Flash frequency remains 80 MHz; this is independent of the LCD's 40 MHz SPI limit.
+- In WSL use Windows `espflash.exe` on the unique VID_303A:PID_1001 COM port with
+  a `wslpath -w` image path. `tools/flash.sh` does this and verifies boot via
+  `tools/verify-boot.ps1`; `ESPFLASH_PORT=COMn` overrides detection.
+  `--after watchdog-reset` works on this board, unlike the earlier default
+  DTR hard-reset that left it in ROM mode after flashing.
 
 ```sh
 nix develop
 build # → ratputer-adv.bin
-flash # rebuild, flash from 0x0, and verify
+flash # rebuild, flash from 0x0, watchdog-reset, verify firmware PING on WSL
 ```
 
 Boot mode (when the port is stubborn): hold G0 while plugging USB-C.
