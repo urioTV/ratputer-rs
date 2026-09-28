@@ -1480,8 +1480,8 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
                     let zero_result = {
                         let mut data = self.data.lock();
                         data.seek(SeekFrom::Start(new_cluster_pos as u64)).await?;
-                        let zeros = alloc::vec![0u8; cluster_size];
-                        data.write_all(&zeros).await
+                        // RATPUTER PATCH: bounded stack buffer, see write_zeros.
+                        Self::write_zeros(&mut *data, cluster_size).await
                     };
                     if let Err(error) = zero_result {
                         let _ = self.free_chain_routed(new_cluster).await;
@@ -1718,12 +1718,24 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
         // above (name generation, LFN build, slot search) have succeeded, so a
         // late failure cannot leak a cluster or skew the free count (#B1).
         let new_cluster = self.allocate_cluster_routed(2).await?;
+        let now = self.time_provider().now();
+        let (date, time, time_tenth) = now.to_raw();
+
+        // RATPUTER PATCH: initialize the new directory cluster BEFORE linking
+        // it into the parent. Upstream wrote the parent entry first, so any
+        // failure while zeroing left a directory pointing at stale cluster
+        // contents (garbage entries: "not empty", unreadable listing).
+        if let Err(error) = self
+            .init_directory_cluster(new_cluster, parent.cluster.0 as u32, now)
+            .await
+        {
+            let _ = self.free_chain_routed(new_cluster).await;
+            return Err(error);
+        }
         self.decrement_free_count();
         self.update_next_free_hint(new_cluster);
 
         // Create the directory entry in parent
-        let now = self.time_provider().now();
-        let (date, time, time_tenth) = now.to_raw();
 
         // For FAT12/16, only use the low 16 bits of the cluster number
         let (cluster_high, cluster_low) = match &self.fat {
@@ -1766,7 +1778,48 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
         let (slot_cluster, slot_offset) = (short_position.cluster, short_position.offset);
         self.write_raw_entry(slot_cluster, slot_offset, &entry, parent.fixed_root).await?;
 
-        // Initialize the new directory with . and .. entries
+        // Flush FSInfo so on-disk free_count matches in-memory state (FAT32).
+        self.write_fsinfo().await?;
+
+        Ok(FatDir {
+            data: self,
+            cluster: Cluster(new_cluster as usize),
+            fixed_root: None, // Newly created directories are never fixed root
+            dir_entry: Some(DirSlot {
+                parent_clus: slot_cluster,
+                offset_within_cluster: slot_offset,
+                short_name,
+                created: now,
+            }),
+        })
+    }
+
+    /// RATPUTER PATCH: zero `len` bytes at the current position through a
+    /// small stack buffer. Upstream allocated a whole cluster (32 KiB on large
+    /// FAT32 cards) on the heap, which aborts small-heap devices mid-update.
+    async fn write_zeros(data: &mut impl Write, mut len: usize) -> Result<()> {
+        const ZERO_CHUNK: usize = 2048;
+        let zeros = [0u8; ZERO_CHUNK];
+        while len > 0 {
+            let count = len.min(ZERO_CHUNK);
+            data.write_all(&zeros[..count]).await?;
+            len -= count;
+        }
+        Ok(())
+    }
+
+    /// Zero a freshly allocated directory cluster and write its `.`/`..`.
+    async fn init_directory_cluster(
+        &self,
+        new_cluster: u32,
+        parent_cluster: u32,
+        now: crate::time::FatDateTime,
+    ) -> Result<()> {
+        let (date, time, time_tenth) = now.to_raw();
+        let (cluster_high, cluster_low) = match &self.fat {
+            Fat::Fat12(_) | Fat::Fat16(_) => (0u16, new_cluster as u16),
+            Fat::Fat32(_) => ((new_cluster >> 16) as u16, new_cluster as u16),
+        };
         {
             let mut data = self.data.lock();
             let cluster_size = data.cluster_size;
@@ -1775,8 +1828,7 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
 
             // Zero out the cluster first
             data.seek(SeekFrom::Start(dir_pos as u64)).await?;
-            let zeros = alloc::vec![0u8; cluster_size];
-            data.write_all(&zeros).await?;
+            Self::write_zeros(&mut *data, cluster_size).await?;
 
             // Write "." entry (points to self)
             let dot_entry = RawFileEntry {
@@ -1805,7 +1857,6 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
             // FAT32 spec: when the parent is the FAT32 root, ".." must store
             // cluster 0 even though the root has a real cluster — fsck.fat
             // rejects images that use the actual root cluster here.
-            let parent_cluster = parent.cluster.0 as u32;
             let dotdot_cluster = if self.is_fat32_root_cluster(parent_cluster) {
                 0
             } else {
@@ -1838,21 +1889,58 @@ impl<DATA: Read + Write + Seek> FatVolume<DATA> {
             data.seek(SeekFrom::Start(dotdot_pos as u64)).await?;
             data.write_all(bytemuck::bytes_of(&dotdot_entry)).await?;
         }
+        Ok(())
+    }
 
-        // Flush FSInfo so on-disk free_count matches in-memory state (FAT32).
-        self.write_fsinfo().await?;
+    /// RATPUTER PATCH: repair a directory left behind by an interrupted
+    /// upstream `create_dir` (parent entry written, cluster never zeroed).
+    ///
+    /// Acts only when BOTH hold, otherwise returns `DirectoryNotEmpty`
+    /// without writing anything:
+    /// - the first slot is not a valid `.` entry pointing at the directory
+    ///   itself (every properly created directory has one), and
+    /// - the directory owns exactly one cluster (what `create_dir` allocates).
+    ///
+    /// The cluster is re-zeroed and `.`/`..` rewritten. Stale bytes that looked
+    /// like entries are discarded WITHOUT freeing the clusters they appear to
+    /// reference, since those may belong to live files. Afterwards the
+    /// directory is empty and `delete` removes it normally.
+    pub async fn repair_uninitialized_dir(&self, entry: &FileEntry) -> Result<()> {
+        self.revalidate_entry(entry).await?;
+        if !entry.is_directory() {
+            return Err(Error::NotADirectory);
+        }
+        let cluster = entry.cluster().0;
+        if cluster < 2 {
+            return Err(Error::DirectoryNotEmpty);
+        }
 
-        Ok(FatDir {
-            data: self,
-            cluster: Cluster(new_cluster as usize),
-            fixed_root: None, // Newly created directories are never fixed root
-            dir_entry: Some(DirSlot {
-                parent_clus: slot_cluster,
-                offset_within_cluster: slot_offset,
-                short_name,
-                created: now,
-            }),
-        })
+        let mut first = [0u8; 32];
+        {
+            let mut data = self.data.lock();
+            let cluster_size = data.cluster_size;
+            let dir_pos = Cluster(cluster).to_bytes(self.info.data_start, cluster_size);
+            data.seek(SeekFrom::Start(dir_pos as u64)).await?;
+            data.read_exact(&mut first).await?;
+        }
+        let own_cluster = (u32::from(u16::from_le_bytes([first[20], first[21]])) << 16)
+            | u32::from(u16::from_le_bytes([first[26], first[27]]));
+        let own_cluster = match &self.fat {
+            Fat::Fat12(_) | Fat::Fat16(_) => own_cluster & 0xFFFF,
+            Fat::Fat32(_) => own_cluster,
+        };
+        let valid_dot = &first[..11] == b".          "
+            && first[11] & DirEntryAttrFlags::DIRECTORY.bits() != 0
+            && own_cluster == cluster as u32;
+        if valid_dot {
+            return Err(Error::DirectoryNotEmpty);
+        }
+        if self.next_cluster_routed(cluster).await?.is_some() {
+            return Err(Error::DirectoryNotEmpty);
+        }
+
+        self.init_directory_cluster(cluster as u32, entry.parent_dir_clus.0 as u32, entry.created)
+            .await
     }
 
     /// Delete a file or empty directory.

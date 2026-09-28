@@ -33,6 +33,18 @@ changes below, each marked `RATPUTER PATCH`.
    current cluster and offset, revalidating identity, first cluster, committed
    size, position, and cluster-offset bounds on each reuse.
 
+4. Cluster zeroing (new directory cluster in `create_dir`, directory
+   extension in `find_free_entry_run_in_dir`) writes through a 2 KiB stack
+   buffer. Upstream allocated a whole cluster on the heap — 32 KiB on large
+   FAT32 cards — which aborted the firmware mid-`create_dir`. Because upstream
+   wrote the parent entry BEFORE zeroing, that abort left a directory pointing
+   at stale cluster bytes (unreadable listing, "not empty", fsck: no `.`).
+   `create_dir` now initializes the cluster first and frees it on failure.
+   `repair_uninitialized_dir` repairs such remnants: only when the first slot
+   is not a valid `.` and the directory owns exactly one cluster, it re-zeroes
+   that cluster and rewrites `.`/`..` without freeing chains referenced by the
+   stale bytes (they may belong to live files); `delete` then works normally.
+
 ## Updating
 
 From the repository root, run the updater with the desired crates.io version:
@@ -42,7 +54,7 @@ From the repository root, run the updater with the desired crates.io version:
 ```
 
 The script downloads the official crate, verifies its crates.io SHA-256,
-removes upstream tests/examples, applies the three patches in order, records
+removes upstream tests/examples, applies the four patches in order, records
 its release commit in `UPSTREAM.toml`, then runs the release check and complete
 firmware build. It replaces the existing vendor only after download and patch
 validation and restores the previous tree if compilation fails.
