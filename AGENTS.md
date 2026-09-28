@@ -32,6 +32,7 @@ src/storage.rs     hadris-fat volume + toml/serde: /RATPUTER/WIFI.CFG (max 12) +
 src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY switching
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
 src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
+src/watchdog.rs    RTC watchdog: one feed per main-loop pass, reset instead of a battery pull
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
 src/filemanager.rs on-device SD browser: paged listing, file operations, streamed copy jobs
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
@@ -232,6 +233,52 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   `KEY enter` is deliberately rejected when USB DISK is selected, preventing an
   unattended session from losing its only control channel; MSC testing still
   requires physical input.
+
+## Reset watchdog (RTC RWDT)
+
+- `src/watchdog.rs` arms the RTC watchdog with stage 0 = reset the system and no
+  interrupt (an interrupt would need a handler plus a critical section to log
+  before dying; the reset cause is read at boot instead). `Watchdog::feed`
+  runs once per main-loop iteration, so a reset means "an iteration never
+  finished", not "the UI was slow".
+- Windows: 15 s ordinary, 25 s while a manual radio step runs (`slow_window()`,
+  RAII guard). The grace period **must stay above one step**: a scan pass is
+  capped at 8 s, an association attempt at 12 s plus a 3 s disconnect. Lowering
+  the ordinary window below ~15 s would reset legitimate slow connects.
+- `program()` always writes the hold register **and** feeds. Writing only hold
+  leaves the counter running, so restoring the short window after a long step
+  would expire immediately and reset the device for no reason.
+- Nothing else takes `peripherals.RTC_TIMER` in this tree (esp-rtos gets TIMG0,
+  esp-radio touches RTC_CNTL only for radio clocks, never the WDT). `Rtc::new`
+  writes no registers, so holding it costs nothing.
+- Panics now self-recover as well: `esp-backtrace` prints and then spins, and the
+  watchdog resets it. Do not lengthen the window to "read panics at leisure" —
+  the backtrace prints in milliseconds.
+- Diagnostics: `reset_reason(Cpu::ProCpu)` at boot is mapped to an ASCII token
+  (`power_on`, `software`, `watchdog`, `timer_watchdog`, `brownout`, ...) and
+  shown by `STATUS`/`WDT`; `loop_max_ms` is the longest iteration since boot, so
+  a slow-but-alive loop is distinguishable from a dead one. `WDT OFF` exists for
+  host-attached debugging only — never disarm at boot, and never treat a reset
+  as a fix for the hang it caught.
+- `last_reset` is usually `usb_uart`, NOT the real cause: the USB Serial/JTAG
+  port re-enumerates after any reset, and the host reopening it resets the chip
+  again (seen even with an 8 s delay before reopening). The real cause is in
+  the retained history: `previous_reset` and `wdt_resets` live in
+  `#[ram(unstable(rtc_fast, persistent))]` statics guarded by a magic word;
+  esp-hal zeroes that section only on `ChipPowerOn`. Test scripts must judge a
+  watchdog reset by `wdt_resets` incrementing, never by `last_reset`.
+- `WDT` also prints the raw stage-0 hold value and the slow-clock calibration
+  (`STORE1`) now and before the last reset. This is how a scan-time reset was
+  shown to have happened under the ordinary 15 s window, i.e. outside a radio
+  step: it was an OOM panic spinning in esp-backtrace, not a watchdog bug.
+- `program()` must NOT touch `last_feed_ms`: a window change is a hardware
+  feed, not a loop pass. Resetting it there hid every slow radio step from
+  `loop_max_ms` (a 20 s stall showed 602 ms).
+- Self-tests: `WDT FREEZE` spins forever (expect a reset after ~15 s and
+  `wdt_resets` +1); `WDT STALL` blocks one iteration 20 s inside `slow_window()`
+  (must survive, `loop_max_ms` ~= 20000, window back to 15 s). Both are refused
+  while USB MSC owns the card. The log line printed right before the freeze may
+  be lost with the USB FIFO; do not treat its absence as a failure.
 
 ## USB Mass Storage (pure Rust)
 

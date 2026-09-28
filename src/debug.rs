@@ -46,9 +46,22 @@ pub enum DebugCommand {
     Status,
     Key { key: DebugKey },
     Text { text: DebugText },
+    Wdt { action: DebugWdt },
     Clear,
     Reboot,
     Invalid { reason: &'static str },
+}
+
+/// What `WDT` asked for: report, re-arm, disarm, or self-test the watchdog.
+#[derive(Clone, Copy)]
+pub enum DebugWdt {
+    Status,
+    On,
+    Off,
+    /// Deliberately wedge the main loop to prove the reset actually fires.
+    Freeze,
+    /// Block the loop for 20 s inside the slow window: must NOT reset.
+    Stall,
 }
 
 pub struct DebugConsole {
@@ -303,6 +316,20 @@ fn parse_command(line: &[u8]) -> Option<DebugCommand> {
                 len: argument.len(),
             },
         })
+    } else if name.eq_ignore_ascii_case("WDT") {
+        let action = match argument.map(str::trim) {
+            None => DebugWdt::Status,
+            Some(value) if value.eq_ignore_ascii_case("on") => DebugWdt::On,
+            Some(value) if value.eq_ignore_ascii_case("off") => DebugWdt::Off,
+            Some(value) if value.eq_ignore_ascii_case("freeze") => DebugWdt::Freeze,
+            Some(value) if value.eq_ignore_ascii_case("stall") => DebugWdt::Stall,
+            _ => {
+                return Some(DebugCommand::Invalid {
+                    reason: "wdt_must_be_on_off_freeze_or_stall",
+                });
+            }
+        };
+        Some(DebugCommand::Wdt { action })
     } else {
         Some(DebugCommand::Invalid {
             reason: "unknown_command",

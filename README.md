@@ -21,6 +21,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 | USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
 | File manager | On-device FAT browser (`src/filemanager.rs`), bounded directory pages and streamed file/directory copying |
+| Reset watchdog | RTC watchdog (`src/watchdog.rs`) resets the chip when the main loop stops completing passes |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
@@ -342,6 +343,7 @@ are entered directly — no separate host utility is required:
 rat> ping
 [rat] OK PONG protocol=1
 rat> status
+rat> wdt off
 rat> key down
 rat> key enter
 rat> text password with spaces
@@ -354,7 +356,9 @@ IPv4 address, mounted-storage/USB/FTP state, clock, battery, free/minimum heap, 
 scanned SSIDs. It deliberately never returns Wi-Fi or FTP passwords. `KEY` accepts
 `up`, `down`, `left`, `right`, `enter`, `back`, `backspace`, `delete`, `tab`, and
 `space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor or the SD filename input is
-open; `CLEAR` clears that active editor. Type `help` to list the commands.
+open; `CLEAR` clears that active editor. `WDT` reports the reset watchdog (armed
+state, window, longest loop iteration since boot, cause of the last reset), while
+`WDT ON` and `WDT OFF` re-arm or disarm it. Type `help` to list the commands.
 
 The shell accepts CR, LF, and CRLF line endings, echoes printable input, supports
 Backspace and Ctrl+U, and ignores terminal cursor-key escape sequences. Press
@@ -368,6 +372,35 @@ The ESP32-S3 USB-OTG and USB-Serial-JTAG controllers share one PHY. Consequently
 the console disappears while **USB DISK** is active and re-enumerates only after the
 firmware exits that screen. To avoid stranding a console-only session, `key enter`
 is rejected when USB DISK is selected; MSC testing still requires physical input.
+
+### Reset watchdog
+
+The firmware is a single loop with no executor, so one call that never returns
+freezes the screen, the keyboard and the USB console together — previously the
+only way out was pulling the battery. The RTC watchdog in `src/watchdog.rs` is
+fed exactly once per main-loop iteration and resets the chip when an iteration
+does not finish within 15 seconds. Operations that are supposed to take seconds
+(one manual scan pass, one association attempt) widen the window to 25 seconds
+for their duration, so a slow access point is not mistaken for a hang.
+
+`WDT` reports the armed state, the current window, the longest loop iteration
+since boot (`loop_max_ms`), the cause of the reset that started this boot, and a
+small reset history. The history matters because of the USB port: after any
+reset the Serial/JTAG port re-enumerates, and a terminal that reopens it resets
+the chip once more, so this boot usually reports `last_reset=usb_uart`. The
+cause of the boot *before* it (`previous_reset=watchdog`) and a counter of
+watchdog resets since power-on (`wdt_resets`) are kept in RTC fast memory,
+which esp-hal clears only on power-on. After a hang, look at those two fields.
+
+Self-tests, from a physically attached host only:
+
+```text
+rat> wdt freeze   # wedge the loop: expect a reset after ~15 s, wdt_resets +1
+rat> wdt stall    # block 20 s inside the 25 s window: must NOT reset
+rat> wdt off      # disarm while debugging a hang; `wdt on` re-arms
+```
+
+Both self-tests are refused while USB DISK owns the SD card.
 
 ### Dev-loop flash
 

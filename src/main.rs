@@ -44,6 +44,7 @@ mod net;
 mod sdblock;
 mod storage;
 mod usbdisk;
+mod watchdog;
 mod wifi;
 
 use cardputer_adv_keyboard::{Arrow, KeyInput, Keyboard};
@@ -83,6 +84,8 @@ const SPLASH_AFTER_MS: u64 = 3500;
 const BATTERY_EVERY_MS: u64 = 5000;
 const SNTP_RESYNC_SECS: u64 = 3600;
 const SNTP_RETRY_SECS: u64 = 30;
+/// `WDT STALL`: longer than the ordinary window, shorter than the slow one.
+const WDT_STALL_SECS: u64 = 20;
 const AUTO_CONNECT_AFTER_SPLASH_MS: u64 = 500;
 const AUTO_NEXT_NETWORK_SECS: u64 = 5;
 const AUTO_RETRY_CYCLE_SECS: u64 = 60;
@@ -556,6 +559,25 @@ fn main() -> ! {
     set_ftp_login_text(&ui, &wifi_config);
     ui.set_ftp_status("STOPPED".into());
 
+    // --- RTC watchdog: reset instead of waiting for a battery pull ---
+    // Arming happens here, after radios, SD and UI are up, so slow first-run
+    // initialisation is never mistaken for a hang.
+    let mut watchdog = watchdog::Watchdog::new(peripherals.RTC_TIMER);
+    log::info!(
+        "Reset cause: {} (boot before: {}, watchdog resets since power-on: {})",
+        watchdog.boot_cause(),
+        watchdog.previous_cause(),
+        watchdog.watchdog_resets()
+    );
+    let last = watchdog.previous_window();
+    log::info!(
+        "Watchdog window before that reset: {} s (hold={} cal={})",
+        last.window_s,
+        last.hold,
+        last.cal
+    );
+    watchdog.arm();
+
     // Single-line buffer (ReusedBuffer) — 240 px RGB565
     let mut line_buffer: [Rgb565Pixel; LCD_WIDTH] = [Rgb565Pixel(0); LCD_WIDTH];
 
@@ -590,6 +612,11 @@ fn main() -> ! {
     // Reboot once the acknowledgement left the FIFO, or after a deadline: a host
     // that closes the port can leave the final flush pending forever.
     let mut debug_reboot_at: Option<Instant> = None;
+    // Watchdog self-test: wedge the loop once the reply has left the FIFO.
+    let mut debug_freeze_at: Option<Instant> = None;
+    // Watchdog self-test: block one iteration for longer than the ordinary
+    // window but shorter than the slow window, like a slow radio step.
+    let mut debug_stall_at: Option<Instant> = None;
     // Sampled low-water mark, visible through STATUS even without profiling.
     // Transient allocations between samples need the heap-profiling feature.
     let mut heap_free_min = esp_alloc::HEAP.free();
@@ -597,6 +624,9 @@ fn main() -> ! {
         slint::platform::update_timers_and_animations();
 
         let now = Instant::now();
+        // One feed per iteration: the watchdog resets if this line stops
+        // running, whichever call is holding the loop.
+        watchdog.feed(now);
         heap_free_min = heap_free_min.min(esp_alloc::HEAP.free());
 
         // After SPLASH_AFTER_MS: switch to the main screen (Slint states, 600 ms crossfade)
@@ -621,6 +651,7 @@ fn main() -> ! {
                         "KEY up|down|left|right|enter|back|backspace|delete|tab|space"
                     ));
                     debug_console.data(format_args!("TEXT <printable ASCII>"));
+                    debug_console.data(format_args!("WDT [ON|OFF|FREEZE|STALL]"));
                     debug_console.data(format_args!("CLEAR"));
                     debug_console.data(format_args!("REBOOT"));
                     debug_console.end();
@@ -633,6 +664,16 @@ fn main() -> ! {
                         now.duration_since_epoch().as_millis(),
                         esp_alloc::HEAP.free(),
                         heap_free_min
+                    ));
+                    debug_console.data(format_args!(
+                        "watchdog armed={} window_s={} loop_max_ms={} last_reset={} \
+                         previous_reset={} wdt_resets={}",
+                        watchdog.is_armed(),
+                        watchdog.window_secs(),
+                        watchdog.slowest_iteration_ms(),
+                        watchdog.boot_cause(),
+                        watchdog.previous_cause(),
+                        watchdog.watchdog_resets(),
                     ));
                     #[cfg(feature = "heap-profiling")]
                     debug_console.data(format_args!(
@@ -809,6 +850,74 @@ fn main() -> ! {
                     debug_console.end();
                     debug_reboot_at = Some(Instant::now() + Duration::from_millis(500));
                 }
+                debug::DebugCommand::Wdt { action } => {
+                    match action {
+                        debug::DebugWdt::Status => {
+                            debug_console.ok(format_args!(
+                                "wdt={}",
+                                if watchdog.is_armed() {
+                                    "armed"
+                                } else {
+                                    "disarmed"
+                                }
+                            ));
+                            debug_console.data(format_args!(
+                                "window_s={} loop_max_ms={} last_reset={} previous_reset={} \
+                                 wdt_resets={}",
+                                watchdog.window_secs(),
+                                watchdog.slowest_iteration_ms(),
+                                watchdog.boot_cause(),
+                                watchdog.previous_cause(),
+                                watchdog.watchdog_resets(),
+                            ));
+                            let now_window = watchdog.current_window();
+                            let last = watchdog.previous_window();
+                            debug_console.data(format_args!(
+                                "now window_s={} hold={} cal={} | before_reset window_s={} \
+                                 hold={} cal={}",
+                                now_window.window_s,
+                                now_window.hold,
+                                now_window.cal,
+                                last.window_s,
+                                last.hold,
+                                last.cal,
+                            ));
+                        }
+                        debug::DebugWdt::On => {
+                            if !watchdog.is_armed() {
+                                watchdog.arm();
+                            }
+                            debug_console.ok(format_args!(
+                                "wdt=armed reset_after_s={}",
+                                watchdog.window_secs()
+                            ));
+                        }
+                        debug::DebugWdt::Off => {
+                            watchdog.disarm();
+                            debug_console.ok(format_args!("wdt=disarmed"));
+                        }
+                        debug::DebugWdt::Stall => {
+                            if usb_sd.is_some() {
+                                debug_console.error(format_args!("busy_usb_disk"));
+                            } else {
+                                debug_console
+                                    .ok(format_args!("wdt=stalling seconds={}", WDT_STALL_SECS));
+                                debug_stall_at = Some(Instant::now() + Duration::from_millis(300));
+                            }
+                        }
+                        debug::DebugWdt::Freeze => {
+                            // A core reset in the middle of MSC service would land
+                            // on the host's side of a write, so refuse it there.
+                            if usb_sd.is_some() {
+                                debug_console.error(format_args!("busy_usb_disk"));
+                            } else {
+                                debug_console.ok(format_args!("wdt=self_test_resetting"));
+                                debug_freeze_at = Some(Instant::now() + Duration::from_millis(300));
+                            }
+                        }
+                    }
+                    debug_console.end();
+                }
                 debug::DebugCommand::Invalid { reason } => {
                     debug_console.error(format_args!("{reason}"));
                     debug_console.end();
@@ -931,6 +1040,9 @@ fn main() -> ! {
         // Execute one radio step. Its status (spinner + progress) was rendered in
         // previous iterations; only the current step blocks below.
         if let Some(step) = radio_pending.take() {
+            // A scan pass or an association attempt is expected to block for
+            // seconds; widen the reset window so it does not look like a hang.
+            let _slow_radio_step = watchdog.slow_window();
             ui.set_wifi_status(busy_status(&step, frame_idx).into());
             radio_pending = match step {
                 RadioStep::Scan { pass } => {
@@ -1526,6 +1638,29 @@ fn main() -> ! {
         {
             delay.delay_millis(20);
             esp_hal::system::software_reset();
+        }
+
+        if debug_stall_at
+            .is_some_and(|deadline| debug_console.output_idle() || Instant::now() >= deadline)
+        {
+            debug_stall_at = None;
+            let _slow = watchdog.slow_window();
+            log::warn!("RTC watchdog self-test: stalling {WDT_STALL_SECS} s in the slow window");
+            let stall_start = Instant::now();
+            while stall_start.elapsed() < Duration::from_secs(WDT_STALL_SECS) {
+                core::hint::spin_loop();
+            }
+            log::info!("RTC watchdog self-test: stall finished without a reset");
+        }
+
+        // Never returns: the watchdog must reset the chip within its window.
+        if debug_freeze_at
+            .is_some_and(|deadline| debug_console.output_idle() || Instant::now() >= deadline)
+        {
+            log::warn!("RTC watchdog self-test: main loop frozen, expecting a reset");
+            loop {
+                core::hint::spin_loop();
+            }
         }
 
         delay.delay_millis(if ftp_busy { 1 } else { 10 });
