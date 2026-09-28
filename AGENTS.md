@@ -439,7 +439,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 
 - `WifiManager::new` returns `(manager, Interface)`; the station `Interface` implements
   `embassy-net-driver` 0.2 and is moved into `embassy_net::new` (see `src/net.rs`).
-  Versions must line up: `embassy-net` 0.8 ↔ driver 0.2 ↔ `embassy-time` 0.5 ↔
+  Versions must line up: `embassy-net` 0.9 ↔ driver 0.2 ↔ `embassy-time` 0.5 ↔
   esp-rtos 0.4 (`embassy-time-driver` 0.2).
 - **esp-rtos needs the `embassy` feature**: it registers the embassy-time driver that
   embassy-net's internal timers (DHCP, DNS, `with_timeout`) rely on. Without it, the

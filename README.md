@@ -14,7 +14,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 | Framework | `esp-hal` 1.2 (no_std, bare-metal, safe API) |
 | UI | **Slint 1.18** (`renderer-software`, `unsafe-single-threaded`, `libm`) |
 | Memory | `esp-alloc` 0.11 — 150 KB heap in **internal SRAM** (the ADV has no PSRAM!) |
-| Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.9 (ST7789) |
+| Display | Slint software renderer → `LineBufferProvider` per line → SPI, `mipidsi` 0.10 (ST7789) |
 | Wi-Fi | `esp-radio` + `esp-rtos`, station mode, scan and association |
 | Storage | `hadris-fat` (vendored) FAT volumes + TOML credentials; `embedded-sdmmc` is only the SD/BlockDevice driver on SPI3 |
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
@@ -25,7 +25,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
 | Fonts | **Press Start 2P** (OFL, pixel grid 8px) — `import "fonts/PressStart2P-Regular.ttf"` in .slint |
 | Toolchain | **"esp"** Rust fork, pinned and supplied by the Nix devshell |
-| Network | `embassy-net` 0.8 (DHCP + DNS + UDP) over the esp-radio station interface — SNTP clock sync |
+| Network | `embassy-net` 0.9 (DHCP + DNS + UDP) over the esp-radio station interface — SNTP clock sync |
 
 > Previous font picks were DejaVu Sans/Mono — weak readability at 6–8 px; the pixel font fits the art natively.
 
