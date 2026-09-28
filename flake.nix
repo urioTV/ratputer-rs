@@ -51,7 +51,7 @@
             project_root="$(git rev-parse --show-toplevel)"
             cd "$project_root"
             cargo xtask build
-            exec espflash write-bin 0x0 ratputer-adv.bin
+            exec bash ./tools/flash.sh ratputer-adv.bin
           '';
         };
       in
@@ -82,7 +82,7 @@
 
             echo "Toolchain: $(rustc --version)"
             echo "Build:     build (merged and verified image)"
-            echo "Flash:     flash (build, flash, and verify)"
+            echo "Flash:     flash (build, flash, watchdog-reset, and verify boot on WSL)"
             echo "Console:   serial terminal on the CDC port (PuTTY / screen / picocom)"
             echo ""
           '';
