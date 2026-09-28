@@ -56,7 +56,7 @@ hadris-fat = { path = "vendor/hadris-fat", default-features = false, features = 
 ] }
 embedded-io = "0.7"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
-toml = { version = "0.9", default-features = false, features = ["display", "parse", "serde"] }
+toml = { version = "1.1", default-features = false, features = ["display", "parse", "serde"] }
 
 # Complete Cardputer ADV keyboard matrix/Fn-layer decoder
 cardputer-adv-keyboard = "0.2.6"
