@@ -101,10 +101,23 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   rendering between the blocking steps and retried attempts. Keep this step-machine
   pattern for any new slow operation. While `radio_pending.is_some()`, keyboard input
   is drained and discarded — otherwise queued keys replay after the radio unblocks.
-  The same drain-and-ignore guard covers the splash screen. After splash,
-  auto-connect tries saved networks newest-first, then backs off for 60 s;
-  after link loss it retries after 5 s. It runs only on menu/rat/about views,
-  never during password entry, USB DISK, or FTP, and must not rewrite WIFI.CFG.
+  The same drain-and-ignore guard covers the splash screen. Automatic Wi-Fi
+  is DIFFERENT: an owned, boxed `WifiManager::connect_automatically` future is
+  polled once per main-loop iteration with `Waker::noop()` (esp-rtos posts radio
+  events). It returns the controller on completion; never drop an unfinished
+  future, because that would drop the only Wi-Fi controller. It starts only on
+  menu/rat/about views, but remains polled if the user navigates elsewhere.
+  There is no busy overlay, only top-bar CONNECTING; input/USB/network/rendering
+  continue while the association waits. Manual radio actions requested during
+  an automatic attempt remain queued until the controller returns, unless the
+  user leaves the relevant Wi-Fi view. Saved networks are tried newest-first
+  for at most 3 full passes (5 s between
+  networks, 60 s between passes); a link drop starts a new 3-pass cycle after
+  5 s. A manual Wi-Fi action cancels later automatic passes. Automatic
+  connections must not rewrite WIFI.CFG. Each `connect_async` attempt has a
+  12 s timeout; each manual `scan_async` pass is capped at 8 s so a missing
+  ScanDone event cannot block the UI indefinitely. The scan is still a manual,
+  blocking operation, unlike automatic association.
 - Main-loop order matters: input → scheduled actions/step executor → USB poll/actions →
   network poll + top-bar refresh → animation ticker → **draw at the BOTTOM of the
   iteration**. This makes the `wifi-connecting` spinner
@@ -121,6 +134,12 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   otherwise a half row bleeds over the status line. Keep 10 px rows or update `rows`.
 - Press Start 2P has no `…` glyph, so `overflow: elide` is useless — truncate in Rust
   (`truncate_ascii`) and use `overflow: clip`.
+- Rat animation sources (`ui/images/rat0.png`–`rat3.png`) are native 32×20 art,
+  displayed at 128×80 with `image-rendering: pixelated`. Do not pre-upscale:
+  `EmbedForSoftwareRenderer` stores expanded textures uncompressed in flash.
+  Downsampling the old 128×80 sources saved 119,040 bytes; a host Slint 1.18.1
+  software-renderer comparison found zero differing RGB565 pixels in all four
+  frames at display size. Frame timing and the image element sizes are unchanged.
 
 ## Keyboard (TCA8418)
 
