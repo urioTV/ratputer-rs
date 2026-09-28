@@ -63,7 +63,7 @@ cardputer-adv-keyboard = "0.2.6"
 
 # Display graphics
 embedded-graphics = "0.8"
-mipidsi = "0.9"                # ST7789 driver (built-in SpiInterface)
+mipidsi = "0.10"                # ST7789 driver (built-in SpiInterface)
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"       # SpiDevice (ExclusiveDevice) on top of esp-hal
 
