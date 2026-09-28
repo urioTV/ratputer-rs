@@ -98,6 +98,9 @@ export component MainWindow inherits Window {
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
 
+    // Native 32x20 pixel art; both Image elements render it at 128x80 with
+    // pixelated nearest-neighbor scaling. Do not pre-upscale the PNG files:
+    // software-renderer embedding would quadruple each dimension in flash.
     property <[image]> frames: [
         @image-url("images/rat0.png"),
         @image-url("images/rat1.png"),
