@@ -36,12 +36,12 @@ use crate::storage::{fmt_fat_mtime, now_ymdhms, FtpConfig, SdBlock, SdVolume};
 pub const CONTROL_PORT: u16 = 21;
 /// Fixed passive-mode data listener.
 const DATA_PORT: u16 = 50_000;
-const CONTROL_RX_LEN: usize = 1024;
-const CONTROL_TX_LEN: usize = 1024;
-const DATA_RX_LEN: usize = 4096;
-const DATA_TX_LEN: usize = 4096;
+const CONTROL_RX_LEN: usize = 512;
+const CONTROL_TX_LEN: usize = 512;
+const DATA_RX_LEN: usize = 2048;
+const DATA_TX_LEN: usize = 2048;
 /// Directory listings are sent in runs of this size to keep RAM flat.
-const LIST_CHUNK_TARGET: usize = 3072;
+const LIST_CHUNK_TARGET: usize = 1536;
 const MAX_COMMAND_LINE: usize = 512;
 /// Close idle control connections after 5 minutes.
 const IDLE_TIMEOUT_SECS: u64 = 300;
@@ -51,7 +51,7 @@ const LIVEN_TIMEOUT_SECS: u64 = 120;
 /// Give the client this long to open its data connection after PASV.
 const DATA_ACCEPT_TIMEOUT_SECS: u64 = 20;
 /// Bytes processed per poll for bulk file transfers.
-const FILE_CHUNK_LEN: usize = 4096;
+const FILE_CHUNK_LEN: usize = 2048;
 
 /// Poll a future exactly once with a no-op waker. `None` = would block.
 fn poll_once<F, O>(future: F) -> Option<O>
@@ -166,7 +166,8 @@ struct Transfer {
     failed: Option<&'static str>,
 }
 
-struct Session {
+struct Session<'a> {
+    control: TcpSocket<'a>,
     cwd: Vec<String>,
     user: Option<String>,
     logged_in: bool,
@@ -186,9 +187,10 @@ struct Session {
     last_activity: Instant,
 }
 
-impl Session {
-    fn new(peer: String) -> Self {
+impl<'a> Session<'a> {
+    fn new(peer: String, control: TcpSocket<'a>) -> Self {
         Self {
+            control,
             cwd: Vec::new(),
             user: None,
             logged_in: false,
@@ -216,11 +218,19 @@ impl Session {
     }
 }
 
+/// Control-connection listeners plus backlog. smoltcp RSTs a SYN when no
+/// socket accepts it, and a session lingers for a few polls after QUIT (the
+/// client must ACK the 221 first). A client that reconnects immediately would
+/// be refused, so several sockets listen at once; at most one ever becomes a
+/// session (single-client policy), the rest absorb SYN/handshake/teardown
+/// overlap and return to listening.
+const CONTROL_SLOTS: usize = 4;
+
 pub struct FtpServer {
-    control: TcpSocket<'static>,
     data: TcpSocket<'static>,
-    session: Option<Session>,
-    control_listening: bool,
+    /// Listening slots; a slot is `None` only while its socket is the session.
+    controls: [Option<TcpSocket<'static>>; CONTROL_SLOTS],
+    session: Option<Session<'static>>,
     /// The fixed passive listener is armed for this session.
     data_listening: bool,
     ip: Option<Ipv4Address>,
@@ -230,28 +240,33 @@ pub struct FtpServer {
 }
 
 impl FtpServer {
-    /// Socket buffers (18 KiB) live in the heap; the caller checks
-    /// `esp_alloc::HEAP.free()` and constructs the server only when there is
-    /// enough room. The server (and its buffers) persist across opens of the
-    /// FTP screen; `start`/`stop` only open and close listeners.
+    /// Socket buffers (6 KiB) are leaked from the heap. The server is created
+    /// once at boot, while the heap is still fresh, and persists for the whole
+    /// run; `start`/`stop` only open and close listeners.
     pub fn new(stack: Stack<'static>) -> Self {
-        let control_rx = Box::leak(Box::new([0_u8; CONTROL_RX_LEN]));
-        let control_tx = Box::leak(Box::new([0_u8; CONTROL_TX_LEN]));
+        // Every control slot needs its own socket: smoltcp RSTs a SYN when no
+        // socket accepts it, so empty slots are useless. Session-level
+        // idle/liveness checks reclaim dead clients; a transport timeout on
+        // the control socket would reset transfers longer than 45 seconds.
+        let mut controls: [Option<TcpSocket<'static>>; CONTROL_SLOTS] = Default::default();
+        for slot in controls.iter_mut() {
+            let mut socket = TcpSocket::new(
+                stack,
+                Box::leak(Box::new([0_u8; CONTROL_RX_LEN])),
+                Box::leak(Box::new([0_u8; CONTROL_TX_LEN])),
+            );
+            socket.set_timeout(None);
+            *slot = Some(socket);
+        }
         let data_rx = Box::leak(Box::new([0_u8; DATA_RX_LEN]));
         let data_tx = Box::leak(Box::new([0_u8; DATA_TX_LEN]));
-        let mut control = TcpSocket::new(stack, control_rx, control_tx);
         let mut data = TcpSocket::new(stack, data_rx, data_tx);
-        // Session-level idle/liveness checks reclaim dead control clients and
-        // are refreshed by data progress. A transport timeout on the control
-        // socket would incorrectly reset any transfer lasting over 45 seconds.
-        control.set_timeout(None);
         // A stalled passive data connection still needs a bounded recovery.
         data.set_timeout(Some(NetDuration::from_secs(45)));
         Self {
-            control,
+            controls,
             data,
             session: None,
-            control_listening: false,
             data_listening: false,
             ip: None,
             stats: FtpStats::default(),
@@ -272,22 +287,59 @@ impl FtpServer {
         } else {
             self.status = FtpStatus::Offline;
         }
-        self.control_listening = false;
-        self.control.abort();
+        // Every socket keeps its buffers; only their listeners reset.
+        if let Some(mut session) = self.session.take() {
+            session.control.abort();
+            self.park(session.control);
+        }
+        for slot in self.controls.iter_mut().flatten() {
+            slot.abort();
+        }
         self.data_listening = false;
         self.data.abort();
-        self.session = None;
         Ok(())
     }
 
     pub fn stop(&mut self) {
-        self.control.abort();
-        self.data.abort();
-        self.control_listening = false;
+        if let Some(mut session) = self.session.take() {
+            session.control.abort();
+            self.park(session.control);
+        }
+        for slot in self.controls.iter_mut().flatten() {
+            slot.abort();
+        }
         self.data_listening = false;
-        self.session = None;
+        self.data.abort();
         self.status = FtpStatus::Stopped;
         self.activity.clear();
+    }
+
+    /// True while any control connection is handshaking, active or tearing
+    /// down, or a transfer is running. The main loop burst-polls then, so
+    /// connections complete in a few milliseconds instead of stretching over
+    /// main-loop iterations (which lets back-to-back clients exhaust the
+    /// listening slots).
+    pub fn busy(&self) -> bool {
+        if self.status == FtpStatus::Stopped {
+            return false;
+        }
+        self.session.is_some()
+            || self
+                .controls
+                .iter()
+                .flatten()
+                .any(|slot| slot.state() != State::Listen)
+    }
+
+    /// Return a finished control socket to a free listening slot.
+    fn park(&mut self, socket: TcpSocket<'static>) {
+        for slot in self.controls.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(socket);
+                return;
+            }
+        }
+        // Unreachable: a session only ever borrows one of our own slots.
     }
 
     pub fn status(&self) -> FtpStatus {
@@ -318,30 +370,48 @@ impl FtpServer {
                 .then_some(config.address.address())
         });
 
-        if !self.control_listening {
-            match self.control.state() {
+        let mut promoted = false;
+        for index in 0..CONTROL_SLOTS {
+            let Some(standby) = self.controls[index].as_mut() else {
+                continue;
+            };
+            match standby.state() {
                 State::Closed => {
-                    let _ = poll_once(self.control.accept(CONTROL_PORT));
-                    self.control_listening = true;
+                    // listen() is idempotent on an already-listening socket.
+                    let _ = poll_once(standby.accept(CONTROL_PORT));
                 }
-                // smoltcp cannot listen from teardown states; abort back to Closed.
+                State::Established => {
+                    if self.session.is_none() && !promoted {
+                        let peer = standby
+                            .remote_endpoint()
+                            .map(|endpoint| format_tcp_endpoint(endpoint.addr, endpoint.port))
+                            .unwrap_or_else(|| String::from("?"));
+                        // End the slot borrow, then move the socket into the
+                        // new session.
+                        let socket = self.controls[index].take().unwrap();
+                        log::info!("FTP client connected from {peer}");
+                        let mut session = Session::new(peer, socket);
+                        session.reply("220 RATPUTER SD");
+                        self.session = Some(session);
+                        promoted = true;
+                    } else {
+                        // A second control connection during an active session:
+                        // single-client policy, do not hold the socket.
+                        standby.abort();
+                    }
+                }
+                // SYN|ACK in flight; leave the handshake alone.
+                State::SynReceived => {}
+                // smoltcp cannot listen from teardown states.
                 State::TimeWait
                 | State::LastAck
                 | State::FinWait1
                 | State::FinWait2
-                | State::CloseWait => self.control.abort(),
+                | State::CloseWait => {
+                    standby.abort();
+                }
                 _ => {}
             }
-        } else if self.session.is_none() && self.control.state() == State::Established {
-            let peer = self
-                .control
-                .remote_endpoint()
-                .map(|endpoint| format_tcp_endpoint(endpoint.addr, endpoint.port))
-                .unwrap_or_else(|| String::from("?"));
-            log::info!("FTP client connected from {peer}");
-            let mut session = Session::new(peer);
-            session.reply("220 RATPUTER SD");
-            self.session = Some(session);
         }
 
         self.status = self
@@ -363,14 +433,13 @@ impl FtpServer {
         if self.session.is_some() {
             let mut session = self.session.take().unwrap();
             if self.poll_session(volume, &mut session, config) {
-                // Session over: discard teardown states and arm the single
-                // listener immediately. This removes the brief refused window
-                // seen by clients that reconnect right after QUIT.
+                // Session over: discard teardown state and put the socket back
+                // on listen duty. A client reconnecting right after QUIT never
+                // sees a moment without an armed listener on port 21.
                 let _ = session.transfer.take();
                 let _ = session.pending.take();
-                self.control.abort();
-                let _ = poll_once(self.control.accept(CONTROL_PORT));
-                self.control_listening = true;
+                session.control.abort();
+                self.park(session.control);
                 self.data.abort();
                 self.data_listening = false;
                 log::info!("FTP client {} left", session.peer);
@@ -389,8 +458,8 @@ impl FtpServer {
     ) -> bool {
         // 1. Flush queued replies; one write per poll is plenty.
         let mut fatal = false;
-        if !session.out.is_empty() && self.control.can_send() {
-            match poll_once(self.control.write(session.out.as_bytes())) {
+        if !session.out.is_empty() && session.control.can_send() {
+            match poll_once(session.control.write(session.out.as_bytes())) {
                 Some(Ok(written)) if written > 0 => {
                     session.out.drain(..written);
                 }
@@ -401,9 +470,9 @@ impl FtpServer {
         }
 
         // 2. Drain command bytes.
-        if !fatal && self.control.can_recv() {
+        if !fatal && session.control.can_recv() {
             let mut buffer = [0_u8; 256];
-            match poll_once(self.control.read(&mut buffer)) {
+            match poll_once(session.control.read(&mut buffer)) {
                 Some(Ok(0)) | Some(Err(_)) => fatal = true,
                 Some(Ok(count)) => {
                     session.last_activity = Instant::now();
@@ -454,8 +523,7 @@ impl FtpServer {
                 >= esp_hal::time::Duration::from_secs(LIVEN_TIMEOUT_SECS)
         {
             log::warn!("FTP session idle past limit; dropping client");
-            self.control.abort();
-            self.control_listening = false;
+            session.control.abort();
             fatal = true;
         }
 
@@ -468,13 +536,11 @@ impl FtpServer {
         // If the client went away first, the TX queue may never drain — abort
         // instead of waiting forever.
         if session.quit && session.out.is_empty() {
-            if self.control.send_queue() == 0 {
-                self.control.close();
-                self.control_listening = false;
+            if session.control.send_queue() == 0 {
+                session.control.close();
                 fatal = true;
-            } else if !self.control.may_send() || !self.control.may_recv() {
-                self.control.abort();
-                self.control_listening = false;
+            } else if !session.control.may_send() || !session.control.may_recv() {
+                session.control.abort();
                 fatal = true;
             }
         }
@@ -483,16 +549,16 @@ impl FtpServer {
         // CloseWait: may_send() is still true, but may_recv() is false and an
         // empty receive queue never makes can_recv() true again.
         if !session.quit
-            && ((!self.control.may_recv() && !self.control.can_recv())
-                || (!self.control.may_send()
+            && ((!session.control.may_recv() && !session.control.can_recv())
+                || (!session.control.may_send()
                     && session.out.is_empty()
-                    && self.control.send_queue() == 0))
+                    && session.control.send_queue() == 0))
         {
             log::info!(
                 "FTP ctrl peer gone: state={:?} out={} queue={}",
-                self.control.state(),
+                session.control.state(),
                 session.out.len(),
-                self.control.send_queue()
+                session.control.send_queue()
             );
             fatal = true;
         }
@@ -567,7 +633,7 @@ impl FtpServer {
 
         // The preliminary 150 reply must leave the control connection first.
         if !transfer.announced {
-            if session.out.is_empty() && self.control.send_queue() == 0 {
+            if session.out.is_empty() && session.control.send_queue() == 0 {
                 transfer.announced = true;
             }
             session.transfer = Some(transfer);
@@ -939,7 +1005,19 @@ impl FtpServer {
                             "MLSD" | "MLST" => ListKind::Machine,
                             _ => ListKind::List,
                         };
-                        let (parent, leaf) = split_path(&session.cwd, arg);
+                        let (mut parent, leaf) = split_path(&session.cwd, arg);
+                        let mut leaf = leaf;
+                        // RFC 959: a directory argument lists that directory's
+                        // contents, not its entry in the parent. A file
+                        // argument keeps the leaf-filter behavior.
+                        if let Some(name) = leaf.clone() {
+                            if let Some((entry, _dir)) = find_in(volume, &parent, &name) {
+                                if entry.is_directory() {
+                                    parent.push(name);
+                                    leaf = None;
+                                }
+                            }
+                        }
                         if kind_cmd == "MLST" {
                             PendingAction::List {
                                 parent: session.cwd.clone(),

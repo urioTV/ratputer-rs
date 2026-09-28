@@ -1270,7 +1270,6 @@ dependencies = [
  "embedded-io-async 0.7.0",
  "embedded-nal-async",
  "heapless 0.8.0",
- "log",
  "managed",
  "smoltcp",
 ]
@@ -1383,7 +1382,6 @@ dependencies = [
  "embassy-usb-driver",
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
- "log",
 ]
 
 [[package]]
@@ -1540,7 +1538,6 @@ dependencies = [
  "embedded-sdmmc-types",
  "heapless 0.9.3",
  "hex-literal",
- "log",
  "thiserror 2.0.20",
 ]
 
@@ -4729,7 +4726,6 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-radio",
- "esp-rom-sys",
  "esp-rtos",
  "hadris-fat",
  "log",

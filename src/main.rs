@@ -34,6 +34,7 @@ use esp_println as _;
 mod battery;
 mod clock;
 mod debug;
+mod filemanager;
 mod ftp;
 mod msc;
 mod net;
@@ -73,8 +74,24 @@ const SPLASH_AFTER_MS: u64 = 3500;
 const BATTERY_EVERY_MS: u64 = 5000;
 const SNTP_RESYNC_SECS: u64 = 3600;
 const SNTP_RETRY_SECS: u64 = 30;
+const AUTO_CONNECT_AFTER_SPLASH_MS: u64 = 500;
+const AUTO_RECONNECT_AFTER_DROP_SECS: u64 = 5;
+const AUTO_NEXT_NETWORK_SECS: u64 = 5;
+const AUTO_RETRY_CYCLE_SECS: u64 = 60;
 // Glyph budget of the top-bar SSID field (120 px / 8 px per glyph).
 const TOP_BAR_SSID_CHARS: usize = 15;
+
+fn retry_saved_network(index: &mut usize, due: &mut Option<Instant>, count: usize) {
+    if count == 0 {
+        *due = None;
+    } else if *index > 0 {
+        *index -= 1;
+        *due = Some(Instant::now() + Duration::from_secs(AUTO_NEXT_NETWORK_SECS));
+    } else {
+        *index = count - 1;
+        *due = Some(Instant::now() + Duration::from_secs(AUTO_RETRY_CYCLE_SECS));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Slint backend for esp-hal (single core, no scheduler)
@@ -208,6 +225,10 @@ fn view_name(view: i32) -> &'static str {
         7 => "usb_disk",
         8 => "ftp",
         9 => "ftp_password",
+        10 => "sd_files",
+        11 => "sd_actions",
+        12 => "sd_name",
+        13 => "sd_delete",
         _ => "unknown",
     }
 }
@@ -234,6 +255,22 @@ fn apply_debug_key(ui: &MainWindow, key: debug::DebugKey) {
             ui.set_ftp_password(password.into());
         }
         debug::DebugKey::Backspace => ui.invoke_key_pressed("back".into()),
+    }
+}
+
+fn file_debug_key(key: debug::DebugKey) -> filemanager::Key {
+    use filemanager::Key;
+    match key {
+        debug::DebugKey::Up => Key::Up,
+        debug::DebugKey::Down => Key::Down,
+        debug::DebugKey::Left => Key::Left,
+        debug::DebugKey::Right => Key::Right,
+        debug::DebugKey::Enter => Key::Enter,
+        debug::DebugKey::Back => Key::Back,
+        debug::DebugKey::Backspace => Key::Backspace,
+        debug::DebugKey::Delete => Key::Delete,
+        debug::DebugKey::Tab => Key::Tab,
+        debug::DebugKey::Space => Key::Char(' '),
     }
 }
 
@@ -273,6 +310,7 @@ enum RadioStep {
     Connect {
         network: SavedNetwork,
         attempt: usize,
+        automatic: bool,
     },
 }
 
@@ -292,6 +330,7 @@ fn begin_connect(
     ui: &MainWindow,
     network: SavedNetwork,
     frame_idx: u32,
+    automatic: bool,
 ) -> Option<RadioStep> {
     match wifi
         .as_mut()
@@ -302,6 +341,7 @@ fn begin_connect(
             let step = RadioStep::Connect {
                 network,
                 attempt: 1,
+                automatic,
             };
             ui.set_wifi_status(busy_status(&step, frame_idx).into());
             ui.set_wifi_connecting(true);
@@ -447,9 +487,13 @@ fn main() -> ! {
     // --- Battery gauge: GPIO10 / ADC1_CH9, 2:1 divider ---
     let mut battery = battery::Battery::new(peripherals.ADC1, peripherals.GPIO10);
     let mut scan_networks: Vec<wifi::ScanNetwork> = Vec::new();
-    // Created lazily on the first FTP screen open (socket buffers use heap),
-    // then retained so repeated opens do not leak another pair of sockets.
-    let mut ftp_server: Option<ftp::FtpServer> = None;
+    // Socket buffers are reserved at boot, while the heap is still fresh.
+    // First renders of the Slint views permanently consume a chunk of heap;
+    // creating the server lazily on first open then failed with LOW MEMORY.
+    let mut ftp_server: Option<ftp::FtpServer> = network
+        .as_ref()
+        .map(|network| ftp::FtpServer::new(network.stack()));
+    let mut file_manager: Option<filemanager::FileManager> = None;
 
     // --- Slint: minimal software window + platform ---
     let window = MinimalSoftwareWindow::new(
@@ -500,6 +544,12 @@ fn main() -> ! {
     let splash_start = Instant::now();
     let mut last_switch = splash_start;
     let mut radio_pending: Option<RadioStep> = None;
+    // Try the most recently saved network first; older entries are fallbacks.
+    // A full failed pass is throttled so stale credentials do not freeze the UI.
+    let mut auto_next_index = wifi_config.networks.len().saturating_sub(1);
+    let mut auto_connect_at = (wifi.is_some() && !wifi_config.networks.is_empty()).then_some(
+        splash_start + Duration::from_millis(SPLASH_AFTER_MS + AUTO_CONNECT_AFTER_SPLASH_MS),
+    );
 
     // Top-bar state; `shown_*` caches avoid re-setting unchanged properties.
     let mut wall_clock = clock::WallClock::default();
@@ -513,11 +563,17 @@ fn main() -> ! {
     let mut next_usb_stats_at = Instant::now();
     let mut next_ftp_stats_at = Instant::now();
     let mut usb_force_exit_armed = false;
-    let mut debug_reboot_requested = false;
+    // Reboot once the acknowledgement left the FIFO, or after a deadline: a host
+    // that closes the port can leave the final flush pending forever.
+    let mut debug_reboot_at: Option<Instant> = None;
+    // Sampled low-water mark, visible through STATUS even without profiling.
+    // Transient allocations between samples need the heap-profiling feature.
+    let mut heap_free_min = esp_alloc::HEAP.free();
     loop {
         slint::platform::update_timers_and_animations();
 
         let now = Instant::now();
+        heap_free_min = heap_free_min.min(esp_alloc::HEAP.free());
 
         // After SPLASH_AFTER_MS: switch to the main screen (Slint states, 600 ms crossfade)
         if !splash_done && now - splash_start >= Duration::from_millis(SPLASH_AFTER_MS) {
@@ -549,9 +605,15 @@ fn main() -> ! {
                     let view = ui.get_view_state();
                     debug_console.ok(format_args!("status"));
                     debug_console.data(format_args!(
-                        "system uptime_ms={} heap_free={}",
+                        "system uptime_ms={} heap_free={} heap_free_min={}",
                         now.duration_since_epoch().as_millis(),
-                        esp_alloc::HEAP.free()
+                        esp_alloc::HEAP.free(),
+                        heap_free_min
+                    ));
+                    #[cfg(feature = "heap-profiling")]
+                    debug_console.data(format_args!(
+                        "heap_peak_used={}",
+                        esp_alloc::HEAP.stats().max_usage
                     ));
                     debug_console.data(format_args!(
                         "ui view={} name={} menu={} wifi_menu={} saved={} scan={}",
@@ -614,6 +676,20 @@ fn main() -> ! {
                         ui.get_battery_percent(),
                         ui.get_link_ssid().as_str()
                     ));
+                    if (10..=13).contains(&view) {
+                        let path = ui.get_fm_path();
+                        let status = ui.get_fm_status();
+                        let selected = file_manager.as_ref().and_then(|fm| fm.selected_label());
+                        debug_console.data(format_args!(
+                            "sd path={:?} page={} index={} selected={:?} copy={} status={:?}",
+                            path.as_str(),
+                            ui.get_fm_page(),
+                            file_manager.as_ref().map_or(0, |fm| fm.selected_index()),
+                            selected.as_ref().map(SharedString::as_str),
+                            file_manager.as_ref().is_some_and(|fm| fm.copying()),
+                            status.as_str(),
+                        ));
+                    }
                     debug_console.data(format_args!(
                         "lists saved={} scan={}",
                         wifi_config.networks.len(),
@@ -644,8 +720,18 @@ fn main() -> ! {
                         // Serial/JTAG to OTG, so a remote-only session could not
                         // send Backspace to leave it.
                         debug_console.error(format_args!("usb_disk_requires_physical_input"));
+                    } else if file_manager.as_ref().is_some_and(|fm| fm.copying()) {
+                        debug_console.error(format_args!("sd_copy_busy"));
                     } else {
-                        apply_debug_key(&ui, key);
+                        if (10..=13).contains(&ui.get_view_state()) {
+                            if let (Some(fm), Some(volume)) =
+                                (file_manager.as_mut(), storage.as_ref())
+                            {
+                                fm.key(file_debug_key(key), volume, &ui);
+                            }
+                        } else {
+                            apply_debug_key(&ui, key);
+                        }
                         debug_console.ok(format_args!(
                             "key={key:?} view={} name={}",
                             ui.get_view_state(),
@@ -658,7 +744,15 @@ fn main() -> ! {
                     if !splash_done || radio_pending.is_some() {
                         debug_console.error(format_args!("input_busy"));
                     } else {
-                        match append_debug_text(&ui, text.as_str()) {
+                        let result = if ui.get_view_state() == 12 {
+                            file_manager
+                                .as_mut()
+                                .ok_or("sd_not_open")
+                                .and_then(|fm| fm.append_text(text.as_str(), &ui))
+                        } else {
+                            append_debug_text(&ui, text.as_str())
+                        };
+                        match result {
                             Ok(()) => debug_console.ok(format_args!("text_accepted")),
                             Err(reason) => debug_console.error(format_args!("{reason}")),
                         }
@@ -675,6 +769,12 @@ fn main() -> ! {
                             ui.set_ftp_password("".into());
                             debug_console.ok(format_args!("ftp_text_cleared"));
                         }
+                        12 => {
+                            if let Some(fm) = file_manager.as_mut() {
+                                fm.clear_text(&ui);
+                                debug_console.ok(format_args!("sd_name_cleared"));
+                            }
+                        }
                         _ => debug_console.error(format_args!("text_entry_not_active")),
                     }
                     debug_console.end();
@@ -682,7 +782,7 @@ fn main() -> ! {
                 debug::DebugCommand::Reboot => {
                     debug_console.ok(format_args!("rebooting"));
                     debug_console.end();
-                    debug_reboot_requested = true;
+                    debug_reboot_at = Some(Instant::now() + Duration::from_millis(500));
                 }
                 debug::DebugCommand::Invalid { reason } => {
                     debug_console.error(format_args!("{reason}"));
@@ -698,6 +798,35 @@ fn main() -> ! {
                 // operation is in progress, so stray presses neither open views behind
                 // the animation nor replay all at once when the radio unblocks.
                 if !splash_done || radio_pending.is_some() {
+                    continue;
+                }
+                if (10..=13).contains(&ui.get_view_state()) {
+                    if let (Some(fm), Some(volume)) = (file_manager.as_mut(), storage.as_ref()) {
+                        use filemanager::Key;
+                        let key = match input {
+                            KeyInput::Char(c) if ui.get_view_state() == 12 => Some(Key::Char(c)),
+                            KeyInput::Char(' ') => Some(Key::Char(' ')),
+                            KeyInput::Char(',') => Some(Key::Left),
+                            KeyInput::Char(';') => Some(Key::Up),
+                            KeyInput::Char('.') => Some(Key::Down),
+                            KeyInput::Char('/') => Some(Key::Right),
+                            KeyInput::Char(_) | KeyInput::Modifier(_) => None,
+                            KeyInput::Enter => Some(Key::Enter),
+                            KeyInput::Backspace if ui.get_view_state() == 12 => {
+                                Some(Key::Backspace)
+                            }
+                            KeyInput::Backspace | KeyInput::Escape => Some(Key::Back),
+                            KeyInput::Delete => Some(Key::Delete),
+                            KeyInput::Tab => Some(Key::Tab),
+                            KeyInput::Arrow(Arrow::Up) => Some(Key::Up),
+                            KeyInput::Arrow(Arrow::Down) => Some(Key::Down),
+                            KeyInput::Arrow(Arrow::Left) => Some(Key::Left),
+                            KeyInput::Arrow(Arrow::Right) => Some(Key::Right),
+                        };
+                        if let Some(key) = key {
+                            fm.key(key, volume, &ui);
+                        }
+                    }
                     continue;
                 }
                 match input {
@@ -749,6 +878,31 @@ fn main() -> ! {
             }
         }
 
+        // Opening from the menu never retains a FAT handle. Drop browser state
+        // on exit, before USB can take ownership of the raw SD card.
+        if (10..=13).contains(&ui.get_view_state()) {
+            if file_manager.is_none() {
+                if let Some(volume) = storage.as_ref() {
+                    if ftp_server
+                        .as_ref()
+                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped)
+                    {
+                        file_manager = Some(filemanager::FileManager::new(volume, &ui));
+                    } else {
+                        ui.set_view_state(0);
+                    }
+                } else {
+                    ui.set_view_state(0);
+                }
+            }
+        } else {
+            file_manager = None;
+        }
+        if let (Some(fm), Some(volume)) = (file_manager.as_mut(), storage.as_ref()) {
+            // A single bounded FAT step per pass keeps other services responsive.
+            fm.poll(volume, &ui);
+        }
+
         // Execute one radio step. Its status (spinner + progress) was rendered in
         // previous iterations; only the current step blocks below.
         if let Some(step) = radio_pending.take() {
@@ -795,23 +949,36 @@ fn main() -> ! {
                         }
                     }
                 }
-                RadioStep::Connect { network, attempt } => {
+                RadioStep::Connect {
+                    network,
+                    attempt,
+                    automatic,
+                } => {
                     match wifi.as_mut().map(|manager| manager.connect_attempt()) {
                         Some(Ok(())) => {
                             let ssid = network.ssid.clone();
                             ui.set_link_ssid(truncate_ascii(&ssid, TOP_BAR_SSID_CHARS).into());
-                            wifi_config.upsert(network);
-                            ui.set_saved_networks(saved_network_model(&wifi_config));
-                            if storage
-                                .as_ref()
-                                .is_none_or(|manager| storage::save(manager, &wifi_config).is_err())
-                            {
-                                ui.set_wifi_status("CONNECTED - SD SAVE FAILED".into());
-                            } else {
-                                ui.set_wifi_status(
-                                    format!("CONNECTED: {}", display_ssid(&ssid)).into(),
-                                );
+                            // Auto-reconnect uses credentials already on SD. Do not
+                            // rewrite WIFI.CFG on every boot or after a link drop.
+                            if !automatic {
+                                wifi_config.upsert(network);
+                                ui.set_saved_networks(saved_network_model(&wifi_config));
                             }
+                            auto_next_index = wifi_config
+                                .networks
+                                .iter()
+                                .position(|entry| entry.ssid == ssid)
+                                .unwrap_or_else(|| wifi_config.networks.len().saturating_sub(1));
+                            auto_connect_at = None;
+                            let save_failed = !automatic
+                                && storage.as_ref().is_none_or(|manager| {
+                                    storage::save(manager, &wifi_config).is_err()
+                                });
+                            ui.set_wifi_status(if save_failed {
+                                "CONNECTED - SD SAVE FAILED".into()
+                            } else {
+                                format!("CONNECTED: {}", display_ssid(&ssid)).into()
+                            });
                             if ui.get_view_state() == 5 {
                                 set_password(&ui, "");
                                 ui.set_view_state(2);
@@ -823,16 +990,29 @@ fn main() -> ! {
                             Some(RadioStep::Connect {
                                 network,
                                 attempt: attempt + 1,
+                                automatic,
                             })
                         }
                         Some(Err(_)) => {
                             ui.set_wifi_connecting(false);
                             ui.set_wifi_status("CONNECTION FAILED".into());
+                            if automatic {
+                                retry_saved_network(
+                                    &mut auto_next_index,
+                                    &mut auto_connect_at,
+                                    wifi_config.networks.len(),
+                                );
+                            } else if !wifi_config.networks.is_empty() {
+                                auto_connect_at = Some(
+                                    Instant::now() + Duration::from_secs(AUTO_RETRY_CYCLE_SECS),
+                                );
+                            }
                             None
                         }
                         None => {
                             ui.set_wifi_connecting(false);
                             ui.set_wifi_status("WI-FI NOT AVAILABLE".into());
+                            auto_connect_at = None;
                             None
                         }
                     }
@@ -863,7 +1043,8 @@ fn main() -> ! {
                 2 if radio_pending.is_none() => {
                     let index = ui.get_wifi_action_index() as usize;
                     if let Some(network) = wifi_config.networks.get(index).cloned() {
-                        radio_pending = begin_connect(&mut wifi, &ui, network, frame_idx);
+                        auto_connect_at = None;
+                        radio_pending = begin_connect(&mut wifi, &ui, network, frame_idx, false);
                     }
                 }
                 3 if radio_pending.is_none() => {
@@ -881,6 +1062,7 @@ fn main() -> ! {
                                     auth: network.auth,
                                 },
                                 frame_idx,
+                                false,
                             );
                         } else {
                             ui.set_wifi_selected_ssid(network.ssid.into());
@@ -907,6 +1089,7 @@ fn main() -> ! {
                                 auth: network.auth,
                             },
                             frame_idx,
+                            false,
                         );
                     }
                 }
@@ -915,6 +1098,10 @@ fn main() -> ! {
                     if wifi_config.remove(index) {
                         ui.set_saved_index(0);
                         ui.set_saved_networks(saved_network_model(&wifi_config));
+                        auto_next_index = wifi_config.networks.len().saturating_sub(1);
+                        if wifi_config.networks.is_empty() {
+                            auto_connect_at = None;
+                        }
                         if storage
                             .as_ref()
                             .is_none_or(|manager| storage::save(manager, &wifi_config).is_err())
@@ -926,6 +1113,33 @@ fn main() -> ! {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Automatic association is scheduled only after user actions, and only on
+        // screens that are not editing credentials or serving USB/FTP. Like manual
+        // connects, it runs in a later iteration so the spinner is drawn first.
+        if radio_pending.is_none()
+            && wifi_action == 0
+            && !network.as_ref().is_some_and(|network| network.is_link_up())
+            && auto_connect_at.is_some_and(|due| Instant::now() >= due)
+            && matches!(ui.get_view_state(), 0 | 1 | 6)
+            && usb_sd.is_none()
+        {
+            if let Some(saved) = wifi_config.networks.get(auto_next_index).cloned() {
+                log::info!("Auto-connecting to saved network {}", saved.ssid);
+                radio_pending = begin_connect(&mut wifi, &ui, saved, frame_idx, true);
+                if radio_pending.is_some() {
+                    auto_connect_at = None;
+                } else {
+                    retry_saved_network(
+                        &mut auto_next_index,
+                        &mut auto_connect_at,
+                        wifi_config.networks.len(),
+                    );
+                }
+            } else {
+                auto_connect_at = None;
             }
         }
 
@@ -994,6 +1208,17 @@ fn main() -> ! {
                         };
                         ui.set_saved_networks(saved_network_model(&wifi_config));
                         ui.set_saved_index(0);
+                        if reload_ok && !wifi_config.networks.is_empty() && wifi.is_some() {
+                            auto_next_index = wifi_config.networks.len() - 1;
+                            if !network.as_ref().is_some_and(|network| network.is_link_up()) {
+                                auto_connect_at = Some(
+                                    Instant::now()
+                                        + Duration::from_secs(AUTO_RECONNECT_AFTER_DROP_SECS),
+                                );
+                            }
+                        } else if wifi_config.networks.is_empty() {
+                            auto_connect_at = None;
+                        }
                         ui.set_wifi_status(
                             if reload_ok {
                                 "SD RELOADED"
@@ -1149,6 +1374,11 @@ fn main() -> ! {
             } else if !link_up && link_was_up && radio_pending.is_none() {
                 // The clock keeps running from the last sync; only the status changes.
                 ui.set_wifi_status("CONNECTION LOST".into());
+                if !wifi_config.networks.is_empty() {
+                    auto_next_index = auto_next_index.min(wifi_config.networks.len() - 1);
+                    auto_connect_at =
+                        Some(Instant::now() + Duration::from_secs(AUTO_RECONNECT_AFTER_DROP_SECS));
+                }
             }
             link_was_up = link_up;
 
@@ -1206,9 +1436,7 @@ fn main() -> ! {
 
         // During a transfer, burst-poll the network and FTP for up to 15 ms.
         // This keeps TCP windows moving without starving input/display forever.
-        let ftp_busy = ftp_server
-            .as_ref()
-            .is_some_and(|server| server.status() == ftp::FtpStatus::Transfer);
+        let ftp_busy = ftp_server.as_ref().is_some_and(ftp::FtpServer::busy);
         if ftp_busy {
             let burst_start = Instant::now();
             while burst_start.elapsed() < Duration::from_millis(15) {
@@ -1229,10 +1457,15 @@ fn main() -> ! {
             renderer.render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
         });
 
+        // Capture allocations from this iteration, including FTP and rendering.
+        heap_free_min = heap_free_min.min(esp_alloc::HEAP.free());
+
         // Responses are queued so a disconnected host can never block the UI.
         // Reboot only after the acknowledgement has left the hardware FIFO.
         debug_console.service();
-        if debug_reboot_requested && debug_console.output_idle() {
+        if debug_reboot_at
+            .is_some_and(|deadline| debug_console.output_idle() || Instant::now() >= deadline)
+        {
             delay.delay_millis(20);
             esp_hal::system::software_reset();
         }
@@ -1260,15 +1493,8 @@ fn start_ftp(
         return;
     }
     let network = network.as_ref().unwrap();
-    if server.is_none() {
-        // Socket buffers consume 10 KiB plus allocator overhead. Keep ample
-        // margin for Slint redraws and Wi-Fi control allocations.
-        if esp_alloc::HEAP.free() < 32 * 1024 {
-            ui.set_ftp_status("LOW MEMORY".into());
-            return;
-        }
-        *server = Some(ftp::FtpServer::new(network.stack()));
-    }
+    // The server exists since boot (network was up); starting only binds its
+    // already-reserved sockets, so no low-memory branch is needed here.
     match server.as_mut().unwrap().start(network.stack()) {
         Ok(()) => {
             set_ftp_login_text(ui, config);

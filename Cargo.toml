@@ -10,13 +10,18 @@ members = ["xtask"]
 default-members = ["."]
 resolver = "2"
 
+[features]
+# Opt-in exact heap peak tracking; updates allocator counters on every allocation.
+heap-profiling = ["esp-alloc/internal-heap-stats"]
+
 [dependencies]
 # HAL (no_std, bare-metal) — ESP32-S3 = Xtensa
 esp-hal = { version = "1.2", features = ["esp32s3", "unstable"] }  # unstable: delay module
 esp-backtrace = { version = "0.20", features = ["esp32s3", "panic-handler", "println"] }
 esp-println = { version = "0.18", features = ["esp32s3", "log-04"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32s3"] }  # app descriptor (required for merged .bin)
-log = "0.4"
+# Keep diagnostics in release, but compile out debug/trace call sites.
+log = { version = "0.4", features = ["release_max_level_info"] }
 
 # Wi-Fi radio and its bare-metal scheduler
 esp-radio = { version = "1.0.0-beta.1", features = ["esp32s3", "wifi", "log-04"] }
@@ -24,13 +29,12 @@ esp-radio = { version = "1.0.0-beta.1", features = ["esp32s3", "wifi", "log-04"]
 esp-rtos = { version = "0.4", features = ["esp32s3", "esp-radio", "esp-alloc", "embassy"] }
 embassy-futures = "0.1"
 embassy-usb = { version = "0.6", default-features = false, features = [
-    "log",
     "max-handler-count-1",
     "max-interface-count-1",
 ] }
 
 # IPv4 stack over the Wi-Fi station interface: DHCP + DNS + UDP (SNTP clock sync)
-embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "tcp", "log"] }
+embassy-net = { version = "0.8", features = ["proto-ipv4", "medium-ethernet", "dhcpv4", "dns", "udp", "tcp"] }
 embassy-time = "0.5"
 # REQUIRED: without a generic queue, esp-rtos uses the executor-integrated timer queue,
 # which panics ("Found waker not created by the Embassy executor") on the first
@@ -39,7 +43,7 @@ embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-16"] }
 nb = "1"                        # non-blocking ADC reads (esp-hal oneshot API)
 
 # SD-card credential storage and TOML serialization (all no_std + alloc)
-embedded-sdmmc = { version = "0.10", default-features = false, features = ["log"] }
+embedded-sdmmc = { version = "0.10", default-features = false }
 # FAT implementation with VFAT long-name read/write, vendored with bounded
 # directory buffering and resumable read/write cursors for FTP. Upstream
 # provenance and the update procedure live in vendor/hadris-fat/PATCHES.md.
@@ -73,7 +77,6 @@ slint = { version = "1.18", default-features = false, features = [
 
 # Heap in internal SRAM (the ADV has no PSRAM!) — required by Slint (alloc)
 esp-alloc = { version = "0.11", features = ["esp32s3"] }
-esp-rom-sys = "0.1"             # ROM symbols (libc-ish) — kept defensively
 
 [build-dependencies]
 # .slint -> Rust compiler; fonts are packed from ui/fonts into the image
@@ -86,6 +89,6 @@ debug-assertions = true
 overflow-checks = true
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1

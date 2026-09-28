@@ -26,12 +26,14 @@ fn run() -> Result<(), String> {
         .parent()
         .ok_or("xtask has no repository root")?;
 
-    run_command(
-        Command::new("cargo")
-            .current_dir(root)
-            .args(["build", "--release"]),
-        "firmware build",
-    )?;
+    let mut build = Command::new("cargo");
+    build.current_dir(root).args(["build", "--release"]);
+    if let Ok(features) = env::var("RATPUTER_FEATURES") {
+        if !features.trim().is_empty() {
+            build.args(["--features", &features]);
+        }
+    }
+    run_command(&mut build, "firmware build")?;
 
     let elf = root
         .join("target")
@@ -69,8 +71,8 @@ fn run() -> Result<(), String> {
 
     println!("\nCreated {} ({size} bytes)", output.display());
     println!("Verified headers: boot/app=e9 DIO, partition=aa 50");
-    println!("Flash with:");
-    println!("  espflash write-bin 0x0 {OUTPUT}");
+    println!("Flash this image with:");
+    println!("  bash tools/flash.sh {OUTPUT}");
     Ok(())
 }
 

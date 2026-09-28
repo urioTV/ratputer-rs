@@ -3,6 +3,23 @@
 
 import "fonts/PressStart2P-Regular.ttf";
 
+// One list row. Instantiated statically: `for` repeater rows are separate heap
+// components (~2 KiB each here), which starved FTP of memory.
+component ListRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    in property <length> indent: 2px;
+    background: selected ? #0e2b17 : transparent;
+    Text {
+        text: (root.selected ? "> " : "  ") + root.label;
+        x: root.indent;
+        color: root.selected ? #7dffa9 : #4a7a5a;
+        font-size: 8px;
+        vertical-alignment: center;
+        overflow: clip;
+    }
+}
+
 export component MainWindow inherits Window {
     default-font-family: "Press Start 2P";
 
@@ -10,7 +27,8 @@ export component MainWindow inherits Window {
     in-out property <int> frame-index: 0;
 
     // 0 menu, 1 rat, 2 Wi-Fi menu, 3 saved, 4 scan, 5 password,
-    // 6 about, 7 USB disk, 8 FTP server, 9 FTP password edit.
+    // 6 about, 7 USB disk, 8 FTP server, 9 FTP password edit,
+    // 10 SD browser, 11 actions, 12 name input, 13 delete confirmation.
     in-out property <int> view-state: 0;
     in-out property <int> menu-index: 0;
     in-out property <int> wifi-menu-index: 0;
@@ -45,6 +63,27 @@ export component MainWindow inherits Window {
     in property <string> ftp-stats: "";
     in-out property <string> ftp-password: "";
 
+    // SD browser state is driven by Rust; the Slint callback only opens it.
+    // Visible browser rows (Rust windows the page into these six slots).
+    in property <int> fm-count: 0;
+    in property <string> fm-row-0;
+    in property <string> fm-row-1;
+    in property <string> fm-row-2;
+    in property <string> fm-row-3;
+    in property <string> fm-row-4;
+    in property <string> fm-row-5;
+    in property <string> fm-path: "/";
+    in property <string> fm-status: "";
+    in property <string> fm-clipboard: "";
+    in property <string> fm-name: "";
+    in property <string> fm-target: "";
+    in property <string> fm-prompt: "";
+    in property <bool> fm-more: false;
+    in property <int> fm-page: 1;
+    // Selected row within the visible window, not within the page.
+    in property <int> fm-index: 0;
+    in property <int> fm-action-index: 0;
+
     // Top bar (main screen only): clock, Wi-Fi link, battery.
     in property <string> clock-text: "--:--";
     in property <bool> clock-synced: false;
@@ -54,7 +93,7 @@ export component MainWindow inherits Window {
     // -1 = no reading yet.
     in property <int> battery-percent: -1;
 
-    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "USB DISK", "FTP SERVER", "ABOUT"];
+    property <[string]> menu-labels: ["RAT VIEW", "WI-FI", "USB DISK", "FTP SERVER", "SD FILES", "ABOUT"];
     property <[string]> wifi-menu-labels: ["SAVED NETWORKS", "SCAN NETWORKS"];
     property <[string]> statuses: ["STALKING", "SNIFFING", "HUNTING", "LOITERING"];
     property <string> dots: frame-index == 0 ? " |" : frame-index == 1 ? " /" : frame-index == 2 ? " -" : " +";
@@ -98,7 +137,7 @@ export component MainWindow inherits Window {
                     root.ftp-action = 1;
                     root.view-state = 8;
                 } else {
-                    root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : 6;
+                    root.view-state = root.menu-index == 0 ? 1 : root.menu-index == 1 ? 2 : root.menu-index == 4 ? 10 : 6;
                 }
             } else if (root.view-state == 1 || root.view-state == 6) {
                 root.view-state = 0;
@@ -557,6 +596,80 @@ export component MainWindow inherits Window {
                     Text { text: root.ftp-status; color: #46a06a; font-size: 8px; horizontal-alignment: center; }
                     Rectangle { height: 1px; background: #0d2b16; }
                     Text { text: "TYPE  ENTER SAVE  ESC CANCEL"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
+                }
+            }
+
+            fm-browser := Rectangle {
+                visible: view-state == 10;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 1px;
+                    Text { text: "SD " + root.fm-path; color: #7dffa9; font-size: 8px; height: 12px; overflow: clip; }
+                    Rectangle { height: 1px; background: #0d2b16; }
+                    // Rust hands over only the rows that fit this viewport.
+                    Rectangle {
+                        clip: true;
+                        if root.fm-count == 0 : Text { text: "EMPTY DIRECTORY"; color: #4a7a5a; font-size: 8px; vertical-alignment: center; horizontal-alignment: center; }
+                        VerticalLayout {
+                            alignment: start;
+                            ListRow { height: 10px; visible: root.fm-count > 0; label: root.fm-row-0; selected: root.fm-index == 0; }
+                            ListRow { height: 10px; visible: root.fm-count > 1; label: root.fm-row-1; selected: root.fm-index == 1; }
+                            ListRow { height: 10px; visible: root.fm-count > 2; label: root.fm-row-2; selected: root.fm-index == 2; }
+                            ListRow { height: 10px; visible: root.fm-count > 3; label: root.fm-row-3; selected: root.fm-index == 3; }
+                            ListRow { height: 10px; visible: root.fm-count > 4; label: root.fm-row-4; selected: root.fm-index == 4; }
+                            ListRow { height: 10px; visible: root.fm-count > 5; label: root.fm-row-5; selected: root.fm-index == 5; }
+                        }
+                    }
+                    Text { text: root.fm-status; color: #ffb347; font-size: 8px; height: 11px; overflow: clip; }
+                    Text { text: root.fm-clipboard; color: #46a06a; font-size: 8px; height: 11px; overflow: clip; }
+                    Text { text: "<> PAGE " + fm-page + (fm-more ? "+" : "") + "  TAB ACTIONS"; color: #39684a; font-size: 8px; height: 11px; }
+                }
+            }
+
+            fm-actions := Rectangle {
+                visible: view-state == 11;
+                VerticalLayout {
+                    padding: 5px;
+                    spacing: 2px;
+                    Text { text: "FILE ACTIONS"; color: #7dffa9; font-size: 8px; height: 13px; horizontal-alignment: center; }
+                    Text { text: root.fm-path; color: #46a06a; font-size: 8px; height: 11px; overflow: clip; }
+                    ListRow { height: 11px; indent: 5px; label: "COPY"; selected: root.fm-action-index == 0; }
+                    ListRow { height: 11px; indent: 5px; label: "MOVE"; selected: root.fm-action-index == 1; }
+                    ListRow { height: 11px; indent: 5px; label: "PASTE"; selected: root.fm-action-index == 2; }
+                    ListRow { height: 11px; indent: 5px; label: "RENAME"; selected: root.fm-action-index == 3; }
+                    ListRow { height: 11px; indent: 5px; label: "NEW FILE"; selected: root.fm-action-index == 4; }
+                    ListRow { height: 11px; indent: 5px; label: "NEW DIR"; selected: root.fm-action-index == 5; }
+                    ListRow { height: 11px; indent: 5px; label: "DELETE"; selected: root.fm-action-index == 6; }
+                    Text { text: "ENTER SELECT  BS BACK"; color: #39684a; font-size: 8px; height: 11px; }
+                }
+            }
+
+            fm-input := Rectangle {
+                visible: view-state == 12;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 5px;
+                    Text { text: root.fm-prompt; color: #7dffa9; font-size: 8px; height: 15px; horizontal-alignment: center; }
+                    Text { text: root.fm-path; color: #46a06a; font-size: 8px; height: 13px; overflow: clip; }
+                    Rectangle {
+                        height: 24px;
+                        border-width: 1px; border-color: #2b5c3b; background: #030903;
+                        Text { text: root.fm-name + "_"; x: 4px; width: parent.width - 8px; color: #7dffa9; font-size: 8px; vertical-alignment: center; overflow: clip; }
+                    }
+                    Text { text: root.fm-status; color: #ffb347; font-size: 8px; overflow: clip; }
+                    Text { text: "ENTER SAVE  ESC CANCEL"; color: #39684a; font-size: 8px; }
+                }
+            }
+
+            fm-confirm := Rectangle {
+                visible: view-state == 13;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 6px;
+                    Text { text: "DELETE FILE / EMPTY DIR?"; color: #ffb347; font-size: 8px; height: 20px; horizontal-alignment: center; }
+                    Text { text: root.fm-target; color: #7dffa9; font-size: 8px; height: 20px; horizontal-alignment: center; overflow: clip; }
+                    Text { text: "PERMANENT - NO UNDO"; color: #ff6b5a; font-size: 8px; height: 18px; horizontal-alignment: center; }
+                    Text { text: "ENTER DELETE  ESC CANCEL"; color: #39684a; font-size: 8px; horizontal-alignment: center; }
                 }
             }
 

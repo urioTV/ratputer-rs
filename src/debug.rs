@@ -7,7 +7,7 @@
 
 use core::fmt::{self, Write};
 
-use esp_hal::{Blocking, peripherals::USB_DEVICE, usb::usb_serial_jtag::UsbSerialJtag};
+use esp_hal::{peripherals::USB_DEVICE, usb::usb_serial_jtag::UsbSerialJtag, Blocking};
 
 const RX_LINE_LEN: usize = 192;
 const TEXT_LEN: usize = 96;

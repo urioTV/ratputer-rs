@@ -44,9 +44,9 @@ pub struct Network {
 
 impl Network {
     pub fn new(interface: Interface, random_seed: u64) -> Self {
-        // DHCP/DNS/SNTP plus persistent FTP control + data TCP sockets.
-        // Keep spare slots for a DNS query while the FTP sockets exist.
-        let resources = Box::leak(Box::new(StackResources::<8>::new()));
+        // DHCP/DNS/SNTP plus the FTP backlog (4 control + 1 data TCP socket,
+        // see ftp::CONTROL_SLOTS) — smoltcp panics on a full SocketSet.
+        let resources = Box::leak(Box::new(StackResources::<10>::new()));
         let (stack, runner) = embassy_net::new(
             interface,
             Config::dhcpv4(Default::default()),

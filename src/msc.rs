@@ -7,10 +7,10 @@
 use alloc::{boxed::Box, rc::Rc};
 use core::{cell::RefCell, ptr};
 
-use embassy_usb::Builder;
 use embassy_usb::control::{InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::{Direction, Driver, Endpoint, EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::types::InterfaceNumber;
+use embassy_usb::Builder;
 use embassy_usb::Handler;
 use embedded_sdmmc::{Block, BlockDevice, BlockIdx};
 
@@ -56,7 +56,7 @@ const ASC_INVALID_FIELD: u8 = 0x24;
 /// Blocks moved by one SD multi-block command and held by one cache line.
 const LINE_BLOCKS: usize = 8;
 /// LRU lines for small, repeated reads (FAT, directories, boot sector).
-const CACHE_LINES: usize = 3;
+const CACHE_LINES: usize = 2;
 /// Index of the extra line used for large sequential transfers, so they do not
 /// evict the metadata cached in the LRU lines.
 const STREAM_LINE: usize = CACHE_LINES;
@@ -282,7 +282,7 @@ impl BlockCache {
     }
 }
 
-/// 16 KiB of internal SRAM, kept out of the 150 KiB heap shared with Wi-Fi and
+/// 12 KiB of internal SRAM, kept out of the 150 KiB heap shared with Wi-Fi and
 /// Slint. `MscClass` is created once, so the cache has exactly one owner.
 static mut CACHE: core::mem::MaybeUninit<BlockCache> = core::mem::MaybeUninit::zeroed();
 
@@ -293,7 +293,10 @@ async fn write_packets<E: EndpointIn>(endpoint: &mut E, data: &[u8]) -> Result<(
     Ok(())
 }
 
-async fn read_packets<E: EndpointOut>(endpoint: &mut E, data: &mut [u8]) -> Result<(), EndpointError> {
+async fn read_packets<E: EndpointOut>(
+    endpoint: &mut E,
+    data: &mut [u8],
+) -> Result<(), EndpointError> {
     for chunk in data.chunks_mut(BULK_PACKET_SIZE as usize) {
         let count = endpoint.read(chunk).await?;
         if count != chunk.len() {
@@ -324,7 +327,11 @@ impl Handler for ControlHandler {
         self.shared.borrow_mut().configured = configured;
     }
 
-    fn control_in<'a>(&'a mut self, request: Request, buffer: &'a mut [u8]) -> Option<InResponse<'a>> {
+    fn control_in<'a>(
+        &'a mut self,
+        request: Request,
+        buffer: &'a mut [u8],
+    ) -> Option<InResponse<'a>> {
         if request.request_type != RequestType::Class
             || request.recipient != Recipient::Interface
             || request.index != self.interface.0 as u16
@@ -372,7 +379,9 @@ struct Cbw {
 
 impl Cbw {
     fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != CBW_LEN || u32::from_le_bytes(bytes[0..4].try_into().ok()?) != CBW_SIGNATURE {
+        if bytes.len() != CBW_LEN
+            || u32::from_le_bytes(bytes[0..4].try_into().ok()?) != CBW_SIGNATURE
+        {
             return None;
         }
         let command_len = bytes[14] & 0x1f;
@@ -597,7 +606,10 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
         }
 
         match page {
-            0x00 => self.send_data(cbw, &[0x00, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83]).await,
+            0x00 => {
+                self.send_data(cbw, &[0x00, 0x00, 0x00, 0x03, 0x00, 0x80, 0x83])
+                    .await
+            }
             0x80 => {
                 let mut response = [0_u8; 16];
                 response[..4].copy_from_slice(&[0x00, 0x80, 0x00, 12]);
@@ -701,10 +713,14 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
                     let backend = self.shared.borrow().backend;
                     let line = &mut self.cache.lines[index];
                     line.valid = false;
-                    if !unsafe { (backend.read)(backend.context, start, &mut line.data[..len as usize]) } {
-                        self.shared
-                            .borrow_mut()
-                            .set_sense(SENSE_MEDIUM_ERROR, ASC_UNRECOVERED_READ, 0);
+                    if !unsafe {
+                        (backend.read)(backend.context, start, &mut line.data[..len as usize])
+                    } {
+                        self.shared.borrow_mut().set_sense(
+                            SENSE_MEDIUM_ERROR,
+                            ASC_UNRECOVERED_READ,
+                            0,
+                        );
                         return (residue, CommandStatus::Failed);
                     }
                     line.valid = true;
@@ -721,7 +737,10 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             let last = ((end - line.start) as usize).min(line.len as usize);
             let next = line.start + last as u32;
             for block in &line.data[first..last] {
-                if write_packets(&mut self.endpoint_in, &block.contents).await.is_err() {
+                if write_packets(&mut self.endpoint_in, &block.contents)
+                    .await
+                    .is_err()
+                {
                     return (residue, CommandStatus::PhaseError);
                 }
                 residue -= Block::LEN as u32;
@@ -771,14 +790,21 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             let line = &mut self.cache.lines[STREAM_LINE];
             line.valid = false;
             for block in &mut line.data[..count] {
-                if read_packets(&mut self.endpoint_out, &mut block.contents).await.is_err() {
+                if read_packets(&mut self.endpoint_out, &mut block.contents)
+                    .await
+                    .is_err()
+                {
                     return (residue, CommandStatus::PhaseError);
                 }
             }
 
             let backend = self.shared.borrow().backend;
             let written = unsafe {
-                (backend.write)(backend.context, current, &self.cache.lines[STREAM_LINE].data[..count])
+                (backend.write)(
+                    backend.context,
+                    current,
+                    &self.cache.lines[STREAM_LINE].data[..count],
+                )
             };
             if !written {
                 self.shared
@@ -806,7 +832,10 @@ impl<'d, D: Driver<'d>> MscClass<'d, D> {
             return (cbw.transfer_len, CommandStatus::PhaseError);
         }
         let count = data.len().min(cbw.transfer_len as usize);
-        if write_packets(&mut self.endpoint_in, &data[..count]).await.is_err() {
+        if write_packets(&mut self.endpoint_in, &data[..count])
+            .await
+            .is_err()
+        {
             return (cbw.transfer_len, CommandStatus::PhaseError);
         }
         if count < cbw.transfer_len as usize && count % BULK_PACKET_SIZE as usize == 0 {
