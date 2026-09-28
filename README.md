@@ -126,9 +126,14 @@ auth = "wpa2"
 ```
 
 The file can hold up to 12 networks. After the splash screen, the firmware tries
-saved networks from newest to oldest, then waits 60 seconds before another pass.
-If the link drops, it retries after 5 seconds. It does not interrupt Wi-Fi editors,
-USB DISK, or FTP, and it does not rewrite the card on an automatic reconnect.
+saved networks in the background, newest-first, for at most three full passes
+(5 seconds between failed networks, 60 seconds between passes). On link loss,
+it starts a fresh three-pass cycle after 5 seconds. If none succeeds, it stays
+offline until manual connection or reboot. Automatic association has no
+full-screen overlay and does not block input or rendering. It only starts on
+menu/rat/about screens, but continues in the background if you navigate away.
+A manual Wi-Fi action takes priority after the in-flight attempt finishes.
+Automatic connections do not rewrite the card.
 You can still select a saved network manually or use **SCAN NETWORKS** to add one
 after a successful connection. Only scan-visible SSIDs are supported.
 Passwords are plain text on the removable card; TOML is a portable configuration

@@ -1,6 +1,7 @@
 use alloc::{string::String, vec::Vec};
 
 use embassy_futures::block_on;
+use embassy_time::{with_timeout, Duration as EmbassyDuration};
 use esp_hal::time::Duration;
 use esp_radio::wifi::{
     scan::{ScanConfig, ScanTypeConfig},
@@ -9,11 +10,14 @@ use esp_radio::wifi::{
     Ssid, WifiController, WifiError,
 };
 
-use crate::storage::AuthKind;
+use crate::storage::{AuthKind, SavedNetwork};
 
 const MAX_SCAN_RESULTS: usize = 8;
 pub const SCAN_PASSES: usize = 2;
 pub const CONNECT_ATTEMPTS: usize = 3;
+const CONNECT_TIMEOUT: EmbassyDuration = EmbassyDuration::from_secs(12);
+const DISCONNECT_TIMEOUT: EmbassyDuration = EmbassyDuration::from_secs(3);
+const SCAN_TIMEOUT: EmbassyDuration = EmbassyDuration::from_secs(8);
 
 #[derive(Clone, Debug)]
 pub struct ScanNetwork {
@@ -66,29 +70,49 @@ impl<'d> WifiManager<'d> {
                 min: Duration::from_millis(50),
                 max: Duration::from_millis(250),
             });
-        block_on(self.controller.scan_async(&config)).map(|results| {
-            results
-                .into_iter()
-                .filter_map(|access_point| {
-                    let ssid = access_point.ssid.as_str();
-                    if ssid.is_empty() {
-                        return None;
-                    }
-                    let (auth, supported) = map_scanned_auth(access_point.auth_method);
-                    Some(ScanNetwork {
-                        ssid: String::from(ssid),
-                        signal_strength: access_point.signal_strength,
-                        auth,
-                        supported,
-                    })
+        // The driver normally posts ScanDone within a few seconds. If it
+        // doesn't (for example after repeated failed associations), never
+        // leave the entire UI stuck inside block_on indefinitely.
+        let results = match block_on(with_timeout(
+            SCAN_TIMEOUT,
+            self.controller.scan_async(&config),
+        )) {
+            Ok(result) => result?,
+            Err(_) => {
+                log::warn!("Wi-Fi scan timed out");
+                return Err(WifiError::Other);
+            }
+        };
+        Ok(results
+            .into_iter()
+            .filter_map(|access_point| {
+                let ssid = access_point.ssid.as_str();
+                if ssid.is_empty() {
+                    return None;
+                }
+                let (auth, supported) = map_scanned_auth(access_point.auth_method);
+                Some(ScanNetwork {
+                    ssid: String::from(ssid),
+                    signal_strength: access_point.signal_strength,
+                    auth,
+                    supported,
                 })
-                .collect()
-        })
+            })
+            .collect())
     }
 
     /// Apply station credentials once. Association itself is done via repeated
     /// [`connect_attempt`] calls so the UI can report attempt progress.
     pub fn configure(
+        &mut self,
+        ssid: &str,
+        password: &str,
+        auth: AuthKind,
+    ) -> Result<(), ConnectError> {
+        block_on(self.configure_async(ssid, password, auth))
+    }
+
+    async fn configure_async(
         &mut self,
         ssid: &str,
         password: &str,
@@ -108,21 +132,48 @@ impl<'d> WifiManager<'d> {
             .with_ssid(ssid)
             .with_authentication(authentication);
 
-        let _ = block_on(self.controller.disconnect_async());
+        let _ = with_timeout(DISCONNECT_TIMEOUT, self.controller.disconnect_async()).await;
         self.controller.set_config(&Config::Station(station))?;
         Ok(())
     }
 
     /// Single association attempt. Flaky on busy channels, so callers retry it.
     pub fn connect_attempt(&mut self) -> Result<(), ConnectError> {
-        match block_on(self.controller.connect_async()) {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                log::warn!("Wi-Fi connect attempt failed: {error:?}");
-                let _ = block_on(self.controller.disconnect_async());
-                Err(ConnectError::from(error))
+        block_on(self.connect_attempt_async())
+    }
+
+    async fn connect_attempt_async(&mut self) -> Result<(), ConnectError> {
+        match with_timeout(CONNECT_TIMEOUT, self.controller.connect_async()).await {
+            Ok(Ok(_)) => Ok(()),
+            result => {
+                log::warn!("Wi-Fi connect attempt failed or timed out: {result:?}");
+                let _ = with_timeout(DISCONNECT_TIMEOUT, self.controller.disconnect_async()).await;
+                match result {
+                    Ok(Err(error)) => Err(ConnectError::from(error)),
+                    _ => Err(ConnectError::Connection),
+                }
             }
         }
+    }
+
+    /// Own the radio for the whole automatic job; returning it on both success
+    /// and failure lets the main loop poll this future without self-borrows.
+    pub async fn connect_automatically(
+        mut self,
+        network: SavedNetwork,
+    ) -> (Self, Result<(), ConnectError>) {
+        let mut result = self
+            .configure_async(&network.ssid, &network.password, network.auth)
+            .await;
+        if result.is_ok() {
+            for _ in 0..CONNECT_ATTEMPTS {
+                result = self.connect_attempt_async().await;
+                if result.is_ok() {
+                    break;
+                }
+            }
+        }
+        (self, result)
     }
 }
 

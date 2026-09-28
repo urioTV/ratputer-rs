@@ -15,6 +15,9 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 
 use embedded_graphics::pixelcolor::raw::RawU16;
 use embedded_graphics::pixelcolor::Rgb565;
@@ -75,21 +78,26 @@ const BATTERY_EVERY_MS: u64 = 5000;
 const SNTP_RESYNC_SECS: u64 = 3600;
 const SNTP_RETRY_SECS: u64 = 30;
 const AUTO_CONNECT_AFTER_SPLASH_MS: u64 = 500;
-const AUTO_RECONNECT_AFTER_DROP_SECS: u64 = 5;
 const AUTO_NEXT_NETWORK_SECS: u64 = 5;
 const AUTO_RETRY_CYCLE_SECS: u64 = 60;
+const AUTO_RECONNECT_AFTER_DROP_SECS: u64 = 5;
+const MAX_AUTO_PASSES: u8 = 3;
 // Glyph budget of the top-bar SSID field (120 px / 8 px per glyph).
 const TOP_BAR_SSID_CHARS: usize = 15;
 
-fn retry_saved_network(index: &mut usize, due: &mut Option<Instant>, count: usize) {
+fn retry_saved_network(index: &mut usize, pass: &mut u8, due: &mut Option<Instant>, count: usize) {
     if count == 0 {
         *due = None;
     } else if *index > 0 {
         *index -= 1;
         *due = Some(Instant::now() + Duration::from_secs(AUTO_NEXT_NETWORK_SECS));
-    } else {
+    } else if *pass < MAX_AUTO_PASSES {
+        *pass += 1;
         *index = count - 1;
         *due = Some(Instant::now() + Duration::from_secs(AUTO_RETRY_CYCLE_SECS));
+    } else {
+        // Do not keep retrying forever when the access point is absent.
+        *due = None;
     }
 }
 
@@ -310,8 +318,16 @@ enum RadioStep {
     Connect {
         network: SavedNetwork,
         attempt: usize,
-        automatic: bool,
     },
+}
+
+// The future owns the controller while connecting, then returns it. This
+// avoids self-referential borrows and lets the no-executor main loop poll it
+// once per pass without blocking input, USB, networking or rendering.
+struct AutoConnectJob {
+    ssid: String,
+    future:
+        Pin<Box<dyn Future<Output = (wifi::WifiManager<'static>, Result<(), wifi::ConnectError>)>>>,
 }
 
 fn busy_status(step: &RadioStep, frame_idx: u32) -> String {
@@ -330,7 +346,6 @@ fn begin_connect(
     ui: &MainWindow,
     network: SavedNetwork,
     frame_idx: u32,
-    automatic: bool,
 ) -> Option<RadioStep> {
     match wifi
         .as_mut()
@@ -341,7 +356,6 @@ fn begin_connect(
             let step = RadioStep::Connect {
                 network,
                 attempt: 1,
-                automatic,
             };
             ui.set_wifi_status(busy_status(&step, frame_idx).into());
             ui.set_wifi_connecting(true);
@@ -544,9 +558,12 @@ fn main() -> ! {
     let splash_start = Instant::now();
     let mut last_switch = splash_start;
     let mut radio_pending: Option<RadioStep> = None;
-    // Try the most recently saved network first; older entries are fallbacks.
-    // A full failed pass is throttled so stale credentials do not freeze the UI.
+    // At most three full saved-network passes per boot or link-loss episode.
+    // The automatic job is polled once per loop; no blocking radio call runs
+    // from the main loop while it owns the controller.
     let mut auto_next_index = wifi_config.networks.len().saturating_sub(1);
+    let mut auto_pass: u8 = 1;
+    let mut auto_job: Option<AutoConnectJob> = None;
     let mut auto_connect_at = (wifi.is_some() && !wifi_config.networks.is_empty()).then_some(
         splash_start + Duration::from_millis(SPLASH_AFTER_MS + AUTO_CONNECT_AFTER_SPLASH_MS),
     );
@@ -627,6 +644,7 @@ fn main() -> ! {
                     let radio = match radio_pending.as_ref() {
                         Some(RadioStep::Scan { .. }) => "scan",
                         Some(RadioStep::Connect { .. }) => "connect",
+                        None if auto_job.is_some() => "auto_connect",
                         None => "idle",
                     };
                     let wifi_status = ui.get_wifi_status();
@@ -949,31 +967,22 @@ fn main() -> ! {
                         }
                     }
                 }
-                RadioStep::Connect {
-                    network,
-                    attempt,
-                    automatic,
-                } => {
+                RadioStep::Connect { network, attempt } => {
                     match wifi.as_mut().map(|manager| manager.connect_attempt()) {
                         Some(Ok(())) => {
                             let ssid = network.ssid.clone();
                             ui.set_link_ssid(truncate_ascii(&ssid, TOP_BAR_SSID_CHARS).into());
-                            // Auto-reconnect uses credentials already on SD. Do not
-                            // rewrite WIFI.CFG on every boot or after a link drop.
-                            if !automatic {
-                                wifi_config.upsert(network);
-                                ui.set_saved_networks(saved_network_model(&wifi_config));
-                            }
+                            wifi_config.upsert(network);
+                            ui.set_saved_networks(saved_network_model(&wifi_config));
                             auto_next_index = wifi_config
                                 .networks
                                 .iter()
                                 .position(|entry| entry.ssid == ssid)
                                 .unwrap_or_else(|| wifi_config.networks.len().saturating_sub(1));
                             auto_connect_at = None;
-                            let save_failed = !automatic
-                                && storage.as_ref().is_none_or(|manager| {
-                                    storage::save(manager, &wifi_config).is_err()
-                                });
+                            let save_failed = storage.as_ref().is_none_or(|manager| {
+                                storage::save(manager, &wifi_config).is_err()
+                            });
                             ui.set_wifi_status(if save_failed {
                                 "CONNECTED - SD SAVE FAILED".into()
                             } else {
@@ -990,23 +999,11 @@ fn main() -> ! {
                             Some(RadioStep::Connect {
                                 network,
                                 attempt: attempt + 1,
-                                automatic,
                             })
                         }
                         Some(Err(_)) => {
                             ui.set_wifi_connecting(false);
                             ui.set_wifi_status("CONNECTION FAILED".into());
-                            if automatic {
-                                retry_saved_network(
-                                    &mut auto_next_index,
-                                    &mut auto_connect_at,
-                                    wifi_config.networks.len(),
-                                );
-                            } else if !wifi_config.networks.is_empty() {
-                                auto_connect_at = Some(
-                                    Instant::now() + Duration::from_secs(AUTO_RETRY_CYCLE_SECS),
-                                );
-                            }
                             None
                         }
                         None => {
@@ -1020,10 +1017,62 @@ fn main() -> ! {
             };
         }
 
-        // Slint commands only SCHEDULE radio work. Each step runs below, one per
-        // loop iteration, so the status/spinner keeps rendering between them.
+        // Poll the automatic radio future once per iteration. Its event
+        // subscriber wakes from esp-rtos; repeated main-loop polling works
+        // without an executor or a self-referential controller borrow.
+        let finished = auto_job.as_mut().and_then(|job| {
+            let mut context = Context::from_waker(Waker::noop());
+            match job.future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            }
+        });
+        if let Some((manager, result)) = finished {
+            let ssid = auto_job.take().unwrap().ssid;
+            wifi = Some(manager);
+            match result {
+                Ok(()) => {
+                    log::info!("Auto-connected to saved network {ssid}");
+                    ui.set_link_ssid(truncate_ascii(&ssid, TOP_BAR_SSID_CHARS).into());
+                    ui.set_wifi_status(format!("CONNECTED: {}", display_ssid(&ssid)).into());
+                    auto_connect_at = None;
+                    auto_pass = 1;
+                }
+                Err(error) => {
+                    log::warn!("Auto-connect to {ssid} failed: {error:?}");
+                    ui.set_wifi_status("AUTO CONNECT FAILED".into());
+                    retry_saved_network(
+                        &mut auto_next_index,
+                        &mut auto_pass,
+                        &mut auto_connect_at,
+                        wifi_config.networks.len(),
+                    );
+                }
+            }
+        }
+
+        // Manual Wi-Fi commands retain the existing blocking behavior. While
+        // the automatic future owns the radio, keep a requested action queued
+        // until it completes; users can still navigate every other screen.
         let wifi_action = ui.get_wifi_action();
-        if wifi_action != 0 {
+        if wifi_action != 0 && auto_job.is_some() {
+            auto_connect_at = None;
+            let view = ui.get_view_state();
+            if !matches!(
+                (wifi_action, view),
+                (1, 4) | (2, 3) | (3, 4) | (4, 5) | (5, 3)
+            ) {
+                ui.set_wifi_action(0);
+                ui.set_wifi_connecting(false);
+            } else {
+                ui.set_wifi_connecting(false);
+                if ui.get_wifi_status().as_str() != "WAIT FOR RADIO" {
+                    ui.set_wifi_status("WAIT FOR RADIO".into());
+                }
+            }
+        } else if wifi_action != 0 {
+            // Manual Wi-Fi input takes precedence over any later auto pass.
+            auto_connect_at = None;
             ui.set_wifi_action(0);
             ui.set_wifi_connecting(false);
             match wifi_action {
@@ -1044,7 +1093,7 @@ fn main() -> ! {
                     let index = ui.get_wifi_action_index() as usize;
                     if let Some(network) = wifi_config.networks.get(index).cloned() {
                         auto_connect_at = None;
-                        radio_pending = begin_connect(&mut wifi, &ui, network, frame_idx, false);
+                        radio_pending = begin_connect(&mut wifi, &ui, network, frame_idx);
                     }
                 }
                 3 if radio_pending.is_none() => {
@@ -1062,7 +1111,6 @@ fn main() -> ! {
                                     auth: network.auth,
                                 },
                                 frame_idx,
-                                false,
                             );
                         } else {
                             ui.set_wifi_selected_ssid(network.ssid.into());
@@ -1089,7 +1137,6 @@ fn main() -> ! {
                                 auth: network.auth,
                             },
                             frame_idx,
-                            false,
                         );
                     }
                 }
@@ -1116,10 +1163,10 @@ fn main() -> ! {
             }
         }
 
-        // Automatic association is scheduled only after user actions, and only on
-        // screens that are not editing credentials or serving USB/FTP. Like manual
-        // connects, it runs in a later iteration so the spinner is drawn first.
+        // Start one owned future only on non-editing screens. Once started it
+        // continues to be polled on every screen without blocking the UI.
         if radio_pending.is_none()
+            && auto_job.is_none()
             && wifi_action == 0
             && !network.as_ref().is_some_and(|network| network.is_link_up())
             && auto_connect_at.is_some_and(|due| Instant::now() >= due)
@@ -1127,16 +1174,23 @@ fn main() -> ! {
             && usb_sd.is_none()
         {
             if let Some(saved) = wifi_config.networks.get(auto_next_index).cloned() {
-                log::info!("Auto-connecting to saved network {}", saved.ssid);
-                radio_pending = begin_connect(&mut wifi, &ui, saved, frame_idx, true);
-                if radio_pending.is_some() {
-                    auto_connect_at = None;
-                } else {
-                    retry_saved_network(
-                        &mut auto_next_index,
-                        &mut auto_connect_at,
-                        wifi_config.networks.len(),
+                if let Some(manager) = wifi.take() {
+                    log::info!(
+                        "Auto-connecting (pass {auto_pass}/{MAX_AUTO_PASSES}) to {}",
+                        saved.ssid
                     );
+                    let ssid = saved.ssid.clone();
+                    auto_job = Some(AutoConnectJob {
+                        ssid,
+                        future: Box::pin(manager.connect_automatically(saved)),
+                    });
+                    auto_connect_at = None;
+                    ui.set_wifi_connecting(false);
+                    ui.set_wifi_status(
+                        format!("AUTO CONNECT {auto_pass}/{MAX_AUTO_PASSES}").into(),
+                    );
+                } else {
+                    auto_connect_at = None;
                 }
             } else {
                 auto_connect_at = None;
@@ -1210,12 +1264,6 @@ fn main() -> ! {
                         ui.set_saved_index(0);
                         if reload_ok && !wifi_config.networks.is_empty() && wifi.is_some() {
                             auto_next_index = wifi_config.networks.len() - 1;
-                            if !network.as_ref().is_some_and(|network| network.is_link_up()) {
-                                auto_connect_at = Some(
-                                    Instant::now()
-                                        + Duration::from_secs(AUTO_RECONNECT_AFTER_DROP_SECS),
-                                );
-                            }
                         } else if wifi_config.networks.is_empty() {
                             auto_connect_at = None;
                         }
@@ -1372,10 +1420,12 @@ fn main() -> ! {
                 // Fresh association: sync as soon as DHCP completes.
                 next_sntp_at = now;
             } else if !link_up && link_was_up && radio_pending.is_none() {
-                // The clock keeps running from the last sync; only the status changes.
+                // Fresh link loss starts a new, bounded three-pass background
+                // reconnect cycle. The clock keeps running from its last sync.
                 ui.set_wifi_status("CONNECTION LOST".into());
                 if !wifi_config.networks.is_empty() {
-                    auto_next_index = auto_next_index.min(wifi_config.networks.len() - 1);
+                    auto_next_index = wifi_config.networks.len() - 1;
+                    auto_pass = 1;
                     auto_connect_at =
                         Some(Instant::now() + Duration::from_secs(AUTO_RECONNECT_AFTER_DROP_SECS));
                 }
@@ -1389,6 +1439,7 @@ fn main() -> ! {
 
         // --- Top bar: Wi-Fi link, clock, battery ---
         let link_state = match (&radio_pending, network.as_ref()) {
+            _ if auto_job.is_some() => 1,
             (Some(RadioStep::Connect { .. }), _) => 1,
             (_, Some(network)) if network.is_online() => 3,
             (_, Some(network)) if network.is_link_up() => 2,
