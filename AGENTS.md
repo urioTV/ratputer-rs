@@ -75,6 +75,20 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 
 - Call `esp_alloc::heap_allocator!(size: 150 * 1024);` **inside `main()`** (esp-alloc
   0.11 macro is a statement, not a global item) BEFORE the first `Box`/`Rc`.
+- A second region, `heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024)`,
+  uses the ESP-IDF 2nd-stage bootloader's RAM (`dram2_seg`, 72 KiB,
+  0x3FCDB700..0x3FCED710; the stack ends exactly at its start). It requires the
+  esp-idf bootloader (enabled through `esp-bootloader-esp-idf`). Verify with
+  `objdump -h`: `.dram2_uninit` = 0x10000 at 0x3fcdb700. Do not put other data
+  into `dram2_uninit` without shrinking this region.
+- Why it exists (measured on hardware): the first visit to the Wi-Fi menu
+  PERMANENTLY allocates ~20 KiB (40.6 -> 20.1 KiB free, unchanged after going
+  back to the menu). The scan view then had ~19 KiB of fragmented heap; with five
+  networks, `Vec<SceneTexture>::push` in the Slint software renderer failed a
+  7168-byte allocation during a scan (OOM panic, previously a frozen device).
+  The scene holds roughly one entry per visible glyph of the dirty region, so a
+  full redraw of a text-heavy view needs one large contiguous block. After the
+  change: ~88 KiB free in the scan view, ~76 KiB minimum over 5 scans.
 - `MinimalSoftwareWindow::new(RepaintBufferType::ReusedBuffer)` + `render_by_line` +
   a `[Rgb565Pixel; 240]` line buffer — only one line of frame data lives in RAM;
   mipidsi streams it via `Display::set_pixels()`.

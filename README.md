@@ -259,6 +259,12 @@ so the firmware uses a 50–250 ms dwell and merges **two scan passes** (status:
 
 - Heap 150 KB in **internal SRAM** (`esp_alloc::heap_allocator!(size: 150*1024);`
   **called inside `main()` before any Box/Rc**); rest of the memory is `.bss`/stack;
+- A second 64 KiB heap region lives in the RAM the ESP-IDF 2nd-stage bootloader
+  ran from (`#[ram(reclaimed)]`, `dram2_seg` 0x3FCDB700..0x3FCED710). The
+  application never used that RAM. Without it the first visit to the Wi-Fi views
+  permanently took ~20 KiB, leaving ~19 KiB of fragmented heap, and a scan that
+  found five networks panicked when the renderer's scene `Vec` could not get a
+  contiguous 7 KiB block. With it, the scan view keeps ~76 KiB free;
 - No persistent framebuffer — Slint in `ReusedBuffer` mode only holds **one raster
   line** (240 Rgb565 ≈ 480 B) and pushes it via `LineBufferProvider` →
   `mipidsi::Display::set_pixels(...)`;

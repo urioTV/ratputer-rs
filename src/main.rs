@@ -66,6 +66,12 @@ slint::include_modules!();
 // Heap in internal SRAM — ADV = Stamp-S3A (ESP32-S3FN8) has no PSRAM.
 // 512 KB SRAM total; MUST be called in main() before the first Box/Rc (Slint needs alloc).
 const HEAP_SIZE: usize = 150 * 1024;
+// Second heap region in the RAM the ESP-IDF 2nd-stage bootloader ran from
+// (dram2_seg, 0x3FCDB700..0x3FCED710 = 72 KiB). The application never used it:
+// the stack ends exactly where it starts. Without it the Wi-Fi views left
+// ~19 KiB of fragmented heap and the renderer's scene Vec failed a 7 KiB
+// allocation during a scan (OOM panic).
+const RECLAIMED_HEAP_SIZE: usize = 64 * 1024;
 
 const LCD_WIDTH: usize = 240;
 const LCD_HEIGHT: usize = 135;
@@ -377,6 +383,7 @@ fn begin_connect(
 #[esp_hal::main]
 fn main() -> ! {
     esp_alloc::heap_allocator!(size: HEAP_SIZE);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: RECLAIMED_HEAP_SIZE);
 
     esp_println::logger::init_logger_from_env();
     log::info!("RATPUTER (Slint) start");
