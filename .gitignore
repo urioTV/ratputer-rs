@@ -1,5 +1,6 @@
 # --- Rust / Cargo ---
 /target
+/tools/sftp-test/target/
 
 # --- Firmware artifacts & local toolchain shims ---
 ratputer-adv.bin

@@ -29,7 +29,8 @@ for patch in \
     0001-bounded-directory-window.patch \
     0002-resumable-append-cursor.patch \
     0003-resumable-read-cursor.patch \
-    0004-bounded-cluster-zeroing.patch; do
+    0004-bounded-cluster-zeroing.patch \
+    0005-random-write-preserves-tail.patch; do
     [[ -f "$patch_dir/$patch" ]] || {
         echo "error: missing patch: $patch_dir/$patch" >&2
         exit 1

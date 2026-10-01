@@ -748,6 +748,12 @@ where
         self.fat.fat_type()
     }
 
+    /// RATPUTER PATCH: size of one allocation unit in bytes, for statvfs.
+    #[cfg(feature = "alloc")]
+    pub fn cluster_size(&self) -> usize {
+        self.info.cluster_size
+    }
+
     /// Get volume metadata from the boot sector.
     ///
     /// This includes the OEM name, volume serial number, volume label,

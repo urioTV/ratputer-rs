@@ -1,0 +1,11 @@
+[package]
+name = "ratputer-sftp-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+hadris-fat = { path = "../../vendor/hadris-fat", default-features = false, features = ["std", "sync", "read", "write", "lfn"] }
+log = "0.4"

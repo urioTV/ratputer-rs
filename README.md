@@ -217,14 +217,31 @@ SFTP (protocol version 3, what every common client speaks) supports
 listing, `stat`, download with random access, upload, resume (`reput`),
 append, `mkdir`, `rmdir` (empty directories), `rm`, and `rename` (refuses to
 overwrite an existing target, as SFTP v3 requires). Long VFAT names, spaces and
-UTF-8 work. FAT has no Unix metadata, so `chmod`/owner/time changes are
-accepted and ignored; changing a file's size via `setstat`, writing anywhere
-except the current end of a file, and symlinks are refused with an explicit
-error. Modification times are reported in UTC (converted from the FAT local
-time with the configured offset and DST rule).
+UTF-8 work. Writes can target any offset and preserve untouched bytes; gaps and
+file growth are zero-filled in 8 KiB steps so the UI keeps running. SETSTAT and
+FSETSTAT support both shrinking and growing files (up to FAT's 4 GiB minus one
+byte limit). OPEN with TRUNC empties the existing file without deleting it.
 
-Measured on hardware over Wi-Fi: about **180 KiB/s download** and **130 KiB/s
-upload**, contents SHA-256 verified with OpenSSH `sftp`/`scp` and Paramiko. The
+Modification times can be preserved by `put -p`, `scp -p`, WinSCP or `utime`.
+UTC is converted to/from FAT local time using the configured offset/DST rule.
+FAT keeps modification times at 2-second resolution and access dates at 1-day
+resolution; dates outside 1980–2107 are rejected. `chmod` maps write bits to the
+FAT READ_ONLY attribute; writable files report 0644, read-only files 0444.
+It does not store Unix execute bits, UID/GID or symlinks; ownership and link
+requests are explicitly rejected rather than silently accepted.
+
+OpenSSH extensions: `fsync@openssh.com`, `statvfs@openssh.com`,
+`fstatvfs@openssh.com` and `limits@openssh.com`. Free-space reporting uses the
+FAT32 FSInfo count and fails explicitly if it is unknown (no blocking full-card
+scan or invented free-space value). Atomic replace-rename is not advertised:
+deleting an existing destination before renaming the source could lose the
+destination if the second operation fails. Ordinary v3 rename refuses an
+existing destination and leaves both files intact.
+
+Measured on hardware over Wi-Fi: about **180 KiB/s download** and **120–130 KiB/s
+upload** with OpenSSH, contents verified with `sftp`/`scp` and Paramiko.
+WinSCP scripting also passes upload/download with preserved timestamps and
+read-only attribute changes (about 48/62 KiB/s on that client). The
 UI stays responsive during transfers (console `PING` within ~0.1 s). An
 interrupted upload leaves a valid partial file (whole 8 KiB chunks); the
 server returns to listening while the screen stays open. Leaving the screen

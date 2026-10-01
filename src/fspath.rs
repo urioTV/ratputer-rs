@@ -91,10 +91,14 @@ pub fn unpack_fat(dt: FatDateTime) -> (u16, u8, u8, u8, u8) {
 pub fn long_listing_line(entry: &FileEntry) -> String {
     let name = entry.name();
     let (year, month, day, hour, minute) = unpack_fat(entry.modified());
-    let permissions = if entry.is_directory() {
-        "drwxr-xr-x"
-    } else {
-        "-rw-r--r--"
+    let readonly = entry
+        .attributes()
+        .contains(hadris_fat::raw::DirEntryAttrFlags::READ_ONLY);
+    let permissions = match (entry.is_directory(), readonly) {
+        (true, true) => "dr-xr-xr-x",
+        (true, false) => "drwxr-xr-x",
+        (false, true) => "-r--r--r--",
+        (false, false) => "-rw-r--r--",
     };
     let month_name = MONTHS[(month as usize).saturating_sub(1).min(11)];
     let current_year = now_ymdhms();

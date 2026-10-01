@@ -53,8 +53,11 @@ pub struct FileWriter<'a, DATA: Read + Write + Seek> {
     current_cluster: Option<Cluster<usize>>,
     /// Offset within the current cluster
     offset_in_cluster: usize,
-    /// Total bytes written so far
+    /// Total bytes written so far (the current position).
     total_written: usize,
+    /// RATPUTER PATCH: random writes must preserve the untouched file tail.
+    /// Zero for the ordinary replacement/append constructors.
+    preserve_len: usize,
     /// First cluster allocated by this writer beyond the entry's committed chain.
     first_allocated_cluster: Option<Cluster<usize>>,
     /// Committed chain tail that precedes `first_allocated_cluster`.
@@ -144,6 +147,7 @@ impl<'a, DATA: Read + Write + Seek> FileWriter<'a, DATA> {
             current_cluster: first_cluster,
             offset_in_cluster: 0,
             total_written: 0,
+            preserve_len: 0,
             first_allocated_cluster: None,
             allocation_predecessor: None,
             allocation_start_offset: 0,
@@ -192,6 +196,7 @@ entry_created: entry.created,
                 current_cluster: first_cluster,
                 offset_in_cluster: 0,
                 total_written: 0,
+                preserve_len: 0,
                 first_allocated_cluster: None,
                 allocation_predecessor: None,
                 allocation_start_offset: 0,
@@ -242,6 +247,7 @@ entry_created: entry.created,
             current_cluster: Some(current),
             offset_in_cluster: offset_in_last,
             total_written: file_size,
+            preserve_len: 0,
             first_allocated_cluster: None,
             allocation_predecessor: None,
             allocation_start_offset: 0,
@@ -309,6 +315,7 @@ entry_created: entry.created,
             current_cluster: cursor.current_cluster,
             offset_in_cluster: cursor.offset_in_cluster,
             total_written: cursor.total_written,
+            preserve_len: 0,
             first_allocated_cluster: None,
             allocation_predecessor: None,
             allocation_start_offset: 0,
@@ -323,6 +330,45 @@ entry_created: entry.created,
             pending_created: None,
             finished: false,
         })
+    }
+
+    /// RATPUTER PATCH: open at an existing byte offset without truncating the
+    /// untouched tail. The offset must be at or before EOF; callers extending
+    /// beyond EOF must first fill the gap with zeros. Chain traversal is bounded.
+    pub async fn new_at(fs: &'a FatVolume<DATA>, entry: &FileEntry, offset: u64) -> Result<Self> {
+        fs.revalidate_entry(entry).await?;
+        if offset > entry.len() || entry.len() > u32::MAX as u64 {
+            return Err(Error::InvalidPath);
+        }
+        let cluster_size = fs.info.cluster_size;
+        let steps = (offset as usize).saturating_sub(1) / cluster_size;
+        if steps > fs.fat.max_cluster() as usize {
+            return Err(Error::ClusterLoop { cluster: entry.cluster().0 as u32 });
+        }
+        let mut current = if entry.cluster().0 >= 2 {
+            Some(entry.cluster())
+        } else {
+            None
+        };
+        for _ in 0..steps {
+            let cluster = current.ok_or(Error::CorruptFilesystem {
+                context: "file size exceeds cluster chain",
+            })?;
+            let next = fs.next_cluster_routed(cluster.0).await?
+                .ok_or(Error::UnexpectedEndOfChain { cluster: cluster.0 as u32 })?;
+            current = Some(Cluster(next as usize));
+        }
+        if entry.len() > 0 && current.is_none() {
+            return Err(Error::CorruptFilesystem { context: "nonempty file has no cluster" });
+        }
+        let mut writer = Self::new(fs, entry)?;
+        writer.current_cluster = current;
+        writer.offset_in_cluster = if offset == 0 { 0 } else {
+            (offset as usize - 1) % cluster_size + 1
+        };
+        writer.total_written = offset as usize;
+        writer.preserve_len = entry.len() as usize;
+        Ok(writer)
     }
 
     /// Write data to the file.
@@ -537,15 +583,19 @@ entry_created: entry.created,
         // Release clusters the rewrite no longer needs and terminate the
         // chain at the last written cluster. Must run before the data lock
         // below — the routed helpers acquire their own locks.
-        if self.total_written == 0 {
+        // RATPUTER PATCH: a random write ending before the old EOF must not
+        // free the untouched tail or shrink the committed directory entry.
+        if self.total_written == 0 && self.preserve_len == 0 {
             if let Some(first) = self.first_cluster.take() {
                 let freed_count = self.fs.free_chain_routed(first.0 as u32).await?;
                 self.fs.increment_free_count(freed_count);
                 self.current_cluster = None;
             }
-        } else if let Some(last) = self.current_cluster {
-            let freed_count = self.fs.truncate_chain_routed(last.0 as u32).await?;
-            self.fs.increment_free_count(freed_count);
+        } else if self.total_written >= self.preserve_len {
+            if let Some(last) = self.current_cluster {
+                let freed_count = self.fs.truncate_chain_routed(last.0 as u32).await?;
+                self.fs.increment_free_count(freed_count);
+            }
         }
 
         {
@@ -572,7 +622,9 @@ entry_created: entry.created,
 
             // Update size
             file_entry.size =
-                hadris_common::types::number::U32::<LittleEndian>::new(self.total_written as u32);
+                hadris_common::types::number::U32::<LittleEndian>::new(
+                    self.total_written.max(self.preserve_len) as u32,
+                );
 
             // Update first cluster - for FAT12/16, only use low 16 bits
             if let Some(cluster) = self.first_cluster {

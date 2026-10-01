@@ -436,14 +436,31 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   ~88/78 KiB/s down/up; 8 KiB gives ~180/130. `stats.card_*_us` (logged at
   session end) showed the card at 55-60% of session time before the change.
 - Handles store paths + validated `ReadCursor`/`AppendCursor`, never FAT
-  handles. Writes must be at the current end of the file
-  (`offset == size`); OPEN with TRUNC deletes and recreates the entry
-  (a large file costs one ~0.5 s poll); resume walks the chain once via
-  `FileWriter::new_append`. A DATA reply that cannot deliver its declared
+  handles. Appends retain `AppendCursor`; random writes use the vendor's
+  `FileWriter::new_at` (patch 0005) and preserve the untouched tail.
+  Gaps and file growth fill one 8 KiB zero chunk per poll. OPEN with TRUNC
+  calls `truncate`, not delete/recreate. Re-find entries and invalidate all
+  matching open-handle cursors after resizing or writing through another handle. A DATA reply that cannot deliver its declared
   length is fatal for the session (the header is already sent).
-- SETSTAT/FSETSTAT accept permissions/times silently (clients' "preserve"
-  options) but refuse a size change. READLINK/SYMLINK/EXTENDED reply
-  OP_UNSUPPORTED; no extensions are advertised.
+- SETSTAT/FSETSTAT resize files and preserve modification/access timestamps.
+  Growth uses a pending ResizeJob; shrinking uses the library's truncate.
+  FAT mtime has 2-second resolution; atime is a date (1-day resolution).
+  chmod maps any Unix write bit to clearing READ_ONLY, no write bits to
+  setting it; other Unix permission bits have no FAT representation.
+  Reject UID/GID, symlinks, out-of-range timestamps and sizes above u32::MAX.
+  Validate metadata before data mutation. Read-only files reject writable
+  OPEN, WRITE, resize and REMOVE.
+- Advertise OpenSSH fsync, statvfs/fstatvfs and limits extensions. statvfs
+  reports FSInfo free counts and explicitly fails when they are unknown,
+  never scanning the whole FAT synchronously. Do not advertise atomic
+  posix-rename by implementing delete-target then rename: a failure would
+  lose the destination. Ordinary rename refuses existing targets.
+- Handle tokens carry per-slot generations; validate the entire token, not
+  just its low slot byte, or a closed handle aliases a reused slot.
+- Run `nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#dosfstools -c bash
+  tools/test-sftp.sh` for the actual SFTP parser and patched writer on
+  disposable FAT12/16/32 images, including 32 KiB clusters and fsck checks.
+  Host timers/storage types are shims; the SFTP, fspath and clock code is real.
 - Times: FAT local time -> UTC via `clock::unix_from_local` and the
   `[clock]` config. Paths are resolved from `/` with `fspath::resolve`
   (no trimming: SFTP names may start or end with spaces).

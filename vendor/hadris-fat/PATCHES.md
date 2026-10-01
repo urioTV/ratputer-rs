@@ -45,6 +45,16 @@ changes below, each marked `RATPUTER PATCH`.
    that cluster and rewrites `.`/`..` without freeing chains referenced by the
    stale bytes (they may belong to live files); `delete` then works normally.
 
+5. `FileWriter::new_at` positions a writer at an existing offset and retains
+   `preserve_len`. `finish()` must not shrink the size or free clusters beyond
+   a middle write: the ordinary replacement writer intentionally does both.
+   Offsets beyond EOF are rejected; SFTP first zero-fills the gap in bounded
+   chunks. Traversal validates the entry and rejects premature chain ends.
+   The existing constructors retain their replacement/append semantics.
+   `FatVolume::cluster_size()` exposes allocation geometry for statvfs.
+   Both sync and async APIs share these transformed sources. Verified through
+   the real SFTP parser on FAT12/16/32 images plus independent fsck.fat.
+
 ## Updating
 
 From the repository root, run the updater with the desired crates.io version:
@@ -54,7 +64,7 @@ From the repository root, run the updater with the desired crates.io version:
 ```
 
 The script downloads the official crate, verifies its crates.io SHA-256,
-removes upstream tests/examples, applies the four patches in order, records
+removes upstream tests/examples, applies the five patches in order, records
 its release commit in `UPSTREAM.toml`, then runs the release check and complete
 firmware build. It replaces the existing vendor only after download and patch
 validation and restores the previous tree if compilation fails.
@@ -62,4 +72,4 @@ validation and restores the previous tree if compilation fails.
 A patch conflict is intentional protection: inspect upstream before rebasing a
 patch, because the new release may have changed or superseded the local fix.
 After a successful update, review the vendor diff and `Cargo.lock`, run the host
-FAT image test plus `fsck.fat`, and finally repeat the FTP/USB hardware suite.
+FAT image test plus `fsck.fat`, and finally repeat the SFTP/USB hardware suite.

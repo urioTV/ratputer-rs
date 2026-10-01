@@ -17,10 +17,10 @@
 //! Open SFTP handles keep paths, offsets and the validated
 //! hadris-fat `ReadCursor`/`AppendCursor` instead.
 //!
-//! Limitations (FAT has no Unix metadata): writes must be sequential at the
-//! end of the file (what every client does for uploads and resumes);
-//! permissions and times in SETSTAT are accepted and ignored; truncation via
-//! SETSTAT, links and extensions are unsupported.
+//! Random writes preserve the untouched tail. Growth and gaps are zero-filled
+//! one chunk per poll. SETSTAT applies FAT timestamps and the read-only bit;
+//! full Unix ownership, symlinks and atomic replace-rename cannot be represented
+//! on FAT. OpenSSH fsync/statvfs/limits extensions are supported.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,8 +28,10 @@ use alloc::vec::Vec;
 use hadris_fat::sync::{
     read::{FileReader, ReadCursor},
     write::{AppendCursor, FileWriter},
-    FileEntry, SeekFrom,
+    FatVolumeWriteExt, FileEntry, SeekFrom,
 };
+
+use hadris_fat::{raw::DirEntryAttrFlags, time::FatDateTime};
 
 use crate::clock;
 use crate::fspath::{display, find_in, long_listing_line, open_dir_path, resolve};
@@ -59,11 +61,14 @@ const FXP_HANDLE: u8 = 102;
 const FXP_DATA: u8 = 103;
 const FXP_NAME: u8 = 104;
 const FXP_ATTRS: u8 = 105;
+const FXP_EXTENDED: u8 = 200;
+const FXP_EXTENDED_REPLY: u8 = 201;
 
 // Status codes.
 const FX_OK: u32 = 0;
 const FX_EOF: u32 = 1;
 const FX_NO_SUCH_FILE: u32 = 2;
+const FX_PERMISSION_DENIED: u32 = 3;
 const FX_FAILURE: u32 = 4;
 const FX_BAD_MESSAGE: u32 = 5;
 const FX_OP_UNSUPPORTED: u32 = 8;
@@ -71,6 +76,7 @@ const FX_OP_UNSUPPORTED: u32 = 8;
 // OPEN flags.
 const FXF_READ: u32 = 0x01;
 const FXF_WRITE: u32 = 0x02;
+const FXF_APPEND: u32 = 0x04;
 const FXF_CREAT: u32 = 0x08;
 const FXF_TRUNC: u32 = 0x10;
 const FXF_EXCL: u32 = 0x20;
@@ -125,7 +131,8 @@ struct FileHandle {
     leaf: String,
     readable: bool,
     writable: bool,
-    /// Committed size: the only offset a WRITE may target.
+    append_mode: bool,
+    /// Last observed committed size; revalidated against the entry on writes.
     size: u64,
     /// Validated tail position for the next WRITE (None before the first).
     append: Option<AppendCursor>,
@@ -156,8 +163,26 @@ struct WriteStream {
     id: u32,
     slot: usize,
     remaining: u32,
+    offset: u64,
     /// First error; the rest of the payload is discarded.
     failed: Option<Status>,
+}
+
+/// Attributes requested by OPEN, SETSTAT or FSETSTAT.
+#[derive(Clone, Default)]
+struct RequestedAttrs {
+    size: Option<u64>,
+    permissions: Option<u32>,
+    times: Option<(u32, u32)>,
+    owner: bool,
+}
+
+/// Zero-filled growth is incremental, never an unbounded main-loop operation.
+struct ResizeJob {
+    id: u32,
+    components: Vec<String>,
+    attrs: RequestedAttrs,
+    file: FileHandle,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -176,12 +201,14 @@ pub struct Sftp {
     out: Vec<u8>,
     read_stream: Option<ReadStream>,
     write_stream: Option<WriteStream>,
+    resize: Option<ResizeJob>,
     /// Bytes of an oversized request still to discard.
     skip: usize,
     handles: [Option<Handle>; MAX_HANDLES],
     /// Mixed into handle strings so a closed handle is not mistaken for a
     /// later one in the same slot.
     generation: u32,
+    tokens: [u32; MAX_HANDLES],
     fatal: bool,
     /// One card read or write per `begin_poll()`: a single 8 KiB FAT write
     /// can take tens of milliseconds, and many of them in one main-loop pass
@@ -202,9 +229,11 @@ impl Sftp {
             out: Vec::with_capacity(SMALL_BUFFER),
             read_stream: None,
             write_stream: None,
+            resize: None,
             skip: 0,
             handles: Default::default(),
             generation: 0,
+            tokens: [0; MAX_HANDLES],
             fatal: false,
             card_budget: true,
             stats: SftpStats::default(),
@@ -241,6 +270,7 @@ impl Sftp {
     pub fn transferring(&self) -> bool {
         self.read_stream.is_some()
             || self.write_stream.is_some()
+            || self.resize.is_some()
             || !self.out.is_empty()
             || !self.input.is_empty()
     }
@@ -264,6 +294,14 @@ impl Sftp {
         // pipelining client is throttled by the channel window.
         if !self.out.is_empty() {
             return false;
+        }
+        if self.resize.is_some() {
+            if !self.card_budget {
+                return false;
+            }
+            self.card_budget = false;
+            self.continue_resize(volume, clock);
+            return true;
         }
         if self.read_stream.is_some() {
             if !self.card_budget {
@@ -318,6 +356,10 @@ impl Sftp {
         if self.input.len() < 4 + length {
             return false;
         }
+        if !self.card_budget {
+            return false;
+        }
+        self.card_budget = false;
         let packet: Vec<u8> = self.input.drain(..4 + length).collect();
         self.stats.requests += 1;
         self.dispatch(kind, &packet[5..], volume, clock);
@@ -326,9 +368,17 @@ impl Sftp {
 
     fn dispatch(&mut self, kind: u8, body: &[u8], volume: Option<&SdVolume>, clock: &ClockConfig) {
         if kind == FXP_INIT {
-            // Reply version 3 whatever the client offers; no extensions.
             let start = self.begin(FXP_VERSION);
             put_u32(&mut self.out, 3);
+            for (name, version) in [
+                ("fsync@openssh.com", "1"),
+                ("statvfs@openssh.com", "2"),
+                ("fstatvfs@openssh.com", "2"),
+                ("limits@openssh.com", "1"),
+            ] {
+                put_string(&mut self.out, name.as_bytes());
+                put_string(&mut self.out, version.as_bytes());
+            }
             self.finish(start);
             return;
         }
@@ -345,16 +395,17 @@ impl Sftp {
                 FXP_FSTAT => self.fstat(id, &mut reader, volume, clock),
                 FXP_OPENDIR => self.opendir(id, &mut reader, volume),
                 FXP_READDIR => self.readdir(id, &mut reader, volume, clock),
-                FXP_OPEN => self.open(id, &mut reader, volume),
+                FXP_OPEN => self.open(id, &mut reader, volume, clock),
                 FXP_CLOSE => self.close(id, &mut reader),
                 FXP_READ => self.read(id, &mut reader, volume),
                 FXP_REMOVE => self.remove(id, &mut reader, volume),
-                FXP_MKDIR => self.mkdir(id, &mut reader, volume),
+                FXP_MKDIR => self.mkdir(id, &mut reader, volume, clock),
                 FXP_RMDIR => self.rmdir(id, &mut reader, volume),
                 FXP_RENAME => self.rename(id, &mut reader, volume),
-                FXP_SETSTAT => self.setstat(id, &mut reader, volume),
-                FXP_FSETSTAT => self.fsetstat(id, &mut reader),
-                // READLINK, SYMLINK, EXTENDED and anything newer.
+                FXP_SETSTAT => self.setstat(id, &mut reader, volume, clock),
+                FXP_FSETSTAT => self.fsetstat(id, &mut reader, volume, clock),
+                FXP_EXTENDED => self.extended(id, &mut reader, volume),
+                // READLINK, SYMLINK and anything newer.
                 _ => Err(Status(FX_OP_UNSUPPORTED, "Operation not supported")),
             },
         };
@@ -396,7 +447,7 @@ impl Sftp {
     }
 
     fn handle_reply(&mut self, id: u32, slot: usize) {
-        let token = self.generation << 8 | slot as u32;
+        let token = self.tokens[slot];
         let start = self.begin(FXP_HANDLE);
         put_u32(&mut self.out, id);
         put_string(&mut self.out, &token.to_be_bytes());
@@ -412,6 +463,7 @@ impl Sftp {
             .position(Option::is_none)
             .ok_or(Status::failure("Too many open handles"))?;
         self.generation = self.generation.wrapping_add(1) & 0x00ff_ffff;
+        self.tokens[slot] = self.generation << 8 | slot as u32;
         self.handles[slot] = Some(handle);
         Ok(slot)
     }
@@ -422,7 +474,7 @@ impl Sftp {
         let token: [u8; 4] = token.try_into().map_err(|_| bad())?;
         let token = u32::from_be_bytes(token);
         let slot = (token & 0xff) as usize;
-        if slot >= MAX_HANDLES || self.handles[slot].is_none() {
+        if slot >= MAX_HANDLES || self.handles[slot].is_none() || self.tokens[slot] != token {
             return Err(bad());
         }
         Ok(slot)
@@ -579,9 +631,17 @@ impl Sftp {
         Ok(())
     }
 
-    fn open(&mut self, id: u32, reader: &mut Reader, volume: &SdVolume) -> Reply {
+    fn open(
+        &mut self,
+        id: u32,
+        reader: &mut Reader,
+        volume: &SdVolume,
+        clock: &ClockConfig,
+    ) -> Reply {
         let path = reader.path().ok_or_else(Status::bad_message)?;
         let flags = reader.u32().ok_or_else(Status::bad_message)?;
+        let attrs = reader.attrs().ok_or_else(Status::bad_message)?;
+        validate_attrs(&attrs, clock)?;
         let mut components = resolve(&[], &path);
         let leaf = components.pop().ok_or(Status::failure("Is a directory"))?;
         let parent = components;
@@ -591,19 +651,22 @@ impl Sftp {
         let existing = dir
             .find(&leaf)
             .map_err(|_| Status::failure("Directory read error"))?;
+        let created = existing.is_none();
         let size = match existing {
             Some(entry) if entry.is_directory() => return Err(Status::failure("Is a directory")),
             Some(_) if flags & FXF_CREAT != 0 && flags & FXF_EXCL != 0 => {
                 return Err(Status::failure("File exists"));
             }
+            Some(entry)
+                if writable && entry.attributes().contains(DirEntryAttrFlags::READ_ONLY) =>
+            {
+                return Err(Status(FX_PERMISSION_DENIED, "File is read-only"));
+            }
             Some(entry) if writable && flags & FXF_TRUNC != 0 => {
-                // Overwrite: start from a fresh, empty cluster chain.
                 volume
-                    .delete(&entry)
-                    .map_err(|_| Status::failure("Cannot replace file"))?;
-                volume
-                    .create_file(&dir, &leaf)
-                    .map_err(|_| Status::failure("Cannot create file"))?;
+                    .truncate(&entry, 0)
+                    .map_err(|_| Status::failure("Cannot truncate file"))?;
+                self.invalidate_file(&parent, &leaf);
                 0
             }
             Some(entry) => entry.len(),
@@ -615,11 +678,16 @@ impl Sftp {
             }
             None => return Err(Status::no_such_file()),
         };
+        if created {
+            let (entry, _) = find_in(volume, &parent, &leaf).ok_or_else(Status::no_such_file)?;
+            apply_metadata(volume, &entry, &attrs, clock)?;
+        }
         let slot = self.allocate(Handle::File(FileHandle {
             parent,
             leaf,
             readable,
             writable,
+            append_mode: flags & FXF_APPEND != 0,
             size,
             append: None,
             read_at: None,
@@ -739,11 +807,11 @@ impl Sftp {
             if !file.writable {
                 return Err(Status::failure("Handle not open for writing"));
             }
-            if offset != file.size {
-                return Err(Status(
-                    FX_OP_UNSUPPORTED,
-                    "Only sequential writes at the end of the file",
-                ));
+            if offset
+                .checked_add(u64::from(data_len))
+                .is_none_or(|end| end > u64::from(u32::MAX))
+            {
+                return Err(Status::failure("File exceeds FAT's 4 GiB limit"));
             }
             Ok(slot)
         })();
@@ -755,6 +823,7 @@ impl Sftp {
             id,
             slot,
             remaining: data_len,
+            offset,
             failed,
         });
         true
@@ -783,7 +852,33 @@ impl Sftp {
                 let result = match (volume, self.handles[stream.slot].as_mut()) {
                     (Some(volume), Some(Handle::File(file))) => {
                         let started = esp_hal::time::Instant::now();
-                        let result = write_chunk(volume, file, &self.input[..count]);
+                        let (entry, _) = match find_in(volume, &file.parent, &file.leaf) {
+                            Some(found) => found,
+                            None => {
+                                stream.failed = Some(Status::no_such_file());
+                                self.write_stream = Some(stream);
+                                return true;
+                            }
+                        };
+                        let offset = if file.append_mode {
+                            entry.len()
+                        } else {
+                            stream.offset
+                        };
+                        if offset > entry.len() {
+                            let zeros = [0_u8; WRITE_CHUNK];
+                            let n = (offset - entry.len()).min(WRITE_CHUNK as u64) as usize;
+                            let result = write_chunk(volume, file, entry.len(), &zeros[..n]);
+                            self.stats.card_write_us += started.elapsed().as_micros();
+                            if let Err(status) = result {
+                                stream.failed = Some(status);
+                            } else {
+                                self.invalidate_written(stream.slot);
+                            }
+                            self.write_stream = Some(stream);
+                            return true; // Payload stays queued until the gap is filled.
+                        }
+                        let result = write_chunk(volume, file, offset, &self.input[..count]);
                         self.stats.card_write_us += started.elapsed().as_micros();
                         result
                     }
@@ -791,7 +886,11 @@ impl Sftp {
                     _ => Err(Status::failure("Invalid handle")),
                 };
                 match result {
-                    Ok(()) => self.stats.bytes_written += count as u64,
+                    Ok(()) => {
+                        self.invalidate_written(stream.slot);
+                        self.stats.bytes_written += count as u64;
+                        stream.offset += count as u64;
+                    }
                     Err(status) => stream.failed = Some(status),
                 }
             }
@@ -819,19 +918,37 @@ impl Sftp {
         if entry.is_directory() {
             return Err(Status::failure("Is a directory"));
         }
+        if entry.attributes().contains(DirEntryAttrFlags::READ_ONLY) {
+            return Err(Status(FX_PERMISSION_DENIED, "File is read-only"));
+        }
         volume
             .delete(&entry)
             .map_err(|_| Status::failure("Cannot delete"))?;
         self.ok(id)
     }
 
-    fn mkdir(&mut self, id: u32, reader: &mut Reader, volume: &SdVolume) -> Reply {
+    fn mkdir(
+        &mut self,
+        id: u32,
+        reader: &mut Reader,
+        volume: &SdVolume,
+        clock: &ClockConfig,
+    ) -> Reply {
         let path = reader.path().ok_or_else(Status::bad_message)?;
+        let attrs = reader.attrs().ok_or_else(Status::bad_message)?;
+        validate_attrs(&attrs, clock)?;
+        if attrs.size.is_some() {
+            return Err(Status::failure("Directory size cannot be set"));
+        }
         let components = resolve(&[], &path);
         let (leaf, parent) = components.split_last().ok_or(Status::failure("Exists"))?;
         let dir = open_dir_path(volume, parent).ok_or_else(Status::no_such_file)?;
         match volume.create_dir(&dir, leaf) {
-            Ok(_) => self.ok(id),
+            Ok(_) => {
+                let (entry, _) = find_in(volume, parent, leaf).ok_or_else(Status::no_such_file)?;
+                apply_metadata(volume, &entry, &attrs, clock)?;
+                self.ok(id)
+            }
             Err(hadris_fat::Error::AlreadyExists) => Err(Status::failure("File exists")),
             Err(_) => Err(Status::failure("Cannot create directory")),
         }
@@ -886,45 +1003,215 @@ impl Sftp {
         }
     }
 
-    fn setstat(&mut self, id: u32, reader: &mut Reader, volume: &SdVolume) -> Reply {
+    fn setstat(
+        &mut self,
+        id: u32,
+        reader: &mut Reader,
+        volume: &SdVolume,
+        clock: &ClockConfig,
+    ) -> Reply {
         let path = reader.path().ok_or_else(Status::bad_message)?;
-        let requested_size = reader.attrs_size().ok_or_else(Status::bad_message)?;
-        let components = resolve(&[], &path);
-        let current = match components.split_last() {
-            None => 0,
-            Some((leaf, parent)) => find_in(volume, parent, leaf)
-                .ok_or_else(Status::no_such_file)?
-                .0
-                .len(),
-        };
-        self.apply_setstat(id, requested_size, current)
+        let attrs = reader.attrs().ok_or_else(Status::bad_message)?;
+        self.apply_setstat(id, resolve(&[], &path), attrs, volume, clock)
     }
 
-    fn fsetstat(&mut self, id: u32, reader: &mut Reader) -> Reply {
+    fn handle_components(&self, slot: usize) -> Result<Vec<String>, Status> {
+        match self.handles[slot].as_ref() {
+            Some(Handle::File(file)) => {
+                let mut path = file.parent.clone();
+                path.push(file.leaf.clone());
+                Ok(path)
+            }
+            Some(Handle::Dir(dir)) => Ok(dir.components.clone()),
+            None => Err(Status::failure("Invalid handle")),
+        }
+    }
+
+    fn fsetstat(
+        &mut self,
+        id: u32,
+        reader: &mut Reader,
+        volume: &SdVolume,
+        clock: &ClockConfig,
+    ) -> Reply {
         let token = reader.string().ok_or_else(Status::bad_message)?;
-        let requested_size = reader.attrs_size().ok_or_else(Status::bad_message)?;
+        let attrs = reader.attrs().ok_or_else(Status::bad_message)?;
         let slot = self.slot_of(token)?;
-        let current = match self.handles[slot].as_ref() {
-            Some(Handle::File(file)) => file.size,
-            _ => 0,
-        };
-        self.apply_setstat(id, requested_size, current)
+        if attrs.size.is_some() && !self.file_mut(slot)?.writable {
+            return Err(Status(FX_PERMISSION_DENIED, "Handle not open for writing"));
+        }
+        self.apply_setstat(id, self.handle_components(slot)?, attrs, volume, clock)
     }
 
-    /// FAT stores no Unix permissions or owners, and clients only use times
-    /// for "preserve" options: accept those so uploads do not fail. A size
-    /// change (truncate/extend) is refused rather than silently ignored.
-    fn apply_setstat(&mut self, id: u32, requested_size: Option<u64>, current: u64) -> Reply {
-        match requested_size {
-            Some(size) if size != current => Err(Status(
-                FX_OP_UNSUPPORTED,
-                "Changing the file size is not supported",
-            )),
-            _ => self.ok(id),
+    fn invalidate_file(&mut self, parent: &[String], leaf: &str) {
+        for handle in &mut self.handles {
+            if let Some(Handle::File(file)) = handle {
+                if same_path(&file.parent, &file.leaf, parent, leaf) {
+                    file.append = None;
+                    file.read_at = None;
+                }
+            }
+        }
+    }
+
+    fn invalidate_written(&mut self, slot: usize) {
+        let (before, rest) = self.handles.split_at_mut(slot);
+        let (current, after) = rest.split_first_mut().unwrap();
+        if let Some(Handle::File(written)) = current {
+            written.read_at = None;
+            for handle in before.iter_mut().chain(after) {
+                if let Some(Handle::File(other)) = handle {
+                    if same_path(&written.parent, &written.leaf, &other.parent, &other.leaf) {
+                        other.append = None;
+                        other.read_at = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_setstat(
+        &mut self,
+        id: u32,
+        components: Vec<String>,
+        attrs: RequestedAttrs,
+        volume: &SdVolume,
+        clock: &ClockConfig,
+    ) -> Reply {
+        validate_attrs(&attrs, clock)?;
+        let (leaf, parent) = components
+            .split_last()
+            .ok_or(Status(FX_OP_UNSUPPORTED, "Root metadata cannot be changed"))?;
+        let (entry, _) = find_in(volume, parent, leaf).ok_or_else(Status::no_such_file)?;
+        if let Some(size) = attrs.size {
+            if entry.is_directory() {
+                return Err(Status::failure("Cannot resize a directory"));
+            }
+            if size != entry.len() && entry.attributes().contains(DirEntryAttrFlags::READ_ONLY) {
+                return Err(Status(FX_PERMISSION_DENIED, "File is read-only"));
+            }
+            if size > entry.len() {
+                self.resize = Some(ResizeJob {
+                    id,
+                    file: FileHandle {
+                        parent: parent.to_vec(),
+                        leaf: leaf.clone(),
+                        readable: false,
+                        writable: true,
+                        append_mode: false,
+                        size: entry.len(),
+                        append: None,
+                        read_at: None,
+                    },
+                    components,
+                    attrs,
+                });
+                return Ok(()); // Answer only once all zero chunks are committed.
+            }
+            if size < entry.len() {
+                volume
+                    .truncate(&entry, size as usize)
+                    .map_err(|_| Status::failure("Cannot truncate file"))?;
+            }
+        }
+        let (entry, _) = find_in(volume, parent, leaf).ok_or_else(Status::no_such_file)?;
+        apply_metadata(volume, &entry, &attrs, clock)?;
+        self.invalidate_file(parent, leaf);
+        self.ok(id)
+    }
+
+    fn continue_resize(&mut self, volume: Option<&SdVolume>, clock: &ClockConfig) {
+        let mut job = self.resize.take().unwrap();
+        let result = (|| {
+            let volume = volume.ok_or(Status::failure("SD unavailable"))?;
+            let (leaf, parent) = job.components.split_last().unwrap();
+            let (entry, _) = find_in(volume, parent, leaf).ok_or_else(Status::no_such_file)?;
+            let target = job.attrs.size.unwrap();
+            if entry.len() < target {
+                let zeros = [0_u8; WRITE_CHUNK];
+                let count = (target - entry.len()).min(WRITE_CHUNK as u64) as usize;
+                write_chunk(volume, &mut job.file, entry.len(), &zeros[..count])?;
+                self.invalidate_file(parent, leaf);
+                return Ok(false); // Metadata gets its own bounded poll.
+            }
+            apply_metadata(volume, &entry, &job.attrs, clock)?;
+            self.invalidate_file(parent, leaf);
+            Ok(true)
+        })();
+        match result {
+            Ok(false) => self.resize = Some(job),
+            Ok(true) => {
+                self.status(job.id, FX_OK, "OK");
+            }
+            Err(Status(code, message)) => self.status(job.id, code, message),
+        }
+    }
+
+    fn extended(&mut self, id: u32, reader: &mut Reader, volume: &SdVolume) -> Reply {
+        let name = reader.string().ok_or_else(Status::bad_message)?;
+        match name {
+            b"limits@openssh.com" => {
+                let start = self.begin(FXP_EXTENDED_REPLY);
+                put_u32(&mut self.out, id);
+                for value in [65536_u64, MAX_READ_REPLY as u64, 32768, MAX_HANDLES as u64] {
+                    self.out.extend_from_slice(&value.to_be_bytes());
+                }
+                self.finish(start);
+                Ok(())
+            }
+            b"fsync@openssh.com" => {
+                let token = reader.string().ok_or_else(Status::bad_message)?;
+                let slot = self.slot_of(token)?;
+                self.file_mut(slot)?;
+                // Every writer calls finish(), but also flush filesystem metadata.
+                volume
+                    .sync()
+                    .map_err(|_| Status::failure("SD sync failed"))?;
+                self.ok(id)
+            }
+            b"statvfs@openssh.com" | b"fstatvfs@openssh.com" => {
+                let components = if name == b"statvfs@openssh.com" {
+                    resolve(&[], &reader.path().ok_or_else(Status::bad_message)?)
+                } else {
+                    let token = reader.string().ok_or_else(Status::bad_message)?;
+                    self.handle_components(self.slot_of(token)?)?
+                };
+                if let Some((leaf, parent)) = components.split_last() {
+                    find_in(volume, parent, leaf).ok_or_else(Status::no_such_file)?;
+                }
+                let free = volume
+                    .free_cluster_count()
+                    .ok_or(Status(FX_OP_UNSUPPORTED, "FAT free-space count is unknown"))?;
+                let total = volume.fat().max_cluster().saturating_sub(1) as u64;
+                if u64::from(free) > total {
+                    return Err(Status::failure("Invalid FAT free-space count"));
+                }
+                let start = self.begin(FXP_EXTENDED_REPLY);
+                put_u32(&mut self.out, id);
+                // f_bsize, f_frsize, blocks/free/available, inodes (not applicable),
+                // fsid, flags, namemax (VFAT UTF-16 units).
+                for value in [
+                    volume.cluster_size() as u64,
+                    volume.cluster_size() as u64,
+                    total,
+                    free as u64,
+                    free as u64,
+                    0,
+                    0,
+                    0,
+                    volume.volume_info().volume_id() as u64,
+                    0,
+                    255,
+                ] {
+                    self.out.extend_from_slice(&value.to_be_bytes());
+                }
+                self.finish(start);
+                Ok(())
+            }
+            _ => Err(Status(FX_OP_UNSUPPORTED, "Extension not supported")),
         }
     }
 }
-
 /// Grow `buffer` to `capacity` in a single allocation (no-op once there).
 fn reserve_full(buffer: &mut Vec<u8>, capacity: usize) {
     if buffer.capacity() < capacity {
@@ -959,27 +1246,119 @@ fn read_chunk(
     Ok(read)
 }
 
-/// Append `data` at the end of the file and commit it to the card.
-fn write_chunk(volume: &SdVolume, file: &mut FileHandle, data: &[u8]) -> Result<(), Status> {
+/// Write at an existing offset (preserving the tail), or append at EOF.
+fn write_chunk(
+    volume: &SdVolume,
+    file: &mut FileHandle,
+    offset: u64,
+    data: &[u8],
+) -> Result<(), Status> {
     let fail = |_| Status::failure("SD write failed");
-    let dir = open_dir_path(volume, &file.parent).ok_or_else(Status::no_such_file)?;
-    let entry = dir
-        .find(&file.leaf)
-        .map_err(fail)?
-        .ok_or_else(Status::no_such_file)?;
-    let mut writer = match file.append.take() {
-        Some(cursor) => FileWriter::new_append_from_cursor(volume, &entry, cursor).map_err(fail)?,
-        None if file.size == 0 => FileWriter::new(volume, &entry).map_err(fail)?,
-        // First write into an existing file (resume): walk the chain once.
-        None => FileWriter::new_append(volume, &entry).map_err(fail)?,
+    let (entry, _) = find_in(volume, &file.parent, &file.leaf).ok_or_else(Status::no_such_file)?;
+    if entry.attributes().contains(DirEntryAttrFlags::READ_ONLY) {
+        return Err(Status(FX_PERMISSION_DENIED, "File is read-only"));
+    }
+    let end = offset
+        .checked_add(data.len() as u64)
+        .filter(|end| *end <= u32::MAX as u64)
+        .ok_or(Status::failure("File exceeds FAT's 4 GiB limit"))?;
+    if offset > entry.len() {
+        return Err(Status::failure("Gap must be zero-filled first"));
+    }
+    if file.size != entry.len() {
+        file.append = None;
+    }
+    let mut writer = if offset == entry.len() {
+        match file.append.take() {
+            Some(cursor) => {
+                FileWriter::new_append_from_cursor(volume, &entry, cursor).map_err(fail)?
+            }
+            None => FileWriter::new_append(volume, &entry).map_err(fail)?,
+        }
+    } else {
+        file.append = None;
+        FileWriter::new_at(volume, &entry, offset).map_err(fail)?
     };
     if writer.write(data).map_err(fail)? != data.len() {
         return Err(Status::failure("SD card full"));
     }
-    let cursor = writer.append_cursor();
+    let cursor = if end >= entry.len() {
+        Some(writer.append_cursor())
+    } else {
+        None
+    };
     writer.finish().map_err(fail)?;
-    file.append = Some(cursor);
-    file.size += data.len() as u64;
+    file.append = cursor;
+    file.read_at = None;
+    file.size = entry.len().max(end);
+    Ok(())
+}
+
+fn same_path(a_parent: &[String], a_leaf: &str, b_parent: &[String], b_leaf: &str) -> bool {
+    a_parent.len() == b_parent.len()
+        && a_leaf.eq_ignore_ascii_case(b_leaf)
+        && a_parent
+            .iter()
+            .zip(b_parent)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Reject unrepresentable metadata before changing any file data.
+fn validate_attrs(attrs: &RequestedAttrs, config: &ClockConfig) -> Reply {
+    if attrs.owner {
+        return Err(Status(FX_OP_UNSUPPORTED, "FAT has no UID/GID"));
+    }
+    if attrs.size.is_some_and(|size| size > u32::MAX as u64) {
+        return Err(Status::failure("File exceeds FAT's 4 GiB limit"));
+    }
+    if let Some((atime, mtime)) = attrs.times {
+        fat_time(atime, config)?;
+        fat_time(mtime, config)?;
+    }
+    Ok(())
+}
+
+fn fat_time(unix: u32, config: &ClockConfig) -> Result<FatDateTime, Status> {
+    let time = clock::date_time(clock::local_seconds(unix as u64, config));
+    if !(1980..=2107).contains(&time.year) {
+        return Err(Status(
+            FX_OP_UNSUPPORTED,
+            "Timestamp is outside FAT's date range",
+        ));
+    }
+    Ok(FatDateTime::new(
+        time.year as u16,
+        time.month as u8,
+        time.day as u8,
+        time.hour as u8,
+        time.minute as u8,
+        time.second as u8,
+    ))
+}
+
+fn apply_metadata(
+    volume: &SdVolume,
+    entry: &FileEntry,
+    attrs: &RequestedAttrs,
+    config: &ClockConfig,
+) -> Reply {
+    if let Some((atime, mtime)) = attrs.times {
+        volume
+            .set_times(
+                entry,
+                Some(fat_time(mtime, config)?),
+                Some(fat_time(atime, config)?.date),
+                None,
+            )
+            .map_err(|_| Status::failure("Cannot set FAT timestamps"))?;
+    }
+    if let Some(permissions) = attrs.permissions {
+        let mut flags = entry.attributes();
+        flags.set(DirEntryAttrFlags::READ_ONLY, permissions & 0o222 == 0);
+        volume
+            .set_attributes(entry, flags)
+            .map_err(|_| Status::failure("Cannot set FAT attributes"))?;
+    }
     Ok(())
 }
 
@@ -988,6 +1367,7 @@ struct Attrs {
     size: u64,
     permissions: u32,
     mtime: Option<u32>,
+    atime: Option<u32>,
 }
 
 impl Attrs {
@@ -996,6 +1376,7 @@ impl Attrs {
             size: 0,
             permissions: 0o040_755,
             mtime: None,
+            atime: None,
         }
     }
 
@@ -1012,12 +1393,28 @@ impl Attrs {
         let mtime = clock::unix_from_local(local, clock).clamp(0, i64::from(u32::MAX)) as u32;
         Self {
             size: if entry.is_directory() { 0 } else { entry.len() },
-            permissions: if entry.is_directory() {
+            permissions: (if entry.is_directory() {
                 0o040_755
             } else {
                 0o100_644
+            }) & if entry.attributes().contains(DirEntryAttrFlags::READ_ONLY) {
+                !0o222
+            } else {
+                u32::MAX
             },
             mtime: Some(mtime),
+            atime: Some({
+                let date = entry.accessed_date();
+                let local = clock::seconds_from_civil(
+                    i64::from(((date >> 9) & 0x7f) + 1980),
+                    u32::from((date >> 5) & 0xf).max(1),
+                    u32::from(date & 0x1f).max(1),
+                    0,
+                    0,
+                    0,
+                );
+                clock::unix_from_local(local, clock).clamp(0, u32::MAX as i64) as u32
+            }),
         }
     }
 
@@ -1027,7 +1424,7 @@ impl Attrs {
         out.extend_from_slice(&self.size.to_be_bytes());
         put_u32(out, self.permissions);
         if let Some(mtime) = self.mtime {
-            put_u32(out, mtime); // atime: FAT keeps no time of day for it
+            put_u32(out, self.atime.unwrap_or(mtime)); // FAT access dates have day resolution
             put_u32(out, mtime);
         }
     }
@@ -1080,23 +1477,27 @@ impl<'a> Reader<'a> {
         (!text.contains('\0')).then(|| String::from(text))
     }
 
-    /// Parse an ATTRS block and return the requested size, if any. The
-    /// outer `None` means malformed.
-    fn attrs_size(&mut self) -> Option<Option<u64>> {
+    /// Parse attributes without silently throwing away metadata.
+    fn attrs(&mut self) -> Option<RequestedAttrs> {
         let flags = self.u32()?;
-        let size = if flags & ATTR_SIZE != 0 {
-            Some(self.u64()?)
-        } else {
-            None
-        };
+        if flags & !(ATTR_SIZE | ATTR_UIDGID | ATTR_PERMISSIONS | ATTR_ACMODTIME | ATTR_EXTENDED)
+            != 0
+        {
+            return None;
+        }
+        let mut attrs = RequestedAttrs::default();
+        if flags & ATTR_SIZE != 0 {
+            attrs.size = Some(self.u64()?);
+        }
         if flags & ATTR_UIDGID != 0 {
             self.take(8)?;
+            attrs.owner = true;
         }
         if flags & ATTR_PERMISSIONS != 0 {
-            self.take(4)?;
+            attrs.permissions = Some(self.u32()?);
         }
         if flags & ATTR_ACMODTIME != 0 {
-            self.take(8)?;
+            attrs.times = Some((self.u32()?, self.u32()?));
         }
         if flags & ATTR_EXTENDED != 0 {
             let count = self.u32()?;
@@ -1105,6 +1506,6 @@ impl<'a> Reader<'a> {
                 self.string()?;
             }
         }
-        Some(size)
+        Some(attrs)
     }
 }
