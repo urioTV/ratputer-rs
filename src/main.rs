@@ -39,7 +39,6 @@ mod clock;
 mod debug;
 mod filemanager;
 mod fspath;
-mod ftp;
 mod msc;
 mod net;
 mod sdblock;
@@ -243,8 +242,8 @@ fn view_name(view: i32) -> &'static str {
         5 => "wifi_password",
         6 => "about",
         7 => "usb_disk",
-        8 => "ftp",
-        9 => "ftp_password",
+        8 => "ssh",
+        9 => "server_password",
         10 => "sd_files",
         11 => "sd_actions",
         12 => "sd_name",
@@ -270,9 +269,9 @@ fn apply_debug_key(ui: &MainWindow, key: debug::DebugKey) {
             set_password(ui, &password);
         }
         debug::DebugKey::Backspace if ui.get_view_state() == 9 => {
-            let mut password = ui.get_ftp_password().to_string();
+            let mut password = ui.get_ssh_password().to_string();
             password.pop();
-            ui.set_ftp_password(password.into());
+            ui.set_ssh_password(password.into());
         }
         debug::DebugKey::Backspace => ui.invoke_key_pressed("back".into()),
     }
@@ -307,14 +306,14 @@ fn append_debug_text(ui: &MainWindow, text: &str) -> Result<(), &'static str> {
         }
         9 => {
             if !text.bytes().all(|byte| byte.is_ascii_graphic()) {
-                return Err("ftp_text_disallows_spaces");
+                return Err("ssh_text_disallows_spaces");
             }
-            let mut password = ui.get_ftp_password().to_string();
+            let mut password = ui.get_ssh_password().to_string();
             if password.len() + text.len() > 32 {
-                return Err("ftp_text_too_long");
+                return Err("ssh_text_too_long");
             }
             password.push_str(text);
-            ui.set_ftp_password(password.into());
+            ui.set_ssh_password(password.into());
             Ok(())
         }
         _ => Err("text_entry_not_active"),
@@ -517,10 +516,8 @@ fn main() -> ! {
     // Socket buffers are reserved at boot, while the heap is still fresh.
     // First renders of the Slint views permanently consume a chunk of heap;
     // creating the server lazily on first open then failed with LOW MEMORY.
-    let mut ftp_server: Option<ftp::FtpServer> = network
-        .as_ref()
-        .map(|network| ftp::FtpServer::new(network.stack()));
-    // The SSH listener follows the same rule: buffers reserved at boot.
+    // The server only ACCEPTS connections while its screen is open (start()),
+    // but its buffers must exist from boot.
     let mut ssh_server: Option<ssh::SshServer> = network
         .as_ref()
         .map(|network| ssh::SshServer::new(network.stack(), storage.as_ref()));
@@ -563,8 +560,8 @@ fn main() -> ! {
         }
         .into(),
     );
-    set_ftp_login_text(&ui, &wifi_config);
-    ui.set_ftp_status("STOPPED".into());
+    set_ssh_login_text(&ui, &wifi_config);
+    ui.set_ssh_status("OFF".into());
 
     // --- RTC watchdog: reset instead of waiting for a battery pull ---
     // Arming happens here, after radios, SD and UI are up, so slow first-run
@@ -614,7 +611,7 @@ fn main() -> ! {
     let mut usb_sd = None;
     let mut shown_usb_state = None;
     let mut next_usb_stats_at = Instant::now();
-    let mut next_ftp_stats_at = Instant::now();
+    let mut next_ssh_stats_at = Instant::now();
     let mut usb_force_exit_armed = false;
     // Reboot once the acknowledgement left the FIFO, or after a deadline: a host
     // that closes the port can leave the final flush pending forever.
@@ -733,14 +730,6 @@ fn main() -> ! {
                         usb_disk.state(),
                         usb_status.as_str()
                     ));
-                    let ftp_status = ui.get_ftp_status();
-                    let ftp_addr = ui.get_ftp_addr();
-                    let ftp_peer = ftp_server.as_ref().and_then(|server| server.peer());
-                    debug_console.data(format_args!(
-                        "ftp state={:?} peer={ftp_peer:?} address={:?}",
-                        ftp_status.as_str(),
-                        ftp_addr.as_str()
-                    ));
                     if let Some(server) = ssh_server.as_ref() {
                         debug_console.data(format_args!(
                             "ssh state={:?} host_key={} sessions={}",
@@ -847,8 +836,8 @@ fn main() -> ! {
                             debug_console.ok(format_args!("wifi_text_cleared"));
                         }
                         9 => {
-                            ui.set_ftp_password("".into());
-                            debug_console.ok(format_args!("ftp_text_cleared"));
+                            ui.set_ssh_password("".into());
+                            debug_console.ok(format_args!("ssh_text_cleared"));
                         }
                         12 => {
                             if let Some(fm) = file_manager.as_mut() {
@@ -990,10 +979,10 @@ fn main() -> ! {
                     }
                     KeyInput::Char(character) if ui.get_view_state() == 9 => {
                         if character.is_ascii_graphic() {
-                            let mut password = ui.get_ftp_password().to_string();
+                            let mut password = ui.get_ssh_password().to_string();
                             if password.len() < 32 {
                                 password.push(character);
-                                ui.set_ftp_password(password.into());
+                                ui.set_ssh_password(password.into());
                             }
                         }
                     }
@@ -1012,9 +1001,9 @@ fn main() -> ! {
                         set_password(&ui, &password);
                     }
                     KeyInput::Backspace if ui.get_view_state() == 9 => {
-                        let mut password = ui.get_ftp_password().to_string();
+                        let mut password = ui.get_ssh_password().to_string();
                         password.pop();
-                        ui.set_ftp_password(password.into());
+                        ui.set_ssh_password(password.into());
                     }
                     KeyInput::Backspace | KeyInput::Escape => ui.invoke_key_pressed("back".into()),
                     KeyInput::Delete => ui.invoke_key_pressed("delete".into()),
@@ -1027,19 +1016,20 @@ fn main() -> ! {
             }
         }
 
+        // Stop SSH before any other feature can access or export the card.
+        // The password editor (view 9) must also run with the server off.
+        if ui.get_view_state() != 8 {
+            stop_ssh(&mut ssh_server);
+        }
+
         // Opening from the menu never retains a FAT handle. Drop browser state
-        // on exit, before USB can take ownership of the raw SD card.
+        // on exit, before USB can take ownership of the raw SD card. The SSH
+        // server only runs while its own screen is open, so it cannot hold the
+        // card when this view is entered.
         if (10..=13).contains(&ui.get_view_state()) {
             if file_manager.is_none() {
                 if let Some(volume) = storage.as_ref() {
-                    if ftp_server
-                        .as_ref()
-                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped)
-                    {
-                        file_manager = Some(filemanager::FileManager::new(volume, &ui));
-                    } else {
-                        ui.set_view_state(0);
-                    }
+                    file_manager = Some(filemanager::FileManager::new(volume, &ui));
                 } else {
                     ui.set_view_state(0);
                 }
@@ -1340,10 +1330,10 @@ fn main() -> ! {
         if usb_action != 0 {
             ui.set_usb_disk_action(0);
             match usb_action {
+                // The SSH+SFTP server only runs while its screen is open, and
+                // USB DISK can only be entered from the menu, so the two can
+                // never overlap; the holds_sd() check is defence in depth.
                 1 if usb_sd.is_none()
-                    && ftp_server
-                        .as_ref()
-                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped)
                     && !ssh_server.as_ref().is_some_and(ssh::SshServer::holds_sd) =>
                 {
                     if let Some(volume) = storage.take() {
@@ -1360,12 +1350,6 @@ fn main() -> ! {
                     } else {
                         ui.set_usb_disk_status("SD ALREADY IN USE".into());
                     }
-                }
-                1 if ftp_server
-                    .as_ref()
-                    .is_some_and(|server| server.status() != ftp::FtpStatus::Stopped) =>
-                {
-                    ui.set_usb_disk_status("SD IN USE BY FTP".into());
                 }
                 1 if ssh_server.as_ref().is_some_and(ssh::SshServer::holds_sd) => {
                     ui.set_usb_disk_status("SD IN USE BY SFTP".into());
@@ -1455,83 +1439,84 @@ fn main() -> ! {
             }
         }
 
-        // --- FTP server: active only while its screen is open ---
-        let ftp_action = ui.get_ftp_action();
-        if ftp_action != 0 {
-            ui.set_ftp_action(0);
-            match ftp_action {
-                1 => start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui),
+        // --- SSH+SFTP server: active only while its screen is open ---
+        let ssh_action = ui.get_ssh_action();
+        if ssh_action != 0 {
+            ui.set_ssh_action(0);
+            match ssh_action {
+                1 => start_ssh(&mut ssh_server, &storage, &network, &wifi_config, &ui),
                 2 => {
-                    stop_ftp(&mut ftp_server, &storage);
-                    ui.set_ftp_status("STOPPED".into());
+                    stop_ssh(&mut ssh_server);
+                    ui.set_ssh_status("OFF".into());
                 }
                 3 => {
-                    stop_ftp(&mut ftp_server, &storage);
-                    ui.set_ftp_password(wifi_config.ftp.password.clone().into());
-                    ui.set_ftp_status("TYPE NEW PASSWORD".into());
+                    stop_ssh(&mut ssh_server);
+                    ui.set_ssh_password(wifi_config.server.password.clone().into());
+                    ui.set_ssh_status("TYPE NEW PASSWORD".into());
                 }
                 4 => {
-                    let password = ui.get_ftp_password().to_string();
-                    if !storage::valid_ftp_credential(&password) {
-                        ui.set_ftp_status("1-32 ASCII, NO SPACES".into());
+                    let password = ui.get_ssh_password().to_string();
+                    if !storage::valid_server_credential(&password) {
+                        ui.set_ssh_status("1-32 ASCII, NO SPACES".into());
                     } else if let Some(manager) = storage.as_ref() {
-                        wifi_config.ftp.password = password;
+                        wifi_config.server.password = password;
                         if storage::save(manager, &wifi_config).is_err() {
-                            ui.set_ftp_status("SD SAVE FAILED".into());
+                            ui.set_ssh_status("SD SAVE FAILED".into());
                         } else {
-                            set_ftp_login_text(&ui, &wifi_config);
+                            set_ssh_login_text(&ui, &wifi_config);
                             ui.set_view_state(8);
-                            start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui);
+                            start_ssh(&mut ssh_server, &storage, &network, &wifi_config, &ui);
                         }
                     } else {
-                        ui.set_ftp_status("SD BUSY".into());
+                        ui.set_ssh_status("SD BUSY".into());
                     }
                 }
                 5 => {
                     ui.set_view_state(8);
-                    start_ftp(&mut ftp_server, &storage, &network, &wifi_config, &ui);
+                    start_ssh(&mut ssh_server, &storage, &network, &wifi_config, &ui);
                 }
                 _ => {}
             }
         }
 
-        // Defensive invariant: any unexpected navigation away from FTP also
-        // closes its files/volume before another feature can use the card.
-        if !matches!(ui.get_view_state(), 8 | 9)
-            && ftp_server
-                .as_ref()
-                .is_some_and(|server| server.status() != ftp::FtpStatus::Stopped)
-        {
-            stop_ftp(&mut ftp_server, &storage);
-        }
-
-        if let (Some(server), Some(manager), Some(network)) =
-            (ftp_server.as_mut(), storage.as_ref(), network.as_ref())
-        {
-            if server.status() != ftp::FtpStatus::Stopped {
-                server.poll(manager, network.stack(), &wifi_config.ftp);
-                let status = if server.status() == ftp::FtpStatus::Transfer
-                    && !server.activity().is_empty()
-                {
-                    truncate_ascii(server.activity(), 26)
-                } else if let Some(peer) = server.peer() {
-                    format!("{} {}", server.status().label(), truncate_ascii(peer, 12))
+        // Screen text: status, address, host-key fingerprint, heap stats.
+        if let Some(server) = ssh_server.as_ref() {
+            if server.is_active() {
+                let online = network.as_ref().is_some_and(net::Network::is_online);
+                let status = if let Some(peer) = server.peer() {
+                    let prefix = if server.transferring() {
+                        "SFTP "
+                    } else {
+                        "SSH "
+                    };
+                    format!("{prefix}{}", truncate_ascii(peer, 24))
+                } else if online {
+                    String::from("LISTENING :22")
                 } else {
-                    server.status().label().to_string()
+                    String::from("WAITING FOR WI-FI")
                 };
-                if ui.get_ftp_status() != status.as_str() {
-                    ui.set_ftp_status(status.into());
+                if ui.get_ssh_status() != status.as_str() {
+                    ui.set_ssh_status(status.into());
                 }
-                let address = server
-                    .ip()
-                    .map(|ip| format!("FTP://{}:21", ip))
+                let address = network
+                    .as_ref()
+                    .and_then(|n| n.stack().config_v4())
+                    .map(|config| format!("SSH://{}:22", config.address.address()))
                     .unwrap_or_else(|| String::from("NO IP YET"));
-                if ui.get_ftp_addr() != address.as_str() {
-                    ui.set_ftp_addr(address.into());
+                if ui.get_ssh_addr() != address.as_str() {
+                    ui.set_ssh_addr(address.into());
                 }
-                if now >= next_ftp_stats_at {
-                    next_ftp_stats_at = now + Duration::from_millis(500);
-                    ui.set_ftp_stats(ftp_stats_text(server.stats()).into());
+                set_ssh_hostkey_text(&ui, server.fingerprint());
+                if now >= next_ssh_stats_at {
+                    next_ssh_stats_at = now + Duration::from_millis(500);
+                    ui.set_ssh_stats(
+                        format!(
+                            "SESS {} HEAP {}K",
+                            server.sessions_total,
+                            esp_alloc::HEAP.free() / 1024
+                        )
+                        .into(),
+                    );
                 }
             }
         }
@@ -1635,13 +1620,19 @@ fn main() -> ! {
             };
             let context = ssh::PollContext {
                 volume: storage.as_ref(),
-                credentials: &wifi_config.ftp,
+                credentials: &wifi_config.server,
                 clock: &wifi_config.clock,
                 status: &status,
             };
+            // Generate and persist the host key only on the active server screen
+            // (the RNG is a TRNG only then), so the fingerprint on the SSH
+            // screen can be verified before the first login.
+            if server.is_active() && network.is_link_up() {
+                server.ensure_hostkey(storage.as_ref());
+            }
             server.poll(&context);
             // During an SFTP transfer, burst-poll TCP and SSH for up to 15 ms
-            // (same budget as FTP), then return to input and rendering.
+            // then return to input and rendering.
             if server.transferring() {
                 let burst_start = Instant::now();
                 while burst_start.elapsed() < Duration::from_millis(15) {
@@ -1655,30 +1646,11 @@ fn main() -> ! {
         }
         let ssh_busy = ssh_server.as_ref().is_some_and(ssh::SshServer::busy);
 
-        // During a transfer, burst-poll the network and FTP for up to 15 ms.
-        // This keeps TCP windows moving without starving input/display forever.
-        let ftp_busy = ftp_server.as_ref().is_some_and(ftp::FtpServer::busy);
-        if ftp_busy {
-            let burst_start = Instant::now();
-            while burst_start.elapsed() < Duration::from_millis(15) {
-                let (Some(network), Some(manager), Some(server)) =
-                    (network.as_mut(), storage.as_ref(), ftp_server.as_mut())
-                else {
-                    break;
-                };
-                network.poll_stack();
-                server.poll(manager, network.stack(), &wifi_config.ftp);
-                if server.status() != ftp::FtpStatus::Transfer {
-                    break;
-                }
-            }
-        }
-
         window.draw_if_needed(|renderer| {
             renderer.render_by_line(&mut HardwareDrawBuffer::new(&mut display, &mut line_buffer));
         });
 
-        // Capture allocations from this iteration, including FTP and rendering.
+        // Capture allocations from this iteration, including SFTP and rendering.
         heap_free_min = heap_free_min.min(esp_alloc::HEAP.free());
 
         // Responses are queued so a disconnected host can never block the UI.
@@ -1714,62 +1686,60 @@ fn main() -> ! {
             }
         }
 
-        delay.delay_millis(if ftp_busy || ssh_busy { 1 } else { 10 });
+        delay.delay_millis(if ssh_busy { 1 } else { 10 });
     }
 }
 
-fn set_ftp_login_text(ui: &MainWindow, config: &WifiConfig) {
+fn set_ssh_login_text(ui: &MainWindow, config: &WifiConfig) {
     // 27 glyphs fit the 216 px content width. Long custom passwords are still
     // accepted but elided here; they remain editable in the password screen.
-    let text = format!("USER:{} PASS:{}", config.ftp.user, config.ftp.password);
-    ui.set_ftp_user(truncate_ascii(&text, 27).into());
+    let text = format!(
+        "USER:{} PASS:{}",
+        config.server.user, config.server.password
+    );
+    ui.set_ssh_user(truncate_ascii(&text, 27).into());
 }
 
-fn start_ftp(
-    server: &mut Option<ftp::FtpServer>,
+/// Split the host-key fingerprint into the two screen lines. OpenSSH shows
+/// `SHA256:<43 base64 chars>`; the display fits about 30 glyphs per line.
+fn set_ssh_hostkey_text(ui: &MainWindow, fingerprint: &str) {
+    if fingerprint == "none" {
+        if ui.get_ssh_key_top() != "KEY ON FIRST LOGIN" {
+            ui.set_ssh_key_top("KEY ON FIRST LOGIN".into());
+            ui.set_ssh_key_bottom("".into());
+        }
+    } else {
+        let split = fingerprint.len().min(29);
+        if ui.get_ssh_key_top() != &fingerprint[..split] {
+            ui.set_ssh_key_top(fingerprint[..split].into());
+            ui.set_ssh_key_bottom(fingerprint[split..].into());
+        }
+    }
+}
+
+fn start_ssh(
+    server: &mut Option<ssh::SshServer>,
     storage: &Option<storage::SdVolume>,
     network: &Option<net::Network>,
     config: &WifiConfig,
     ui: &MainWindow,
 ) {
     if storage.is_none() || network.is_none() {
-        ui.set_ftp_status("SD OR WI-FI UNAVAILABLE".into());
+        ui.set_ssh_status("SD OR WI-FI UNAVAILABLE".into());
         return;
     }
-    let network = network.as_ref().unwrap();
-    // The server exists since boot (network was up); starting only binds its
-    // already-reserved sockets, so no low-memory branch is needed here.
-    match server.as_mut().unwrap().start(network.stack()) {
-        Ok(()) => {
-            set_ftp_login_text(ui, config);
-            ui.set_ftp_status("WAITING FOR WI-FI".into());
-        }
-        Err(()) => ui.set_ftp_status("SD VOLUME ERROR".into()),
-    }
+    set_ssh_login_text(ui, config);
+    // The server exists since boot (network was up); starting only re-binds
+    // its already-reserved socket, so no low-memory branch is needed here.
+    server.as_mut().unwrap().start();
+    ui.set_ssh_status("WAITING FOR WI-FI".into());
 }
 
-fn stop_ftp(server: &mut Option<ftp::FtpServer>, storage: &Option<storage::SdVolume>) {
-    if let (Some(server), Some(_)) = (server.as_mut(), storage.as_ref()) {
-        if server.status() != ftp::FtpStatus::Stopped {
+fn stop_ssh(server: &mut Option<ssh::SshServer>) {
+    if let Some(server) = server {
+        if server.is_active() {
             server.stop();
         }
-    }
-}
-
-fn ftp_stats_text(stats: ftp::FtpStats) -> String {
-    format!(
-        "UP {}  DOWN {}  FREE {}K",
-        byte_size_text(stats.sent_bytes),
-        byte_size_text(stats.received_bytes),
-        esp_alloc::HEAP.free() / 1024
-    )
-}
-
-fn byte_size_text(bytes: u64) -> String {
-    if bytes < 1024 * 1024 {
-        format!("{}K", bytes / 1024)
-    } else {
-        format!("{}M", bytes / (1024 * 1024))
     }
 }
 

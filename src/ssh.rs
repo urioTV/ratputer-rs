@@ -1,4 +1,4 @@
-//! SSH server (spike): one session on TCP port 22, driven from the main loop.
+//! SSH server: one session on TCP port 22, driven from the main loop.
 //!
 //! `sunset` is sans-io: the application feeds it received TCP bytes
 //! (`Runner::input`), takes bytes to send (`Runner::output_buf`) and reacts
@@ -10,9 +10,11 @@
 //! The only expensive step is key exchange (X25519 + an Ed25519 signature),
 //! which runs synchronously inside one `progress()` call.
 //!
-//! This first stage offers a tiny command shell (`help`, `status`, `ping`,
-//! `exit`) to measure memory, flash and handshake time. SFTP comes later.
-//! Logins use the FTP credentials from `WIFI.CFG` (password only).
+//! This stage offers a tiny command shell (`help`, `status`, `ping`,
+//! `exit`) and the SFTP subsystem. Logins use the server credentials from
+//! `WIFI.CFG` (password only). The server accepts connections only while its
+//! SSH+SFTP screen is open, exactly like the FTP server it replaces; its
+//! socket buffers are still reserved at boot so restarting never allocates.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -30,10 +32,10 @@ use sha2::{Digest, Sha256};
 use sunset::{ChanData, ChanFail, ChanHandle, Event, Runner, ServEvent, Server, SignKey};
 
 use crate::sftp::Sftp;
-use crate::storage::{self, ClockConfig, FtpConfig, SdVolume};
+use crate::storage::{self, ClockConfig, SdVolume, ServerConfig};
 
 const SSH_PORT: u16 = 22;
-/// TCP buffers, leaked once at boot like the FTP sockets.
+/// TCP buffers, leaked once at boot.
 const SOCKET_RX_LEN: usize = 8192;
 const SOCKET_TX_LEN: usize = 8192;
 /// sunset packet buffers. They must hold the largest packet either side
@@ -137,6 +139,9 @@ impl Drop for Session {
 
 pub struct SshServer {
     socket: TcpSocket<'static>,
+    /// The server accepts connections only while its screen is open (like the
+    /// old FTP screen); buffers stay reserved so restarting never allocates.
+    active: bool,
     session: Option<Box<Session>>,
     hostkey: Option<SignKey>,
     fingerprint: String,
@@ -159,6 +164,7 @@ impl SshServer {
         socket.set_timeout(Some(NetDuration::from_secs(120)));
         let mut server = Self {
             socket,
+            active: false,
             session: None,
             hostkey: None,
             fingerprint: String::new(),
@@ -188,7 +194,9 @@ impl SshServer {
     }
 
     /// Generate a key (radio is up, so the RNG is a TRNG) and persist it.
-    fn ensure_hostkey(&mut self, volume: Option<&SdVolume>) {
+    /// Called on the first connection and from the screen once Wi-Fi is up,
+    /// so the fingerprint can be verified before the first login.
+    pub fn ensure_hostkey(&mut self, volume: Option<&SdVolume>) {
         if self.hostkey.is_none() {
             let mut seed = [0_u8; 32];
             esp_hal::rng::Rng::new().read(&mut seed);
@@ -207,6 +215,28 @@ impl SshServer {
         }
     }
 
+    /// Start accepting connections (the SSH+SFTP screen was opened).
+    pub fn start(&mut self) {
+        self.active = true;
+    }
+
+    /// Stop the listener and end any session. The client sees a TCP reset;
+    /// SFTP writes were already committed per chunk, so partial files stay
+    /// valid. Buffers remain reserved, the server can start again at once.
+    pub fn stop(&mut self) {
+        self.active = false;
+        if self.session.take().is_some() {
+            log::info!("SSH session dropped: the SSH+SFTP screen was closed");
+        }
+        self.closing_since = None;
+        self.socket.abort();
+    }
+
+    /// The screen is open: the listener or a session needs polling.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub fn fingerprint(&self) -> &str {
         if self.fingerprint.is_empty() {
             "none"
@@ -215,8 +245,18 @@ impl SshServer {
         }
     }
 
+    /// The connected peer's `ip:port`, for the screen and STATUS.
+    pub fn peer(&self) -> Option<&str> {
+        self.session
+            .as_ref()
+            .map(|session| session.shell.peer.as_str())
+    }
+
     /// Short state for STATUS and the UI.
     pub fn state(&self) -> String {
+        if !self.active {
+            return String::from("off");
+        }
         match &self.session {
             None if self.socket.state() == State::Listen => String::from("listening"),
             None => format!("{:?}", self.socket.state()).to_ascii_lowercase(),
@@ -234,6 +274,9 @@ impl SshServer {
 
     /// Advance the listener and the session once. Never blocks.
     pub fn poll(&mut self, context: &PollContext<'_>) {
+        if !self.active {
+            return;
+        }
         if self.session.is_none() {
             self.poll_listener(context.volume);
         }
@@ -474,7 +517,7 @@ impl SshServer {
 /// Everything a poll needs from the main loop.
 pub struct PollContext<'a> {
     pub volume: Option<&'a SdVolume>,
-    pub credentials: &'a FtpConfig,
+    pub credentials: &'a ServerConfig,
     pub clock: &'a ClockConfig,
     pub status: &'a dyn Fn() -> ShellStatus,
 }
@@ -631,7 +674,7 @@ fn channel_sftp(session: &mut Session, context: &PollContext<'_>) -> Result<bool
 fn handle_event(
     event: ServEvent<'_, '_>,
     hostkey: &SignKey,
-    credentials: &FtpConfig,
+    credentials: &ServerConfig,
     session: &mut Shell,
 ) -> sunset::Result<bool> {
     match event {

@@ -1,5 +1,5 @@
 //! Protocol-independent helpers for addressing the FAT volume by path, shared
-//! by the FTP and SFTP servers.
+//! by the SFTP server.
 //!
 //! Paths are component lists from the volume root. FAT handles returned here
 //! borrow the volume, so callers use and drop them within one poll step.
@@ -87,7 +87,7 @@ pub fn unpack_fat(dt: FatDateTime) -> (u16, u8, u8, u8, u8) {
     )
 }
 
-/// `ls -l`-style line, as FTP `LIST` and SFTP `READDIR` long names use.
+/// `ls -l`-style line, used by SFTP `READDIR` long names.
 pub fn long_listing_line(entry: &FileEntry) -> String {
     let name = entry.name();
     let (year, month, day, hour, minute) = unpack_fat(entry.modified());

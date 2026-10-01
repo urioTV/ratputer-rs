@@ -3,7 +3,7 @@
 Firmware for the **M5Stack Cardputer ADV** (ESP32-S3FN8 / Stamp-S3A) written in Rust.
 Contents: welcome splash with an animated pixel-art rat on a 240×135 ST7789V2 LCD,
 a nav-menu UI, full keyboard support, Wi-Fi scanning/connection, SD-backed
-credentials, USB Mass Storage export, a Wi-Fi FTP server, and an on-device SD
+credentials, USB Mass Storage export, a screen-gated SSH/SFTP server, and an on-device SD
 file manager, everything in **Slint (no_std)**. 🐀
 
 ## Stack
@@ -19,7 +19,6 @@ file manager, everything in **Slint (no_std)**. 🐀
 | Storage | `hadris-fat` (vendored) FAT volumes + TOML credentials; `embedded-sdmmc` is only the SD/BlockDevice driver on SPI3 |
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
 | USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
-| FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
 | SSH / SFTP | `sunset` 0.6 (vendored, sans-io) driven from the main loop (`src/ssh.rs`); own SFTP v3 server (`src/sftp.rs`) with writable SD access |
 | File manager | On-device FAT browser (`src/filemanager.rs`), bounded directory pages and streamed file/directory copying |
 | Reset watchdog | RTC watchdog (`src/watchdog.rs`) resets the chip when the main loop stops completing passes |
@@ -40,7 +39,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 - The template defines **two top-level screens** driven by the `splash-done` property
   (Slint `states` with `animate opacity { duration: 600ms; easing }`) plus fourteen
   mainscreen views (`view-state`: 0=menu, 1=rat, 2=Wi-Fi menu, 3=saved networks,
-  4=scan results, 5=password, 6=about, 7=USB disk, 8=FTP server, 9=FTP password,
+  4=scan results, 5=password, 6=about, 7=USB disk, 8=SSH/SFTP server, 9=server password,
   10–13=SD browser/actions/name/delete) and a
   **`key-pressed(string)`** callback:
   - **splash** — animated pixel-art rat (`ui/images/rat0..3.png` scaled ×4 =
@@ -55,8 +54,8 @@ file manager, everything in **Slint (no_std)**. 🐀
     connection status, and forgetting credentials;
   - **USB disk** (`view-state == 7`) — exports the whole physical SD card to the
     connected computer and reports waiting/mounted/ejected state;
-  - **FTP server** (`view-state == 8`) — shares the SD over Wi-Fi and reports its
-    address, login, client/transfer state, byte counters and free heap; Tab opens
+  - **SSH + SFTP SERVER** (`view-state == 8`) — shares the SD over Wi-Fi and reports its
+    address, login, client/transfer state, host-key fingerprint and free heap; Tab opens
     the password editor (`view-state == 9`);
   - **SD files** (`view-state == 10–13`) — browse, copy, move, rename, create and
     delete files or empty directories; no text preview or editor;
@@ -100,8 +99,8 @@ contents: its stale bytes can look like entries pointing at live files.
 The UI has **no file-content preview or text editor**. Copy errors leave the
 source untouched, but may leave a **partial destination**; the screen reports
 this explicitly, so inspect the destination before retrying. Never remove the
-card during a copy. SD FILES is unavailable while USB DISK owns the card, and FTP
-is stopped outside its own screen. The console's `KEY`, `TEXT`, and `CLEAR` can
+card during a copy. SD FILES is unavailable while USB DISK owns the card, and
+SSH/SFTP is stopped outside its own screen. The console's `KEY`, `TEXT`, and `CLEAR` can
 also operate the filename input; `TEXT` never echoes the name in its response.
 
 ### Wi-Fi credentials on SD
@@ -117,7 +116,7 @@ utc_offset_minutes = 60
 dst = "eu"                    # "eu" or "none"
 ntp_server = "pool.ntp.org"
 
-[ftp]                         # optional; shown on the FTP SERVER screen
+[ftp]                         # legacy name: SSH/SFTP credentials
 user = "rat"
 password = "cheese"
 
@@ -195,48 +194,18 @@ the serial port will disappear and re-enumerate during that interval. Descriptor
 currently use the development VID `0xCAFE` with PID `0x4002` and are not
 intended as production USB identifiers.
 
-### FTP server over Wi-Fi
-
-Connect the Cardputer to Wi-Fi, then open **FTP SERVER**. While that screen is
-open the firmware holds the FAT volume exclusively and listens on TCP port 21;
-the UI shows an address such as `FTP://192.168.1.23:21`. The default credentials
-are `rat` / `cheese`. Press **Tab** to edit the password (1–32 printable ASCII
-characters without spaces); it is saved in `[ftp]` in `WIFI.CFG`. Enter or
-Backspace stops the server and closes every open file before returning to the
-menu. USB DISK cannot take the card while FTP owns its volume.
-
-The implementation is a single-client, passive-mode server: control port 21 and
-fixed data port 50000 (`PASV` and `EPSV`; active `PORT`/`EPRT` are rejected). It
-supports `LIST`, `NLST`, `MLSD`, `MLST`, `PWD`, `CWD`, `CDUP`, `SIZE`, `MDTM`,
-`REST` for downloads, `RETR`, `STOR`, `DELE`, `MKD`, `RMD`, `ABOR`, and the usual
-login/session commands. `LIST -a`/`-la` options are accepted. Network and FTP
-futures run without an executor; during a transfer the main loop burst-polls TCP
-for up to 15 ms at a time, then returns to input and rendering. Transfers have no
-time cap — control-connection liveness is refreshed by data progress — while a
-stalled data connection is dropped after 45 s. Multi-megabyte uploads/downloads
-are verified checksum-clean on hardware (about 70–90 KiB/s up, 130–205 KiB/s
-down depending on file size and card fragmentation).
-
-Long (VFAT) filenames are fully supported for read and write. Uploads and
-directories may use long, spacing names up to 255 UTF-16 code units — the
-filesystem layer (`hadris-fat` 2.4) writes the VFAT entries and generates the
-8.3 alias itself. `RNFR`/`RNTO` rename and `DELE` of LFN entries work the same
-as for short names. Writes are write-through: the 226 reply means the data
-came to the card, and deletion frees the whole cluster chain.
-
-FTP credentials and all file contents travel in **plain text**. Use this only on
-a trusted LAN; the shared card contains `RATPUTER/WIFI.CFG` with Wi-Fi passwords.
-There is no anonymous login, TLS, internet exposure, or background server: closing
-the FTP screen immediately stops access. Files uploaded after SNTP synchronization
-receive the current configured local FAT timestamp.
-
 ### SSH and SFTP server over Wi-Fi
 
-Whenever the Cardputer is online, an SSH server listens on TCP port 22. It
-uses the same login as FTP (`[ftp]` in `WIFI.CFG`, default `rat` / `cheese`),
-password authentication only, one connection at a time. Unlike FTP, the
-password and all data are encrypted, so this is the recommended way to move
-files:
+Open **SSH + SFTP SERVER** to enable the server on TCP port 22. It is off
+at boot and everywhere outside that screen. Enter/Backspace stops the listener
+and disconnects the client before returning to the menu. Tab opens the password
+editor with the server stopped; save/cancel returns to the server screen.
+USB DISK and SD FILES cannot run concurrently with SSH/SFTP.
+
+The default login is `rat` / `cheese`, with password authentication only and one
+connection at a time. Credentials remain in the historical `[ftp]` section of
+`WIFI.CFG` for compatibility; the FTP implementation and ports 21/50000 have
+been removed. Passwords and transfer data are encrypted:
 
 ```text
 $ sftp rat@192.168.1.23            # or WinSCP / FileZilla, protocol SFTP
@@ -255,17 +224,16 @@ error. Modification times are reported in UTC (converted from the FAT local
 time with the configured offset and DST rule).
 
 Measured on hardware over Wi-Fi: about **180 KiB/s download** and **130 KiB/s
-upload** (FTP: 130–205 / 70–90 KiB/s), contents SHA-256 verified with OpenSSH
-`sftp`/`scp` and Paramiko, also while FTP transfers run at the same time. The
+upload**, contents SHA-256 verified with OpenSSH `sftp`/`scp` and Paramiko. The
 UI stays responsive during transfers (console `PING` within ~0.1 s). An
 interrupted upload leaves a valid partial file (whole 8 KiB chunks); the
-server returns to listening. USB DISK refuses to take the card while SFTP has
-files open ("SD IN USE BY SFTP").
+server returns to listening while the screen stays open. Leaving the screen
+also interrupts an active transfer; completed card writes remain committed.
 
 Cryptography: `mlkem768x25519-sha256` key exchange (post-quantum hybrid,
 OpenSSH 10's default; `curve25519-sha256` for older clients), `ssh-ed25519`
 host key, `chacha20-poly1305` or `aes256-ctr` + `hmac-sha2-256`. The host key
-is generated on the first connection from the hardware RNG (true random while
+is generated while the server screen is open and Wi-Fi is up, from the hardware RNG (true random while
 Wi-Fi is on) and stored as a raw 32-byte Ed25519 seed in
 `RATPUTER/SSHHOST.KEY`; `STATUS` prints its `SHA256:` fingerprint, so you can
 compare it with what the client shows on first contact. Anyone who can read
@@ -276,8 +244,9 @@ Memory: 16 KiB of TCP buffers are reserved at boot and 8 KiB of SSH packet
 buffers are static; a logged-in session costs ~3 KiB, and an SFTP transfer
 adds up to ~18 KiB (10 KiB request buffer for uploads, 8 KiB reply buffer for
 downloads, each allocated once on first use). The lowest free heap measured
-was ~32 KiB, with FTP and SFTP transferring at the same time after the Wi-Fi
-views had been opened; SFTP alone stays above ~55 KiB.
+was ~46 KiB during screen-lifecycle/transfer tests after the Wi-Fi views had
+been opened. Socket buffers remain reserved at boot to avoid heap fragmentation;
+no SSH protocol work runs while the server is off.
 
 ### Top bar: clock, Wi-Fi, battery
 
@@ -324,7 +293,7 @@ so the firmware uses a 50–250 ms dwell and merges **two scan passes** (status:
   allocator-tracked peak estimate (including short-lived allocations), build with
   `RATPUTER_FEATURES=heap-profiling build` and read `heap_peak_used` from `STATUS`.
   Profiling updates counters at every allocation; use the normal build for speed.
-  Exercise Wi-Fi, FTP transfers, and USB MSC before lowering the 150 KiB heap;
+  Exercise Wi-Fi, SFTP transfers, and USB MSC before lowering the 150 KiB heap;
 - Previous version: 4 ASCII-art frames (by Gio) — in git history.
 
 ## Development environment
@@ -402,10 +371,10 @@ rat> reboot
 ```
 
 `STATUS` reports the current view and selection indices, Wi-Fi/radio/network state,
-IPv4 address, mounted-storage/USB/FTP state, clock, battery, free/minimum heap, and saved or
-scanned SSIDs. It deliberately never returns Wi-Fi or FTP passwords. `KEY` accepts
+IPv4 address, mounted-storage/USB/SSH state, clock, battery, free/minimum heap, and saved or
+scanned SSIDs. It deliberately never returns Wi-Fi or SSH/SFTP passwords. `KEY` accepts
 `up`, `down`, `left`, `right`, `enter`, `back`, `backspace`, `delete`, `tab`, and
-`space`. `TEXT` appends printable ASCII only when a Wi-Fi or FTP password editor or the SD filename input is
+`space`. `TEXT` appends printable ASCII only when a Wi-Fi or server password editor or the SD filename input is
 open; `CLEAR` clears that active editor. `WDT` reports the reset watchdog (armed
 state, window, longest loop iteration since boot, cause of the last reset), while
 `WDT ON` and `WDT OFF` re-arm or disarm it. Type `help` to list the commands.
@@ -513,10 +482,11 @@ variant from mipidsi 0.7 for the same panel).
 10. Open **USB DISK** and confirm that the computer mounts `RATPUTER SD`; read and
     write a test file, eject it on the host, then press Backspace and verify that
     `WIFI.CFG` is reloaded.
-11. Open **FTP SERVER**, connect a passive FTP client to the displayed address with
-    `rat` / `cheese`, then test listing, an upload with a long filename, download,
-    delete, mkdir/rmdir, rename, resume download, disconnect, and password editing.
-    Confirm USB DISK is unavailable until the FTP screen is closed.
+11. Open **SSH + SFTP SERVER**, connect an SFTP client to the displayed address with
+    `rat` / `cheese`, then test listing, upload/download, delete, mkdir/rmdir,
+    rename, resume upload, disconnect, and password editing. Leave the screen
+    during a transfer and verify port 22 closes; reopen it and reconnect.
+    USB DISK is only available after leaving the server screen.
 12. Top bar: after connecting, the clock switches from `--:--` to local time within a
     few seconds and the bars turn bright; power off the AP and confirm `OFFLINE` while
     the clock keeps counting; compare the battery % against the charge level.

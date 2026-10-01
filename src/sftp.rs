@@ -13,8 +13,8 @@
 //! - Nothing new is parsed while a reply is still being sent, so the SSH
 //!   channel window (not this module) throttles a pipelining client.
 //!
-//! FAT handles borrow the volume and never outlive one `step`, exactly as in
-//! the FTP server. Open SFTP handles keep paths, offsets and the validated
+//! FAT handles borrow the volume and never outlive one `step`.
+//! Open SFTP handles keep paths, offsets and the validated
 //! hadris-fat `ReadCursor`/`AppendCursor` instead.
 //!
 //! Limitations (FAT has no Unix metadata): writes must be sequential at the

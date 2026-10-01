@@ -1,5 +1,5 @@
 //! On-device SD browser. FAT handles never outlive a single main-loop step;
-//! USB MSC and FTP cannot run while this view is open.
+//! USB MSC and SSH/SFTP cannot run while this view is open.
 
 use alloc::format;
 use alloc::string::String;
@@ -18,7 +18,7 @@ use crate::MainWindow;
 const PAGE_LEN: usize = 24;
 /// Rows that fit the browser viewport: the six static `fm-row-N` slots in the
 /// UI. Static rows cost nothing at runtime; a `for` repeater allocated ~2 KiB
-/// per row and kept it after leaving the screen, starving FTP of heap.
+/// per row and kept it after leaving the screen, starving other features of heap.
 const VISIBLE_ROWS: usize = 6;
 const COPY_CHUNK: usize = 2048;
 const MAX_COPY_DEPTH: usize = 12;

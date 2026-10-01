@@ -1,4 +1,4 @@
-//! SD-card Wi-Fi/FTP configuration (`RATPUTER/WIFI.CFG`, TOML) and the FAT
+//! SD-card Wi-Fi/server configuration (`RATPUTER/WIFI.CFG`, TOML) and the FAT
 //! volume mounted with `hadris-fat`.
 //!
 //! Ownership: one mounted `FatVolume` owns the raw SD card. Opening the USB
@@ -87,35 +87,37 @@ impl Default for ClockConfig {
     }
 }
 
-/// FTP server login. Shown on the FTP screen; the password can be changed there.
+/// Login for the network servers (SSH/SFTP; formerly FTP). Shown on the
+/// SSH+SFTP screen; the password can be changed there. Persisted in the
+/// `[ftp]` section of WIFI.CFG for compatibility with older cards.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FtpConfig {
-    #[serde(default = "default_ftp_user")]
+pub struct ServerConfig {
+    #[serde(default = "default_server_user")]
     pub user: String,
-    #[serde(default = "default_ftp_password")]
+    #[serde(default = "default_server_password")]
     pub password: String,
 }
 
-fn default_ftp_user() -> String {
+fn default_server_user() -> String {
     String::from("rat")
 }
 
-fn default_ftp_password() -> String {
+fn default_server_password() -> String {
     String::from("cheese")
 }
 
-impl Default for FtpConfig {
+impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            user: default_ftp_user(),
-            password: default_ftp_password(),
+            user: default_server_user(),
+            password: default_server_password(),
         }
     }
 }
 
-/// FTP credentials: 1-32 printable ASCII characters without spaces, so they can
-/// be typed on the Cardputer and shown in the pixel font.
-pub fn valid_ftp_credential(value: &str) -> bool {
+/// Server credentials: 1-32 printable ASCII characters without spaces, so
+/// they can be typed on the Cardputer and shown in the pixel font.
+pub fn valid_server_credential(value: &str) -> bool {
     (1..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
@@ -125,8 +127,9 @@ pub struct WifiConfig {
     // Kept before `networks`: TOML needs plain tables ahead of arrays of tables.
     #[serde(default)]
     pub clock: ClockConfig,
-    #[serde(default)]
-    pub ftp: FtpConfig,
+    // The TOML section keeps its historical `[ftp]` name.
+    #[serde(default, rename = "ftp")]
+    pub server: ServerConfig,
     #[serde(default)]
     pub networks: Vec<SavedNetwork>,
 }
@@ -136,7 +139,7 @@ impl Default for WifiConfig {
         Self {
             version: CONFIG_VERSION,
             clock: ClockConfig::default(),
-            ftp: FtpConfig::default(),
+            server: ServerConfig::default(),
             networks: Vec::new(),
         }
     }
@@ -182,11 +185,11 @@ impl WifiConfig {
         if self.clock.ntp_server.is_empty() || self.clock.ntp_server.len() > 64 {
             self.clock.ntp_server = default_ntp_server();
         }
-        if !valid_ftp_credential(&self.ftp.user) {
-            self.ftp.user = default_ftp_user();
+        if !valid_server_credential(&self.server.user) {
+            self.server.user = default_server_user();
         }
-        if !valid_ftp_credential(&self.ftp.password) {
-            self.ftp.password = default_ftp_password();
+        if !valid_server_credential(&self.server.password) {
+            self.server.password = default_server_password();
         }
         Ok(self)
     }
@@ -329,23 +332,7 @@ impl TimeProvider for FatClock {
     }
 }
 
-/// Format a FAT timestamp as `YYYYMMDDHHMMSS` (used by FTP MDTM/MLST) with the
-/// pre-sync fallback date.
-pub fn fmt_fat_mtime(date: FatDateTime) -> String {
-    let (raw_date, raw_time, _) = date.to_raw();
-    let year = ((raw_date >> 9) & 0x7F) + 1980;
-    alloc::format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}",
-        year,
-        (raw_date >> 5) & 0x0F,
-        raw_date & 0x1F,
-        (raw_time >> 11) & 0x1F,
-        (raw_time >> 5) & 0x3F,
-        (raw_time & 0x1F) * 2
-    )
-}
-
-/// Current local time for FTP LIST/MLSD fallbacks, 1980-01-01 before NTP sync.
+/// Current local time for SFTP long-name listings, 1980-01-01 before NTP sync.
 pub fn now_ymdhms() -> String {
     match local_now_seconds() {
         Some(now) => {

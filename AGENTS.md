@@ -33,15 +33,14 @@ src/usbdisk.rs     embassy-usb device setup, executor-less polling, USB-OTG PHY 
 src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD BlockDevice
 src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
 src/watchdog.rs    RTC watchdog: one feed per main-loop pass, reset instead of a battery pull
-src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
 src/ssh.rs         SSH server (vendored sunset, sans-io) polled from the main loop; shell + SFTP channel
 src/sftp.rs        SFTP v3 server: streamed WRITE/DATA, handles as paths + FAT cursors
-src/fspath.rs      path resolution and FAT lookups shared by FTP and SFTP
+src/fspath.rs      path resolution and FAT lookups for SFTP
 src/filemanager.rs on-device SD browser: paged listing, file operations, streamed copy jobs
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
 src/battery.rs     GPIO10/ADC1 battery gauge (2:1 divider, curve calibration, Li-ion %)
-ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/FTP/SD files/about)
+ui/ratputer.slint  All UI (splash → menu/rat/Wi-Fi/password/USB/SSH+SFTP/SD files/about)
 ui/images/, ui/fonts/  pixel-art frames + Press Start 2P (OFL)
 src/sdblock.rs     seekable first-partition adapter: MBR translate + sector RMW
 build.rs           compiles Slint resources
@@ -198,7 +197,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - Watches on memory: Wi-Fi init allocs ~tens of KB from the 150 KB heap. `STATUS`
   reports sampled `heap_free_min`; use `RATPUTER_FEATURES=heap-profiling nix develop -c build`
   to include the allocator's peak-usage estimate `heap_peak_used` (allocation overhead).
-  Flash and exercise Wi-Fi, FTP, and USB on hardware before shrinking the heap;
+  Flash and exercise Wi-Fi, SFTP, and USB on hardware before shrinking the heap;
   never infer safe headroom from an ELF build alone.
 
 ## USB debug console
@@ -217,7 +216,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   overflow a 2 KiB queue. Never replace this with blocking USB writes: a
   disconnected host must not freeze the UI or network loop.
 - `STATUS` may expose local operational state and SSIDs, but must never emit Wi-Fi
-  or FTP passwords. `TEXT` accepts credentials from a physically attached host but
+  or SSH/SFTP passwords. `TEXT` accepts credentials from a physically attached host but
   does not echo them in its response.
 - Hardware test scripts must keep the RAW serial stream and abort on
   `RATPUTER (Slint) start`, `panicked`, or a decreasing `uptime_ms`. Filtering
@@ -339,84 +338,29 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   keeps margin for MISO sampling. If a card shows read errors (`C` stays low, host
   I/O errors), fall back to 10 MHz before suspecting the MSC code.
 
-## FTP server
+## Storage and network server ownership
 
-- `src/ftp.rs` is a single-client FTP server on `embassy-net` TCP. It is active
-  **only** while view 8 is open. Control = port 21, fixed passive data = port 50000;
-  `PASV`/`EPSV` only, no active `PORT`/`EPRT`, anonymous access or TLS. Default
-  login is `rat` / `cheese`; `[ftp]` in `WIFI.CFG` persists it and Tab on the FTP
-  screen opens the password editor. Credentials and data are plaintext: LAN only.
-- Supported file operations: LIST/NLST/MLSD/MLST, PWD/CWD/CDUP, SIZE/MDTM,
-  RETR (+ REST), STOR, DELE, MKD, empty RMD, RNFR/RNTO and ABOR. `LIST -a`/`-la`
-  works. Full VFAT long filenames (255 UTF-16 units) for read AND write are
-  provided by `hadris-fat` 2.4, which generates the 8.3 alias itself.
-- FAT implementation: `hadris-fat` with features read/write/lfn/alloc/sync and
-  NO `cache` feature (its cache is write-back; this project is write-through).
-  `src/sdblock.rs` adapts the raw `embedded_sdmmc::BlockDevice` to
-  `embedded_io` 0.7 with MBR partition translation and sub-sector
-  read-modify-write (max 16 blocks per card command). `embedded-sdmmc` remains
-  only as the SD/BlockDevice driver; its VolumeManager is unused.
-- `hadris-fat` handles delete-empty-dir validation, cluster-chain freeing,
-  FSInfo updates, LFN runs across cluster boundaries, and stale-handle
-  revalidation. Do not reintroduce hand-written FAT entry patching.
-- Open FAT handles (`FatDir`, `FileReader`, `FileWriter`) borrow the volume,
-  so FTP creates/uses/drops them within one poll step. Transfer state kept
-  between polls is paths + byte offsets + opaque validated FAT cursors
-  (`AppendCursor`/`ReadCursor`, see src/ftp.rs header and vendor/hadris-fat
-  PATCHES.md) — without the cursors every 4 KiB chunk would re-walk the FAT
-  chain, making large transfers quadratic.
-- The vendor is reproducible: `vendor/hadris-fat/UPSTREAM.toml` records the
-  upstream release, commit, and checksum, while `vendor-patches/hadris-fat/`
-  contains the four local changes. Update only with
-  `./tools/update-hadris-fat.sh <version>`; review patch conflicts instead of
-  bypassing them manually.
-- Socket timeouts: the control socket has NO transport timeout; dead clients
-  are reaped by the session liveness timer (120 s without control OR data
-  progress) and the 5-minute idle timeout. A transport timeout on the control
-  socket resets any transfer outlasting it; only the passive data socket keeps
-  a 45 s transport timeout. Data progress refreshes `last_activity`.
-- The FTP screen owns one raw volume for its lifetime. Stop FTP and close all
-  RawFile/RawDirectory handles before USB MSC can call `VolumeManager::free()`.
-  `main.rs` enforces FTP↔USB exclusion and defensively stops FTP on navigation.
-- There is no executor: `TcpSocket::accept/read/write` futures are polled once
-  with `Waker::noop()` only when socket readiness says they can progress. During
-  transfers, main burst-polls `Network::poll_stack()` + `FtpServer::poll()` for
-  up to 15 ms, then returns to input/rendering. Do not consume `Network::poll()`
-  inside the burst or an SNTP completion result will be lost.
-- `Network` uses `StackResources<10>` for DHCP/DNS/SNTP plus five persistent
-  FTP sockets (four control listeners, one data) and the SSH listener: 9 of
-  10 slots. Adding a socket anywhere requires raising this number. `FtpServer` is created eagerly
-  right after `Network::new`, BEFORE any UI screen consumes heap: first renders
-  permanently allocate ~20 KiB. Lazy creation with a 32 KiB free threshold
-  made FTP unreachable after browsing. The control listeners have 512 B RX/TX
-  each; the data socket has 2 KiB RX/TX. Increasing the listener count without
-  increasing `StackResources` panics at boot (`adding a socket to a full
-  SocketSet`, black screen). Six control sockets with larger buffers left just
-  ~9 KiB minimum heap during browsing; four yielded 40/40 successful rapid
-  reconnects (both zero- and 20-ms pacing) with ~21 KiB minimum on FTP. Keep
-  `FtpServer::busy()` false after `stop()` or the main loop idles at 1 ms forever.
-  Do not reintroduce lazy creation or a free-heap threshold. UI refresh is 2 Hz.
-- LIST/NLST/MLSD with a directory argument list that directory's contents (RFC
-  959); a file argument still filters the parent listing by that name.
-- The passive data listener is armed in the SAME FTP poll that moves 227/229
-  into the control socket's TX buffer, i.e. before any network poll can
-  transmit it (still after the reply is queued, never before). An extra
-  "one FTP poll" delay used to sit here; with SFTP card work between polls
-  the reply reached the client first and the data SYN was refused (RST).
-  `abort()` takes a teardown-state data socket back to Closed at once, so it
-  is re-armed in the same poll too.
-- `TcpSocket::abort()` only marks the socket Closed; the RST goes out at the
-  next network poll and ONLY if the socket still has its remote endpoint.
-  Re-listening the slot (`accept`) before that poll silently drops the RST and
-  leaves the client hanging. Hence: a connection arriving while the previous
-  session is closing (QUIT sent or peer gone) is left Established and promoted
-  once the session slot frees; a genuine second concurrent client gets
-  "421 Only one FTP client at a time" + FIN, and its slot's teardown is not
-  aborted for `REFUSE_GRACE_SECS` (2 s). Verified: 60/60 zero-gap reconnects
-  under SFTP load (51/60 before), 3/3 second clients got 421.
-- FAT timestamps use `storage::FatClock`, backed by the SNTP-derived local time;
-  before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
-  the 226 reply. Do not add write-back caching.
+- FTP has been removed. Only SSH/SFTP runs, and only on view 8
+  (**SSH + SFTP SERVER**). The server starts off; leaving the screen or
+  opening the password editor (view 9) calls `stop()`, drops the session
+  and aborts the TCP socket. Card writes finish per chunk, so interruption
+  leaves a valid partial upload.
+- Reserve SSH socket buffers at boot, not lazily after rendering has
+  fragmented the heap. `start()` only enables listening; `poll()` does
+  nothing while inactive. Generate host keys only while active and Wi-Fi
+  is up, when the hardware RNG has true entropy.
+- USB DISK and the SD browser are entered from the menu, after SSH has
+  stopped. Keep the defensive `holds_sd()` check for USB ownership.
+- `Network` uses `StackResources<6>`: DHCP, DNS, transient SNTP and one
+  SSH TCP socket need four slots, leaving two spare. Raise the count before
+  adding sockets or smoltcp panics at boot.
+- `ServerConfig` holds login credentials. Its `WifiConfig::server` field
+  uses `serde(rename = "ftp")`, preserving existing cards' `[ftp]` TOML.
+  Tab on the server screen edits the password; saving/cancelling restarts it.
+- FAT remains write-through: hadris-fat read/write/lfn/alloc/sync, no cache
+  feature. Handles must not survive a poll step; retain validated
+  `ReadCursor`/`AppendCursor` instead. Update the vendor through
+  `./tools/update-hadris-fat.sh <version>`, never by bypassing patches.
 
 ## SSH server (sunset)
 
@@ -424,7 +368,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   takes bytes straight from the TCP receive ring (`TcpSocket::read_with`),
   `progress()` yields host-key/auth/channel events, `output_buf()` +
   `consume_output()` feed the socket. Every socket future is polled once with
-  `Waker::noop()` (same pattern as FTP); `sunset-async`/`sunset-embassy` are
+  `Waker::noop()`; `sunset-async`/`sunset-embassy` are
   NOT used because they need an executor.
 - `sunset` is vendored in `vendor/sunset` (0BSD) with reproducible patches in
   `vendor-patches/sunset/`; update only via `./tools/update-sunset.sh
@@ -435,18 +379,18 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   Keep that split or the borrow checker rejects any handler touching state.
 - Packet buffers (2 x 4 KiB) are static `.bss`, borrowed `'static` by the
   runner; `BUFFERS_IN_USE` enforces one runner at a time and `Session::drop`
-  releases it. TCP buffers (2 x 4 KiB) are leaked at boot like FTP's. Do not
+  releases it. TCP buffers (2 x 8 KiB) are leaked at boot. Do not
   use `Runner::new_server_owned()`: it boxes 2 x 35 KB (`SSH_MAX_PACKET`).
 - RNG: getrandom 0.4 is set to the custom backend in `.cargo/config.toml`
   (`--cfg getrandom_backend="custom"`); `src/ssh.rs` defines
   `__getrandom_v03_custom` (the symbol name in getrandom 0.4.3 source, despite
   esp-hal docs showing `v04`) on `esp_hal::rng::Rng`, which is a TRNG only
-  while the radio runs. The host key is generated on the first connection,
+  while the radio runs. The host key is generated while the server screen is active,
   never before Wi-Fi is up.
 - Host key = raw 32-byte Ed25519 seed in `/RATPUTER/SSHHOST.KEY` (written via
   `storage::write_config_file`). If the card is owned by USB MSC at generation
   time, the key stays in RAM and is saved on a later connection.
-- Login = FTP credentials, password only (`set_auth_methods(true, false)` on
+- Login = server credentials (historical `[ftp]` TOML section), password only (`set_auth_methods(true, false)` on
   `FirstAuth`); both username and password are compared in constant time and
   combined with `&`, not `&&`.
 - The `mlkem` feature (mlkem768x25519-sha256) is ON: OpenSSH 10 warns about
@@ -492,7 +436,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   ~88/78 KiB/s down/up; 8 KiB gives ~180/130. `stats.card_*_us` (logged at
   session end) showed the card at 55-60% of session time before the change.
 - Handles store paths + validated `ReadCursor`/`AppendCursor`, never FAT
-  handles (same rule as FTP). Writes must be at the current end of the file
+  handles. Writes must be at the current end of the file
   (`offset == size`); OPEN with TRUNC deletes and recreates the entry
   (a large file costs one ~0.5 s poll); resume walks the chain once via
   `FileWriter::new_append`. A DATA reply that cannot deliver its declared
@@ -502,15 +446,12 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   OP_UNSUPPORTED; no extensions are advertised.
 - Times: FAT local time -> UTC via `clock::unix_from_local` and the
   `[clock]` config. Paths are resolved from `/` with `fspath::resolve`
-  (no trimming: SFTP names may start or end with spaces, unlike FTP args).
+  (no trimming: SFTP names may start or end with spaces).
 - The main loop burst-polls (15 ms) network + SSH while `transferring()`.
-  SFTP load exposed two latent FTP races (fixed in ftp.rs, see FTP section):
-  the passive listener armed one FTP poll too late, and a zero-gap reconnect
-  after QUIT was aborted without the RST ever being sent.
 - USB DISK refuses to take the card while `holds_sd()` (open handles or a
   transfer). Volume `None` (card exported) makes every request fail cleanly.
 - Verified: OpenSSH sftp/scp and Paramiko (aes256-ctr + hmac-sha2-256),
-  SHA-256 of 3 KiB-10.7 MB files both ways, concurrent FTP + SFTP 3/3,
+  SHA-256 of 3 KiB-10.7 MB files both ways,
   killed clients mid-upload/download, PING latency <= 108 ms during a 10.7 MB
   download. USB-DISK refusal itself is untested on hardware (the console
   deliberately rejects KEY enter there).
@@ -549,7 +490,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   replace it with recursive deletion: stale entries may alias live files.
 - The file manager is dropped when leaving its screen; it never owns the SD
   card or keeps open FAT handles. USB MSC transfers ownership only from the
-  menu, FTP runs only on its screen. Do not start either while a copy is active.
+  menu, SSH/SFTP runs only on its screen. Do not start either while a copy is active.
   No file-content preview or editor is included.
 
 ## Network, clock, battery (top bar)
