@@ -38,6 +38,7 @@ mod battery;
 mod clock;
 mod debug;
 mod filemanager;
+mod fspath;
 mod ftp;
 mod msc;
 mod net;

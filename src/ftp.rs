@@ -27,11 +27,11 @@ use esp_hal::time::Instant;
 use hadris_fat::sync::{
     read::{FileReader, ReadCursor},
     write::{AppendCursor, FileWriter},
-    FatDir, FileEntry, SeekFrom,
+    FileEntry, SeekFrom,
 };
-use hadris_fat::time::FatDateTime;
 
-use crate::storage::{fmt_fat_mtime, now_ymdhms, FtpConfig, SdBlock, SdVolume};
+use crate::fspath::{find_in, long_listing_line, open_dir_path, resolve};
+use crate::storage::{fmt_fat_mtime, FtpConfig, SdVolume};
 
 pub const CONTROL_PORT: u16 = 21;
 /// Fixed passive-mode data listener.
@@ -1209,26 +1209,6 @@ fn not_found() -> String {
     String::from("550 No such file or directory")
 }
 
-/// Open the directory at absolute components. Handle is borrowed for this poll.
-fn open_dir_path<'a>(volume: &'a SdVolume, components: &[String]) -> Option<FatDir<'a, SdBlock>> {
-    let mut current = volume.root_dir();
-    for component in components {
-        current = current.open_dir(component).ok()?;
-    }
-    Some(current)
-}
-
-/// Find an entry by name inside a directory addressed by components.
-fn find_in<'a>(
-    volume: &'a SdVolume,
-    parent: &[String],
-    leaf: &str,
-) -> Option<(FileEntry, FatDir<'a, SdBlock>)> {
-    let dir = open_dir_path(volume, parent)?;
-    let entry = dir.find(leaf).ok().flatten()?;
-    Some((entry, dir))
-}
-
 fn find_for(cwd: &[String], volume: &SdVolume, arg: &str) -> Option<FileEntry> {
     let (parent, leaf) = split_path(cwd, arg);
     find_in(volume, &parent, &leaf?).map(|(entry, _)| entry)
@@ -1365,48 +1345,8 @@ fn listing_line(kind: ListKind, entry: &FileEntry) -> String {
                 name
             )
         }
-        ListKind::List => {
-            let (year, month, day, hour, minute) = unpack_fat(entry.modified());
-            let permissions = if entry.is_directory() {
-                "drwxr-xr-x"
-            } else {
-                "-rw-r--r--"
-            };
-            let month_name = MONTHS[(month as usize).saturating_sub(1).min(11)];
-            let current_year = now_ymdhms();
-            let same_year = current_year.starts_with(&format!("{year:04}"));
-            let when = if same_year {
-                format!("{hour:02}:{minute:02}")
-            } else {
-                format!("{year:>5}")
-            };
-            format!(
-                "{} 1 rat rat {:>13} {} {:>2} {} {}",
-                permissions,
-                entry.len(),
-                month_name,
-                day,
-                when,
-                name
-            )
-        }
+        ListKind::List => long_listing_line(entry),
     }
-}
-
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// Unpack a FAT datetime into (year, month, day, hour, minute).
-fn unpack_fat(dt: FatDateTime) -> (u16, u8, u8, u8, u8) {
-    let (date, time, _) = dt.to_raw();
-    (
-        ((date >> 9) & 0x7F) + 1980,
-        ((date >> 5) & 0x0F) as u8,
-        (date & 0x1F) as u8,
-        ((time >> 11) & 0x1F) as u8,
-        ((time >> 5) & 0x3F) as u8,
-    )
 }
 
 /// Split a path argument into (parent components, optional leaf name).
@@ -1427,23 +1367,10 @@ fn need_leaf(cwd: &[String], arg: &str) -> Option<(Vec<String>, String)> {
 }
 
 /// Normalize an FTP path relative to the session cwd, respecting `..`.
+/// FTP clients may quote paths or pad them with spaces; strip both here.
 fn normalize(cwd: &[String], arg: &str) -> Vec<String> {
     let arg = arg.trim().trim_matches('"').replace('\\', "/");
-    let mut result: Vec<String> = if arg.starts_with('/') {
-        Vec::new()
-    } else {
-        cwd.to_vec()
-    };
-    for component in arg.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                result.pop();
-            }
-            name => result.push(name.to_string()),
-        }
-    }
-    result
+    resolve(cwd, &arg)
 }
 
 /// `true` when `target` is the current directory or one of its ancestors.
