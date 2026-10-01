@@ -29,12 +29,13 @@ use esp_hal::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use sunset::{ChanData, ChanFail, ChanHandle, Event, Runner, ServEvent, Server, SignKey};
 
-use crate::storage::{self, FtpConfig, SdVolume};
+use crate::sftp::Sftp;
+use crate::storage::{self, ClockConfig, FtpConfig, SdVolume};
 
 const SSH_PORT: u16 = 22;
 /// TCP buffers, leaked once at boot like the FTP sockets.
-const SOCKET_RX_LEN: usize = 4096;
-const SOCKET_TX_LEN: usize = 4096;
+const SOCKET_RX_LEN: usize = 8192;
+const SOCKET_TX_LEN: usize = 8192;
 /// sunset packet buffers. They must hold the largest packet either side
 /// sends; sunset advertises 1000-byte channel packets, and OpenSSH's
 /// handshake packets (KEXINIT, user auth) stay well below 4 KiB.
@@ -45,9 +46,17 @@ const HOSTKEY_FILE: &str = "SSHHOST.KEY";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 /// Authenticated sessions without any traffic are dropped after this long.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Log an SSH poll slower than this (see `poll`).
+const SLOW_POLL_MS: u64 = 500;
+/// Time a gracefully closed connection may linger in FIN states.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Bound the work done per main-loop pass.
 const MAX_PROGRESS_STEPS: usize = 16;
 const MAX_LINE: usize = 128;
+/// Socket/protocol/channel rounds per poll (see `poll_session`).
+const MAX_ROUNDS: usize = 8;
+/// SFTP process/reply steps per round.
+const SFTP_STEPS: usize = 8;
 
 // The packet buffers live in .bss, not on the heap. `Runner` borrows them for
 // `'static`; `BUFFERS_IN_USE` guarantees a single borrower at a time.
@@ -114,6 +123,8 @@ struct Shell {
     exec_pending: bool,
     /// Reported to the client when the channel closes (127 = unknown).
     exit_status: u32,
+    /// The channel runs the `sftp` subsystem instead of the shell.
+    sftp: Option<Box<Sftp>>,
 }
 
 impl Drop for Session {
@@ -132,6 +143,8 @@ pub struct SshServer {
     /// A generated key is waiting for the SD card (USB DISK owned it).
     unsaved_seed: Option<[u8; 32]>,
     pub sessions_total: u32,
+    /// Graceful close started; teardown states are given `CLOSE_GRACE`.
+    closing_since: Option<Instant>,
 }
 
 impl SshServer {
@@ -151,6 +164,7 @@ impl SshServer {
             fingerprint: String::new(),
             unsaved_seed: None,
             sessions_total: 0,
+            closing_since: None,
         };
         if let Some(volume) = volume {
             match storage::read_config_file(volume, HOSTKEY_FILE, 64) {
@@ -219,35 +233,71 @@ impl SshServer {
     }
 
     /// Advance the listener and the session once. Never blocks.
-    pub fn poll(
-        &mut self,
-        volume: Option<&SdVolume>,
-        credentials: &FtpConfig,
-        status: &dyn Fn() -> ShellStatus,
-    ) {
+    pub fn poll(&mut self, context: &PollContext<'_>) {
         if self.session.is_none() {
-            self.poll_listener(volume);
+            self.poll_listener(context.volume);
         }
         let Some(mut session) = self.session.take() else {
             return;
         };
-        let keep = self.poll_session(&mut session, credentials, status);
+        let poll_started = Instant::now();
+        let keep = self.poll_session(&mut session, context);
+        // Diagnostics: one poll should cost one card chunk at most. Expected
+        // outliers are key exchange (~0.13 s) and replacing a large file on
+        // OPEN with TRUNC (its whole cluster chain is freed at once).
+        let poll_ms = poll_started.elapsed().as_millis();
+        if poll_ms > SLOW_POLL_MS {
+            log::warn!(
+                "Slow SSH poll: {poll_ms} ms (authenticated={} sftp={})",
+                session.shell.authenticated,
+                session.shell.sftp.is_some()
+            );
+        }
         if keep {
             self.session = Some(session);
         } else {
+            if let Some(sftp) = session.shell.sftp.as_ref() {
+                log::info!(
+                    "SFTP session ended: {} requests, {} B read, {} B written",
+                    sftp.stats.requests,
+                    sftp.stats.bytes_read,
+                    sftp.stats.bytes_written
+                );
+            }
             log::info!(
                 "SSH session from {} closed after {} ms",
                 session.shell.peer,
                 session.shell.started.elapsed().as_millis()
             );
-            self.socket.abort();
+            // FIN rather than RST: the client may still be reading our last
+            // packets. `poll_listener` aborts if the teardown stalls.
+            self.socket.close();
+            self.closing_since = Some(Instant::now());
             drop(session);
         }
+    }
+
+    /// An SFTP transfer is in flight: the main loop should burst-poll.
+    pub fn transferring(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| session.shell.sftp.as_ref())
+            .is_some_and(|sftp| sftp.transferring())
+    }
+
+    /// SFTP holds open files or directories: the SD card must not move to
+    /// USB DISK under it.
+    pub fn holds_sd(&self) -> bool {
+        self.session
+            .as_ref()
+            .and_then(|session| session.shell.sftp.as_ref())
+            .is_some_and(|sftp| sftp.has_open_handles() || sftp.transferring())
     }
 
     fn poll_listener(&mut self, volume: Option<&SdVolume>) {
         match self.socket.state() {
             State::Closed => {
+                self.closing_since = None;
                 // listen() is idempotent on an already-listening socket.
                 let _ = poll_once(self.socket.accept(SSH_PORT));
             }
@@ -288,21 +338,23 @@ impl SshServer {
                         kex_done_logged: false,
                         exec_pending: false,
                         exit_status: 0,
+                        sftp: None,
                     },
                 }));
             }
             State::Listen | State::SynReceived => {}
-            _ => self.socket.abort(),
+            _ if self
+                .closing_since
+                .is_some_and(|since| since.elapsed() < CLOSE_GRACE) => {}
+            _ => {
+                self.closing_since = None;
+                self.socket.abort();
+            }
         }
     }
 
     /// Returns `false` when the session is over.
-    fn poll_session(
-        &mut self,
-        session: &mut Session,
-        credentials: &FtpConfig,
-        status: &dyn Fn() -> ShellStatus,
-    ) -> bool {
+    fn poll_session(&mut self, session: &mut Session, context: &PollContext<'_>) -> bool {
         let now = Instant::now();
         if !session.shell.authenticated && now - session.shell.started > AUTH_TIMEOUT {
             log::warn!("SSH: authentication timeout for {}", session.shell.peer);
@@ -312,6 +364,29 @@ impl SshServer {
             log::info!("SSH: idle timeout for {}", session.shell.peer);
             return false;
         }
+        if let Some(sftp) = session.shell.sftp.as_mut() {
+            sftp.begin_poll();
+        }
+        // Several rounds per call: the sunset output buffer holds only one
+        // packet, so during a transfer it must be drained to TCP often.
+        for _ in 0..MAX_ROUNDS {
+            match self.round(session, context) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(()) => return false,
+            }
+        }
+        if !self.socket.may_send() && !self.socket.may_recv() {
+            return false;
+        }
+        true
+    }
+
+    /// One pass of socket input, protocol progress, channel I/O and socket
+    /// output. `Ok(true)` if anything moved, `Err` to end the session.
+    fn round(&mut self, session: &mut Session, context: &PollContext<'_>) -> Result<bool, ()> {
+        let now = Instant::now();
+        let mut moved = false;
 
         // 1. Network -> sunset, straight out of the socket's receive ring.
         if self.socket.can_recv() && session.runner.is_input_ready() {
@@ -320,13 +395,16 @@ impl SshServer {
                 Ok(used) => (used, Ok(used)),
                 Err(error) => (0, Err(error)),
             })) {
-                Some(Ok(Ok(used))) if used > 0 => session.shell.last_activity = now,
+                Some(Ok(Ok(used))) if used > 0 => {
+                    session.shell.last_activity = now;
+                    moved = true;
+                }
                 Some(Ok(Ok(_))) | None => {}
                 Some(Ok(Err(error))) => {
                     log::warn!("SSH input error from {}: {error:?}", session.shell.peer);
-                    return false;
+                    return Err(());
                 }
-                Some(Err(_)) => return false,
+                Some(Err(_)) => return Err(()),
             }
         }
         if !self.socket.may_recv() && !self.socket.can_recv() {
@@ -339,23 +417,24 @@ impl SshServer {
                 Ok(event) => event,
                 Err(error) => {
                     log::warn!("SSH protocol error from {}: {error:?}", session.shell.peer);
-                    return false;
+                    return Err(());
                 }
             };
             match event {
                 Event::None => break,
-                Event::Progressed => continue,
-                Event::Cli(_) => return false,
+                Event::Progressed => moved = true,
+                Event::Cli(_) => return Err(()),
                 Event::Serv(event) => {
+                    moved = true;
                     let Some(hostkey) = self.hostkey.as_ref() else {
-                        return false;
+                        return Err(());
                     };
-                    match handle_event(event, hostkey, credentials, &mut session.shell) {
+                    match handle_event(event, hostkey, context.credentials, &mut session.shell) {
                         Ok(true) => {}
-                        Ok(false) => return false,
+                        Ok(false) => return Err(()),
                         Err(error) => {
                             log::warn!("SSH event error: {error:?}");
-                            return false;
+                            return Err(());
                         }
                     }
                 }
@@ -363,56 +442,14 @@ impl SshServer {
         }
 
         // 3. Channel data in both directions.
-        if session.shell.exec_pending {
-            session.shell.exec_pending = false;
-            let line = core::mem::take(&mut session.shell.line);
-            run_command(&mut session.shell, &line, status);
-        }
-        if let Some(channel) = session.shell.channel.as_ref() {
-            let mut input = [0_u8; 128];
-            match session
-                .runner
-                .read_channel(channel, ChanData::Normal, &mut input)
-            {
-                Ok(0) => {}
-                Ok(count) => {
-                    session.shell.last_activity = now;
-                    shell_input(&mut session.shell, &input[..count], status);
-                }
-                Err(sunset::Error::ChannelEOF) => {
-                    session.shell.close_after_reply = true;
-                }
-                Err(error) => {
-                    log::warn!("SSH channel read error: {error:?}");
-                    return false;
-                }
+        if session.shell.sftp.is_some() {
+            if channel_sftp(session, context)? {
+                session.shell.last_activity = now;
+                moved = true;
             }
-        }
-        if let Some(channel) = session.shell.channel.as_ref() {
-            if !session.shell.reply.is_empty() {
-                match session
-                    .runner
-                    .write_channel(channel, ChanData::Normal, &session.shell.reply)
-                {
-                    Ok(written) => {
-                        session.shell.reply.drain(..written);
-                    }
-                    Err(sunset::Error::ChannelEOF) => session.shell.reply.clear(),
-                    Err(error) => {
-                        log::warn!("SSH channel write error: {error:?}");
-                        return false;
-                    }
-                }
-            }
-            if session.shell.close_after_reply && session.shell.reply.is_empty() {
-                if let Some(channel) = session.shell.channel.take() {
-                    // Vendor patch 0001: sunset can now end the channel itself.
-                    let _ = session
-                        .runner
-                        .close_channel(&channel, Some(session.shell.exit_status));
-                    let _ = session.runner.channel_done(channel);
-                }
-            }
+        } else if channel_shell(session, context.status)? {
+            session.shell.last_activity = now;
+            moved = true;
         }
 
         // 4. sunset -> network.
@@ -422,17 +459,172 @@ impl SshServer {
                 break;
             }
             match poll_once(self.socket.write(pending)) {
-                Some(Ok(written)) if written > 0 => session.runner.consume_output(written),
+                Some(Ok(written)) if written > 0 => {
+                    session.runner.consume_output(written);
+                    moved = true;
+                }
                 Some(Ok(_)) | None => break,
-                Some(Err(_)) => return false,
+                Some(Err(_)) => return Err(()),
             }
         }
-
-        if !self.socket.may_send() && !self.socket.may_recv() {
-            return false;
-        }
-        true
+        Ok(moved)
     }
+}
+
+/// Everything a poll needs from the main loop.
+pub struct PollContext<'a> {
+    pub volume: Option<&'a SdVolume>,
+    pub credentials: &'a FtpConfig,
+    pub clock: &'a ClockConfig,
+    pub status: &'a dyn Fn() -> ShellStatus,
+}
+
+/// Interactive shell / exec channel. `Ok(true)` if bytes moved.
+fn channel_shell(session: &mut Session, status: &dyn Fn() -> ShellStatus) -> Result<bool, ()> {
+    let mut moved = false;
+    if session.shell.exec_pending {
+        session.shell.exec_pending = false;
+        let line = core::mem::take(&mut session.shell.line);
+        run_command(&mut session.shell, &line, status);
+        moved = true;
+    }
+    let Some(channel) = session.shell.channel.as_ref() else {
+        return Ok(moved);
+    };
+    let mut input = [0_u8; 128];
+    match session
+        .runner
+        .read_channel(channel, ChanData::Normal, &mut input)
+    {
+        Ok(0) => {}
+        Ok(count) => {
+            moved = true;
+            shell_input(&mut session.shell, &input[..count], status);
+        }
+        Err(sunset::Error::ChannelEOF) => session.shell.close_after_reply = true,
+        Err(error) => {
+            log::warn!("SSH channel read error: {error:?}");
+            return Err(());
+        }
+    }
+    let Some(channel) = session.shell.channel.as_ref() else {
+        return Ok(moved);
+    };
+    if !session.shell.reply.is_empty() {
+        match session
+            .runner
+            .write_channel(channel, ChanData::Normal, &session.shell.reply)
+        {
+            Ok(written) => {
+                moved |= written > 0;
+                session.shell.reply.drain(..written);
+            }
+            Err(sunset::Error::ChannelEOF) => session.shell.reply.clear(),
+            Err(error) => {
+                log::warn!("SSH channel write error: {error:?}");
+                return Err(());
+            }
+        }
+    }
+    if session.shell.close_after_reply && session.shell.reply.is_empty() {
+        if let Some(channel) = session.shell.channel.take() {
+            // Vendor patch 0001: sunset can now end the channel itself.
+            let _ = session
+                .runner
+                .close_channel(&channel, Some(session.shell.exit_status));
+            let _ = session.runner.channel_done(channel);
+            moved = true;
+        }
+    }
+    Ok(moved)
+}
+
+/// SFTP subsystem channel. `Ok(true)` if bytes moved.
+fn channel_sftp(session: &mut Session, context: &PollContext<'_>) -> Result<bool, ()> {
+    let Some(channel) = session.shell.channel.as_ref() else {
+        return Ok(false);
+    };
+    let Some(sftp) = session.shell.sftp.as_mut() else {
+        return Ok(false);
+    };
+    let mut moved = false;
+
+    // Requests in, as far as the SFTP input bound allows. Not reading leaves
+    // the data in sunset, which then stops extending the channel window.
+    let space = sftp.input_space();
+    if space > 0 {
+        let mut input = [0_u8; 1024];
+        let wanted = space.min(input.len());
+        match session
+            .runner
+            .read_channel(channel, ChanData::Normal, &mut input[..wanted])
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                sftp.feed(&input[..count]);
+                moved = true;
+            }
+            Err(sunset::Error::ChannelEOF) => {
+                // The client ended the subsystem (sftp "bye", scp done):
+                // report success and close the channel like sftp-server.
+                let stats = sftp.stats;
+                log::info!(
+                    "SFTP closed by client: {} requests, {} B read, {} B written, \
+                     card read {} ms, card write {} ms, session {} ms",
+                    stats.requests,
+                    stats.bytes_read,
+                    stats.bytes_written,
+                    stats.card_read_us / 1000,
+                    stats.card_write_us / 1000,
+                    session.shell.started.elapsed().as_millis()
+                );
+                session.shell.sftp = None;
+                if let Some(channel) = session.shell.channel.take() {
+                    let _ = session.runner.close_channel(&channel, Some(0));
+                    let _ = session.runner.channel_done(channel);
+                }
+                return Ok(true);
+            }
+            Err(error) => {
+                log::warn!("SFTP channel read error: {error:?}");
+                return Err(());
+            }
+        }
+    }
+
+    // Process, then send replies, until the channel cannot take more.
+    for _ in 0..SFTP_STEPS {
+        let stepped = sftp.step(context.volume, context.clock);
+        let mut wrote = false;
+        if !sftp.output().is_empty() {
+            match session
+                .runner
+                .write_channel(channel, ChanData::Normal, sftp.output())
+            {
+                Ok(written) => {
+                    wrote = written > 0;
+                    sftp.consume_output(written);
+                }
+                Err(sunset::Error::ChannelEOF) => return Err(()),
+                Err(error) => {
+                    log::warn!("SFTP channel write error: {error:?}");
+                    return Err(());
+                }
+            }
+        }
+        if sftp.is_fatal() {
+            return Err(());
+        }
+        moved |= stepped | wrote;
+        if !stepped && !wrote {
+            break;
+        }
+        // A full sunset output buffer needs the socket before more fits.
+        if !sftp.output().is_empty() && !wrote {
+            break;
+        }
+    }
+    Ok(moved)
 }
 
 /// Returns `Ok(false)` to end the session.
@@ -501,7 +693,15 @@ fn handle_event(
             session.close_after_reply = true;
             session.exec_pending = true;
         }
-        ServEvent::SessionSubsystem(request) => request.fail()?,
+        ServEvent::SessionSubsystem(request) => {
+            if request.command().is_ok_and(|name| name == "sftp") && session.sftp.is_none() {
+                request.succeed()?;
+                session.sftp = Some(Box::new(Sftp::new()));
+                log::info!("SFTP subsystem started for {}", session.peer);
+            } else {
+                request.fail()?;
+            }
+        }
         ServEvent::SessionEnv(request) => request.fail()?,
         ServEvent::Defunct => return Ok(false),
         ServEvent::PollAgain => {}

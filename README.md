@@ -20,7 +20,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
 | USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
-| SSH server | `sunset` 0.6 (vendored, sans-io) driven from the main loop (`src/ssh.rs`); preview: command shell, SFTP planned |
+| SSH / SFTP | `sunset` 0.6 (vendored, sans-io) driven from the main loop (`src/ssh.rs`); own SFTP v3 server (`src/sftp.rs`) with writable SD access |
 | File manager | On-device FAT browser (`src/filemanager.rs`), bounded directory pages and streamed file/directory copying |
 | Reset watchdog | RTC watchdog (`src/watchdog.rs`) resets the chip when the main loop stops completing passes |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
@@ -230,34 +230,54 @@ There is no anonymous login, TLS, internet exposure, or background server: closi
 the FTP screen immediately stops access. Files uploaded after SNTP synchronization
 receive the current configured local FAT timestamp.
 
-### SSH server over Wi-Fi (preview)
+### SSH and SFTP server over Wi-Fi
 
 Whenever the Cardputer is online, an SSH server listens on TCP port 22. It
 uses the same login as FTP (`[ftp]` in `WIFI.CFG`, default `rat` / `cheese`),
-password authentication only, one session at a time:
+password authentication only, one connection at a time. Unlike FTP, the
+password and all data are encrypted, so this is the recommended way to move
+files:
 
 ```text
-$ ssh rat@192.168.1.23 status
-uptime_ms=57433 heap_free=95096 heap_free_min=91704 loop_max_ms=595
-$ ssh rat@192.168.1.23        # interactive: help, status, ping, exit
+$ sftp rat@192.168.1.23            # or WinSCP / FileZilla, protocol SFTP
+$ scp photo.jpg rat@192.168.1.23:/downloads/
+$ ssh rat@192.168.1.23 status      # small shell: help, status, ping, exit
 ```
 
-Unlike FTP, the password and all traffic are encrypted:
-`mlkem768x25519-sha256` key exchange (post-quantum hybrid, OpenSSH 10's
-default), `ssh-ed25519` host key, `chacha20-poly1305`. The host key is
-generated on the first connection from the hardware RNG (true random while
+SFTP (protocol version 3, what every common client speaks) supports
+listing, `stat`, download with random access, upload, resume (`reput`),
+append, `mkdir`, `rmdir` (empty directories), `rm`, and `rename` (refuses to
+overwrite an existing target, as SFTP v3 requires). Long VFAT names, spaces and
+UTF-8 work. FAT has no Unix metadata, so `chmod`/owner/time changes are
+accepted and ignored; changing a file's size via `setstat`, writing anywhere
+except the current end of a file, and symlinks are refused with an explicit
+error. Modification times are reported in UTC (converted from the FAT local
+time with the configured offset and DST rule).
+
+Measured on hardware over Wi-Fi: about **180 KiB/s download** and **130 KiB/s
+upload** (FTP: 130–205 / 70–90 KiB/s), contents SHA-256 verified with OpenSSH
+`sftp`/`scp` and Paramiko, also while FTP transfers run at the same time. The
+UI stays responsive during transfers (console `PING` within ~0.1 s). An
+interrupted upload leaves a valid partial file (whole 8 KiB chunks); the
+server returns to listening. USB DISK refuses to take the card while SFTP has
+files open ("SD IN USE BY SFTP").
+
+Cryptography: `mlkem768x25519-sha256` key exchange (post-quantum hybrid,
+OpenSSH 10's default; `curve25519-sha256` for older clients), `ssh-ed25519`
+host key, `chacha20-poly1305` or `aes256-ctr` + `hmac-sha2-256`. The host key
+is generated on the first connection from the hardware RNG (true random while
 Wi-Fi is on) and stored as a raw 32-byte Ed25519 seed in
 `RATPUTER/SSHHOST.KEY`; `STATUS` prints its `SHA256:` fingerprint, so you can
-compare it with what `ssh` shows on first contact. Anyone who can read the SD
-card can read that key. Delete the file to rotate the key.
+compare it with what the client shows on first contact. Anyone who can read
+the SD card can read that key; delete the file to rotate it. Login plus one
+command takes ~0.55 s; key exchange costs ~0.13 s of one main-loop pass.
 
-Measured on hardware: login plus one command ~0.55 s from a LAN host, no main
-loop pass longer than the usual ~0.6 s, ~6 KiB extra heap during a session
-(8 KiB of TCP buffers are reserved at boot, 8 KiB of packet buffers are static).
-A second connection is refused while a session is open; a killed client, a
-garbage handshake, 60 s without authentication or 10 minutes idle all return
-the server to listening. This is a first stage: SFTP (file access over the same
-login) is the next step, after which FTP may be retired.
+Memory: 16 KiB of TCP buffers are reserved at boot and 8 KiB of SSH packet
+buffers are static; a logged-in session costs ~3 KiB, and an SFTP transfer
+adds up to ~18 KiB (10 KiB request buffer for uploads, 8 KiB reply buffer for
+downloads, each allocated once on first use). The lowest free heap measured
+was ~32 KiB, with FTP and SFTP transferring at the same time after the Wi-Fi
+views had been opened; SFTP alone stays above ~55 KiB.
 
 ### Top bar: clock, Wi-Fi, battery
 

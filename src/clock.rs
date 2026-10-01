@@ -47,6 +47,32 @@ pub fn local_seconds(unix_seconds: u64, config: &ClockConfig) -> i64 {
     local
 }
 
+/// Inverse of [`local_seconds`]: UTC Unix seconds for a local wall-clock
+/// value. In the repeated autumn hour the earlier (summer-time) instant wins.
+pub fn unix_from_local(local: i64, config: &ClockConfig) -> i64 {
+    let standard = local - i64::from(config.utc_offset_minutes) * 60;
+    if config.dst == DstRule::Eu && eu_summer_time(standard - 3600) {
+        standard - 3600
+    } else {
+        standard
+    }
+}
+
+/// Seconds since 1970-01-01 of a calendar date and time, without any zone.
+pub fn seconds_from_civil(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> i64 {
+    days_from_civil(year, month, day) * SECONDS_PER_DAY
+        + i64::from(hour) * 3600
+        + i64::from(minute) * 60
+        + i64::from(second)
+}
+
 /// Calendar fields of a [`local_seconds`] value.
 #[derive(Clone, Copy)]
 pub struct DateTime {

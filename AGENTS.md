@@ -34,7 +34,9 @@ src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD Blo
 src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
 src/watchdog.rs    RTC watchdog: one feed per main-loop pass, reset instead of a battery pull
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
-src/ssh.rs         SSH server (vendored sunset, sans-io) polled from the main loop; preview shell
+src/ssh.rs         SSH server (vendored sunset, sans-io) polled from the main loop; shell + SFTP channel
+src/sftp.rs        SFTP v3 server: streamed WRITE/DATA, handles as paths + FAT cursors
+src/fspath.rs      path resolution and FAT lookups shared by FTP and SFTP
 src/filemanager.rs on-device SD browser: paged listing, file operations, streamed copy jobs
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
@@ -416,7 +418,7 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
   the 226 reply. Do not add write-back caching.
 
-## SSH server (sunset, preview)
+## SSH server (sunset)
 
 - `src/ssh.rs` drives `sunset` 0.6 as a pure state machine: `Runner::input()`
   takes bytes straight from the TCP receive ring (`TcpSocket::read_with`),
@@ -454,8 +456,64 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - Verified on hardware: exec + exit status, interactive pty shell (echo,
   Backspace, Ctrl+C/D), wrong password rejected, second connection refused,
   killed client and garbage handshake recover to listening, host key survives
-  reflashing. sunset-sftp 0.2 lacks REMOVE/MKDIR/RMDIR/RENAME/SETSTAT and is
-  executor-based; the plan is to reuse its protocol parsing only.
+  reflashing.
+- Session = `poll_session` running up to `MAX_ROUNDS` rounds of: socket ->
+  `Runner::input`, `progress()` events, channel I/O, `output_buf` -> socket.
+  sunset's output buffer holds one packet, so a transfer needs several rounds
+  per poll. TCP buffers are 8 KiB each: 4 KiB capped downloads at ~140 KiB/s
+  (only ~3 segments in flight against Linux delayed ACKs).
+- Patch 0002 raises sunset's receive window/max packet from 1000/1000 to
+  32 KiB/3072 (uploads 64 -> 78 KiB/s alone). The packet size must fit the
+  4 KiB input buffer with SSH overhead; the window only shifts backpressure
+  to TCP.
+- A client's channel EOF on the SFTP channel is the normal end: answer with
+  `close_channel(Some(0))`. Ending a session closes TCP with FIN (`close()`),
+  then `poll_listener` waits `CLOSE_GRACE` before aborting stuck teardown
+  states. Aborting immediately made OpenSSH print "Connection reset by peer".
+
+## SFTP server
+
+- `src/sftp.rs` is our own SFTP v3 implementation (sunset-sftp 0.2 needs an
+  executor and lacks REMOVE/MKDIR/RMDIR/RENAME/SETSTAT). It is sans-io like
+  sunset: `feed()` channel bytes, `step()`, drain `output()`. Started by the
+  `sftp` subsystem request in `ssh.rs`.
+- Memory is bounded although OpenSSH sends 32 KiB WRITEs and asks for 32 KiB
+  READs with many requests in flight: WRITE payloads stream to the card in
+  8 KiB chunks after the fixed header; DATA replies declare their length,
+  then stream from the card in 8 KiB chunks. Nothing new is parsed while a
+  reply is pending, and `input_space()` stops channel reads, so the SSH window
+  throttles the client. `input`/`out` are allocated once with fixed capacity:
+  letting them grow by doubling dropped the minimum free heap to ~40 KiB.
+- Only ONE card read or write per `Sftp::begin_poll()` (once per SSH poll).
+  Without that budget a single poll did up to 64 x 8 KiB card ops and froze
+  the UI for 1.2 s; with it, transfers got faster (network serviced between
+  card ops) and `loop_max_ms` stays at the ordinary ~0.6 s.
+- Chunk size matters most: 2 KiB chunks reopen dir + file per 2 KiB and gave
+  ~88/78 KiB/s down/up; 8 KiB gives ~180/130. `stats.card_*_us` (logged at
+  session end) showed the card at 55-60% of session time before the change.
+- Handles store paths + validated `ReadCursor`/`AppendCursor`, never FAT
+  handles (same rule as FTP). Writes must be at the current end of the file
+  (`offset == size`); OPEN with TRUNC deletes and recreates the entry
+  (a large file costs one ~0.5 s poll); resume walks the chain once via
+  `FileWriter::new_append`. A DATA reply that cannot deliver its declared
+  length is fatal for the session (the header is already sent).
+- SETSTAT/FSETSTAT accept permissions/times silently (clients' "preserve"
+  options) but refuse a size change. READLINK/SYMLINK/EXTENDED reply
+  OP_UNSUPPORTED; no extensions are advertised.
+- Times: FAT local time -> UTC via `clock::unix_from_local` and the
+  `[clock]` config. Paths are resolved from `/` with `fspath::resolve`
+  (no trimming: SFTP names may start or end with spaces, unlike FTP args).
+- The main loop burst-polls (15 ms) network + SSH while `transferring()`.
+  SFTP load exposed two latent FTP races (fixed in ftp.rs, see FTP section):
+  the passive listener armed one FTP poll too late, and a zero-gap reconnect
+  after QUIT was aborted without the RST ever being sent.
+- USB DISK refuses to take the card while `holds_sd()` (open handles or a
+  transfer). Volume `None` (card exported) makes every request fail cleanly.
+- Verified: OpenSSH sftp/scp and Paramiko (aes256-ctr + hmac-sha2-256),
+  SHA-256 of 3 KiB-10.7 MB files both ways, concurrent FTP + SFTP 3/3,
+  killed clients mid-upload/download, PING latency <= 108 ms during a 10.7 MB
+  download. USB-DISK refusal itself is untested on hardware (the console
+  deliberately rejects KEY enter there).
 
 ## On-device SD file manager
 

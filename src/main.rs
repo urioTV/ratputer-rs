@@ -43,6 +43,7 @@ mod ftp;
 mod msc;
 mod net;
 mod sdblock;
+mod sftp;
 mod ssh;
 mod storage;
 mod usbdisk;
@@ -1342,7 +1343,8 @@ fn main() -> ! {
                 1 if usb_sd.is_none()
                     && ftp_server
                         .as_ref()
-                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped) =>
+                        .is_none_or(|server| server.status() == ftp::FtpStatus::Stopped)
+                    && !ssh_server.as_ref().is_some_and(ssh::SshServer::holds_sd) =>
                 {
                     if let Some(volume) = storage.take() {
                         let card = Box::new(storage::free(volume));
@@ -1364,6 +1366,9 @@ fn main() -> ! {
                     .is_some_and(|server| server.status() != ftp::FtpStatus::Stopped) =>
                 {
                     ui.set_usb_disk_status("SD IN USE BY FTP".into());
+                }
+                1 if ssh_server.as_ref().is_some_and(ssh::SshServer::holds_sd) => {
+                    ui.set_usb_disk_status("SD IN USE BY SFTP".into());
                 }
                 2 if usb_sd.is_some() => {
                     if usb_disk.can_detach() || usb_force_exit_armed {
@@ -1620,14 +1625,33 @@ fn main() -> ! {
 
         // SSH: one bounded step per pass; never blocks except for the key
         // exchange computation inside one progress() call.
-        if let (Some(server), Some(_)) = (ssh_server.as_mut(), network.as_ref()) {
+        if let (Some(server), Some(network)) = (ssh_server.as_mut(), network.as_mut()) {
             let loop_max_ms = watchdog.slowest_iteration_ms();
-            server.poll(storage.as_ref(), &wifi_config.ftp, &|| ssh::ShellStatus {
+            let status = || ssh::ShellStatus {
                 heap_free: esp_alloc::HEAP.free(),
                 heap_free_min,
                 uptime_ms: Instant::now().duration_since_epoch().as_millis(),
                 loop_max_ms,
-            });
+            };
+            let context = ssh::PollContext {
+                volume: storage.as_ref(),
+                credentials: &wifi_config.ftp,
+                clock: &wifi_config.clock,
+                status: &status,
+            };
+            server.poll(&context);
+            // During an SFTP transfer, burst-poll TCP and SSH for up to 15 ms
+            // (same budget as FTP), then return to input and rendering.
+            if server.transferring() {
+                let burst_start = Instant::now();
+                while burst_start.elapsed() < Duration::from_millis(15) {
+                    network.poll_stack();
+                    server.poll(&context);
+                    if !server.transferring() {
+                        break;
+                    }
+                }
+            }
         }
         let ssh_busy = ssh_server.as_ref().is_some_and(ssh::SshServer::busy);
 
