@@ -42,6 +42,7 @@ mod ftp;
 mod msc;
 mod net;
 mod sdblock;
+mod ssh;
 mod storage;
 mod usbdisk;
 mod watchdog;
@@ -517,6 +518,10 @@ fn main() -> ! {
     let mut ftp_server: Option<ftp::FtpServer> = network
         .as_ref()
         .map(|network| ftp::FtpServer::new(network.stack()));
+    // The SSH listener follows the same rule: buffers reserved at boot.
+    let mut ssh_server: Option<ssh::SshServer> = network
+        .as_ref()
+        .map(|network| ssh::SshServer::new(network.stack(), storage.as_ref()));
     let mut file_manager: Option<filemanager::FileManager> = None;
 
     // --- Slint: minimal software window + platform ---
@@ -734,6 +739,14 @@ fn main() -> ! {
                         ftp_status.as_str(),
                         ftp_addr.as_str()
                     ));
+                    if let Some(server) = ssh_server.as_ref() {
+                        debug_console.data(format_args!(
+                            "ssh state={:?} host_key={} sessions={}",
+                            server.state().as_str(),
+                            server.fingerprint(),
+                            server.sessions_total
+                        ));
+                    }
                     let clock = ui.get_clock_text();
                     debug_console.data(format_args!(
                         "top clock={:?} synced={} battery={} ssid={:?}",
@@ -1604,6 +1617,19 @@ fn main() -> ! {
             last_switch = now;
         }
 
+        // SSH: one bounded step per pass; never blocks except for the key
+        // exchange computation inside one progress() call.
+        if let (Some(server), Some(_)) = (ssh_server.as_mut(), network.as_ref()) {
+            let loop_max_ms = watchdog.slowest_iteration_ms();
+            server.poll(storage.as_ref(), &wifi_config.ftp, &|| ssh::ShellStatus {
+                heap_free: esp_alloc::HEAP.free(),
+                heap_free_min,
+                uptime_ms: Instant::now().duration_since_epoch().as_millis(),
+                loop_max_ms,
+            });
+        }
+        let ssh_busy = ssh_server.as_ref().is_some_and(ssh::SshServer::busy);
+
         // During a transfer, burst-poll the network and FTP for up to 15 ms.
         // This keeps TCP windows moving without starving input/display forever.
         let ftp_busy = ftp_server.as_ref().is_some_and(ftp::FtpServer::busy);
@@ -1663,7 +1689,7 @@ fn main() -> ! {
             }
         }
 
-        delay.delay_millis(if ftp_busy { 1 } else { 10 });
+        delay.delay_millis(if ftp_busy || ssh_busy { 1 } else { 10 });
     }
 }
 

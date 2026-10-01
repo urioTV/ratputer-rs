@@ -20,6 +20,7 @@ file manager, everything in **Slint (no_std)**. 🐀
 | USB disk | Pure-Rust MSC Bulk-Only/SCSI class (`src/msc.rs`) on `embassy-usb` 0.6 + esp-hal USB-OTG |
 | USB console | Interactive control/status shell (`src/debug.rs`) over USB Serial/JTAG; use any serial terminal (PuTTY, picocom, screen) |
 | FTP server | Pure-Rust, passive-mode FTP (`src/ftp.rs`) over `embassy-net` TCP; writable SD access |
+| SSH server | `sunset` 0.6 (vendored, sans-io) driven from the main loop (`src/ssh.rs`); preview: command shell, SFTP planned |
 | File manager | On-device FAT browser (`src/filemanager.rs`), bounded directory pages and streamed file/directory copying |
 | Reset watchdog | RTC watchdog (`src/watchdog.rs`) resets the chip when the main loop stops completing passes |
 | Keyboard | `cardputer-adv-keyboard` — full ASCII, Shift/Fn, arrows and editing keys |
@@ -228,6 +229,35 @@ a trusted LAN; the shared card contains `RATPUTER/WIFI.CFG` with Wi-Fi passwords
 There is no anonymous login, TLS, internet exposure, or background server: closing
 the FTP screen immediately stops access. Files uploaded after SNTP synchronization
 receive the current configured local FAT timestamp.
+
+### SSH server over Wi-Fi (preview)
+
+Whenever the Cardputer is online, an SSH server listens on TCP port 22. It
+uses the same login as FTP (`[ftp]` in `WIFI.CFG`, default `rat` / `cheese`),
+password authentication only, one session at a time:
+
+```text
+$ ssh rat@192.168.1.23 status
+uptime_ms=57433 heap_free=95096 heap_free_min=91704 loop_max_ms=595
+$ ssh rat@192.168.1.23        # interactive: help, status, ping, exit
+```
+
+Unlike FTP, the password and all traffic are encrypted:
+`mlkem768x25519-sha256` key exchange (post-quantum hybrid, OpenSSH 10's
+default), `ssh-ed25519` host key, `chacha20-poly1305`. The host key is
+generated on the first connection from the hardware RNG (true random while
+Wi-Fi is on) and stored as a raw 32-byte Ed25519 seed in
+`RATPUTER/SSHHOST.KEY`; `STATUS` prints its `SHA256:` fingerprint, so you can
+compare it with what `ssh` shows on first contact. Anyone who can read the SD
+card can read that key. Delete the file to rotate the key.
+
+Measured on hardware: login plus one command ~0.55 s from a LAN host, no main
+loop pass longer than the usual ~0.6 s, ~6 KiB extra heap during a session
+(8 KiB of TCP buffers are reserved at boot, 8 KiB of packet buffers are static).
+A second connection is refused while a session is open; a killed client, a
+garbage handshake, 60 s without authentication or 10 minutes idle all return
+the server to listening. This is a first stage: SFTP (file access over the same
+login) is the next step, after which FTP may be retired.
 
 ### Top bar: clock, Wi-Fi, battery
 

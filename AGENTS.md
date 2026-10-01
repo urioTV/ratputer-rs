@@ -34,6 +34,7 @@ src/msc.rs         pure-Rust MSC Bulk-Only Transport + SCSI class over an SD Blo
 src/debug.rs       USB Serial/JTAG command parser + non-blocking response queue
 src/watchdog.rs    RTC watchdog: one feed per main-loop pass, reset instead of a battery pull
 src/ftp.rs         passive FTP server: control/data sessions + FAT file operations
+src/ssh.rs         SSH server (vendored sunset, sans-io) polled from the main loop; preview shell
 src/filemanager.rs on-device SD browser: paged listing, file operations, streamed copy jobs
 src/net.rs         embassy-net stack (DHCP/DNS/UDP/TCP) + one-shot SNTP, no executor
 src/clock.rs       WallClock (last SNTP sync + monotonic elapsed), UTC offset + EU DST
@@ -381,7 +382,8 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   up to 15 ms, then returns to input/rendering. Do not consume `Network::poll()`
   inside the burst or an SNTP completion result will be lost.
 - `Network` uses `StackResources<10>` for DHCP/DNS/SNTP plus five persistent
-  FTP sockets (four control listeners, one data). `FtpServer` is created eagerly
+  FTP sockets (four control listeners, one data) and the SSH listener: 9 of
+  10 slots. Adding a socket anywhere requires raising this number. `FtpServer` is created eagerly
   right after `Network::new`, BEFORE any UI screen consumes heap: first renders
   permanently allocate ~20 KiB. Lazy creation with a 32 KiB free threshold
   made FTP unreachable after browsing. The control listeners have 512 B RX/TX
@@ -397,6 +399,47 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
 - FAT timestamps use `storage::FatClock`, backed by the SNTP-derived local time;
   before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
   the 226 reply. Do not add write-back caching.
+
+## SSH server (sunset, preview)
+
+- `src/ssh.rs` drives `sunset` 0.6 as a pure state machine: `Runner::input()`
+  takes bytes straight from the TCP receive ring (`TcpSocket::read_with`),
+  `progress()` yields host-key/auth/channel events, `output_buf()` +
+  `consume_output()` feed the socket. Every socket future is polled once with
+  `Waker::noop()` (same pattern as FTP); `sunset-async`/`sunset-embassy` are
+  NOT used because they need an executor.
+- `sunset` is vendored in `vendor/sunset` (0BSD) with reproducible patches in
+  `vendor-patches/sunset/`; update only via `./tools/update-sunset.sh
+  <version>`. Patch 0001 adds `Runner::close_channel(chan, exit_status)`:
+  upstream servers cannot end a channel themselves, so `ssh host cmd` hung.
+- Events borrow the runner, so session state lives in a separate `Shell`
+  struct; handlers take `&mut Shell` while the event holds `&mut runner`.
+  Keep that split or the borrow checker rejects any handler touching state.
+- Packet buffers (2 x 4 KiB) are static `.bss`, borrowed `'static` by the
+  runner; `BUFFERS_IN_USE` enforces one runner at a time and `Session::drop`
+  releases it. TCP buffers (2 x 4 KiB) are leaked at boot like FTP's. Do not
+  use `Runner::new_server_owned()`: it boxes 2 x 35 KB (`SSH_MAX_PACKET`).
+- RNG: getrandom 0.4 is set to the custom backend in `.cargo/config.toml`
+  (`--cfg getrandom_backend="custom"`); `src/ssh.rs` defines
+  `__getrandom_v03_custom` (the symbol name in getrandom 0.4.3 source, despite
+  esp-hal docs showing `v04`) on `esp_hal::rng::Rng`, which is a TRNG only
+  while the radio runs. The host key is generated on the first connection,
+  never before Wi-Fi is up.
+- Host key = raw 32-byte Ed25519 seed in `/RATPUTER/SSHHOST.KEY` (written via
+  `storage::write_config_file`). If the card is owned by USB MSC at generation
+  time, the key stays in RAM and is saved on a later connection.
+- Login = FTP credentials, password only (`set_auth_methods(true, false)` on
+  `FirstAuth`); both username and password are compared in constant time and
+  combined with `&`, not `&&`.
+- The `mlkem` feature (mlkem768x25519-sha256) is ON: OpenSSH 10 warns about
+  non-PQ kex otherwise. It cost +23 KiB flash and no measurable login time;
+  key exchange runs inside one `progress()` call and never exceeded the
+  ordinary ~0.6 s loop maximum. All of SSH added ~210 KiB flash.
+- Verified on hardware: exec + exit status, interactive pty shell (echo,
+  Backspace, Ctrl+C/D), wrong password rejected, second connection refused,
+  killed client and garbage handshake recover to listening, host key survives
+  reflashing. sunset-sftp 0.2 lacks REMOVE/MKDIR/RMDIR/RENAME/SETSTAT and is
+  executor-based; the plan is to reuse its protocol parsing only.
 
 ## On-device SD file manager
 

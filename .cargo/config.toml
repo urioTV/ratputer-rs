@@ -12,6 +12,9 @@ rustflags = [
   "-C", "link-arg=-nostartfiles",    # Xtensa fork: no crt0 from GCC
   "-C", "link-arg=-Tlinkall.x",      # esp-hal section layout (ld/esp32s3 via -L OUT_DIR)
   # device.x (interrupt handler aliases from the PAC) goes from the esp32s3 PAC build.rs — don't add it manually!
+  # getrandom 0.4 (used by sunset SSH) has no bare-metal backend: link the
+  # `__getrandom_v03_custom` symbol defined in src/ssh.rs (hardware RNG).
+  "--cfg", 'getrandom_backend="custom"',
 ]
 
 [env]
