@@ -1,0 +1,29 @@
+From: RATPUTER <noreply@ratputer.invalid>
+Subject: [PATCH 0002] Raise the channel receive window and packet size
+
+Upstream 1000-byte window and max packet throttle bulk uploads: the client
+waits for a window adjust after every kilobyte. Use a 32 KiB window and
+3072-byte packets, which still fit the firmware's 4 KiB input buffer with
+SSH packet overhead.
+
+diff --git a/src/config.rs b/src/config.rs
+index 12ff8eb..e025092 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,6 +1,13 @@
+-// TODO
+-pub const DEFAULT_WINDOW: usize = 1000;
+-pub const DEFAULT_MAX_PACKET: usize = 1000;
++// RATPUTER PATCH: receive window and channel packet size for bulk uploads.
++//
++// Upstream's 1000/1000 makes a client stop after every kilobyte and wait for
++// a window adjust, which caps SFTP uploads at a few dozen KiB/s. A larger
++// window only moves backpressure to TCP (data waits in the socket buffer,
++// never dropped). The packet size must still fit, with SSH packet overhead
++// (length, padding, MAC, channel header), into the application's input
++// buffer: 3072 + ~80 bytes < the firmware's 4 KiB.
++pub const DEFAULT_WINDOW: usize = 32 * 1024;
++pub const DEFAULT_MAX_PACKET: usize = 3072;
+ 
+ /// Maximum SSH packet size, from RFC4253.
+ ///

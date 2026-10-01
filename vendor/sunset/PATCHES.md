@@ -16,3 +16,11 @@ sources differ only by the changes below, each marked `RATPUTER PATCH`.
    and CLOSE, using the existing `Req` and packet code (`Req::ExitStatus` is
    the new request variant). The peer's CLOSE reply goes through the normal
    `handle_close` path; the application still calls `channel_done()`.
+
+2. Larger channel receive window and packet size (patch 0002,
+   `config.rs`). Upstream's `DEFAULT_WINDOW`/`DEFAULT_MAX_PACKET` of 1000
+   bytes make the client stop after every kilobyte and wait for a window
+   adjust, capping SFTP uploads at a few dozen KiB/s. Now 32 KiB / 3072
+   bytes; the packet size must fit the firmware's 4 KiB input buffer
+   including SSH packet overhead, and the window only shifts backpressure to
+   TCP. Both constants affect the receive direction only.
