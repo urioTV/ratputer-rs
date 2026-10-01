@@ -224,27 +224,7 @@ pub fn free(volume: SdVolume) -> SdCardDevice {
 }
 
 pub fn load(volume: &SdVolume) -> Result<WifiConfig, StorageError> {
-    let root = volume.root_dir();
-    let directory = root
-        .open_dir(CONFIG_DIR)
-        .map_err(|_| StorageError::Missing)?;
-    let mut reader = directory
-        .open_file(CONFIG_FILE)
-        .map_err(|_| StorageError::Missing)?;
-
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 256];
-    loop {
-        let count = reader.read(&mut chunk).map_err(|_| StorageError::Sd)?;
-        if count == 0 {
-            break;
-        }
-        if bytes.len() + count > MAX_CONFIG_BYTES {
-            return Err(StorageError::TooLarge);
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-
+    let bytes = read_config_file(volume, CONFIG_FILE, MAX_CONFIG_BYTES)?;
     let text = core::str::from_utf8(&bytes).map_err(|_| StorageError::InvalidToml)?;
     let config: WifiConfig = toml::from_str(text).map_err(|_| StorageError::InvalidToml)?;
     config.validate()
@@ -255,7 +235,40 @@ pub fn save(volume: &SdVolume, config: &WifiConfig) -> Result<(), StorageError> 
     if text.len() > MAX_CONFIG_BYTES {
         return Err(StorageError::TooLarge);
     }
+    write_config_file(volume, CONFIG_FILE, text.as_bytes())
+}
 
+/// Read a small file from `/RATPUTER`, refusing anything over `max` bytes.
+pub fn read_config_file(
+    volume: &SdVolume,
+    name: &str,
+    max: usize,
+) -> Result<Vec<u8>, StorageError> {
+    let root = volume.root_dir();
+    let directory = root
+        .open_dir(CONFIG_DIR)
+        .map_err(|_| StorageError::Missing)?;
+    let mut reader = directory
+        .open_file(name)
+        .map_err(|_| StorageError::Missing)?;
+
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 256];
+    loop {
+        let count = reader.read(&mut chunk).map_err(|_| StorageError::Sd)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len() + count > max {
+            return Err(StorageError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(bytes)
+}
+
+/// Create or overwrite a small file in `/RATPUTER` (created if missing).
+pub fn write_config_file(volume: &SdVolume, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
     let root = volume.root_dir();
     let directory = match root.open_dir(CONFIG_DIR) {
         Ok(directory) => directory,
@@ -263,18 +276,16 @@ pub fn save(volume: &SdVolume, config: &WifiConfig) -> Result<(), StorageError> 
             .create_dir(&root, CONFIG_DIR)
             .map_err(|_| StorageError::Sd)?,
     };
-    let entry = match directory.find(CONFIG_FILE) {
+    let entry = match directory.find(name) {
         Ok(Some(entry)) if !entry.is_directory() => entry,
         Ok(Some(_)) | Ok(None) => volume
-            .create_file(&directory, CONFIG_FILE)
+            .create_file(&directory, name)
             .map_err(|_| StorageError::Sd)?,
         Err(_) => return Err(StorageError::Sd),
     };
     let mut writer =
         hadris_fat::sync::write::FileWriter::new(volume, &entry).map_err(|_| StorageError::Sd)?;
-    writer
-        .write(text.as_bytes())
-        .map_err(|_| StorageError::Sd)?;
+    writer.write(bytes).map_err(|_| StorageError::Sd)?;
     writer.finish().map_err(|_| StorageError::Sd)
 }
 
