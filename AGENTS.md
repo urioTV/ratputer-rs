@@ -396,6 +396,22 @@ flake.nix, rust-toolchain.toml, .cargo/config.toml — toolchain wiring
   Do not reintroduce lazy creation or a free-heap threshold. UI refresh is 2 Hz.
 - LIST/NLST/MLSD with a directory argument list that directory's contents (RFC
   959); a file argument still filters the parent listing by that name.
+- The passive data listener is armed in the SAME FTP poll that moves 227/229
+  into the control socket's TX buffer, i.e. before any network poll can
+  transmit it (still after the reply is queued, never before). An extra
+  "one FTP poll" delay used to sit here; with SFTP card work between polls
+  the reply reached the client first and the data SYN was refused (RST).
+  `abort()` takes a teardown-state data socket back to Closed at once, so it
+  is re-armed in the same poll too.
+- `TcpSocket::abort()` only marks the socket Closed; the RST goes out at the
+  next network poll and ONLY if the socket still has its remote endpoint.
+  Re-listening the slot (`accept`) before that poll silently drops the RST and
+  leaves the client hanging. Hence: a connection arriving while the previous
+  session is closing (QUIT sent or peer gone) is left Established and promoted
+  once the session slot frees; a genuine second concurrent client gets
+  "421 Only one FTP client at a time" + FIN, and its slot's teardown is not
+  aborted for `REFUSE_GRACE_SECS` (2 s). Verified: 60/60 zero-gap reconnects
+  under SFTP load (51/60 before), 3/3 second clients got 421.
 - FAT timestamps use `storage::FatClock`, backed by the SNTP-derived local time;
   before sync they fall back to 2026-01-01. FTP uploads flush on `close_file` before
   the 226 reply. Do not add write-back caching.

@@ -45,6 +45,8 @@ const LIST_CHUNK_TARGET: usize = 1536;
 const MAX_COMMAND_LINE: usize = 512;
 /// Close idle control connections after 5 minutes.
 const IDLE_TIMEOUT_SECS: u64 = 300;
+/// Time a refused second client's connection may spend closing (421 + FIN).
+const REFUSE_GRACE_SECS: u64 = 2;
 /// Drop any session with no control or data progress for this long. Data
 /// progress refreshes the timer, so large healthy transfers are not capped.
 const LIVEN_TIMEOUT_SECS: u64 = 120;
@@ -180,9 +182,6 @@ struct Session<'a> {
     transfer: Option<Transfer>,
     /// PASV/EPSV given; waiting for the client to pick a data transfer.
     passive_requested: bool,
-    /// Keep one full network-runner poll between queuing 227/229 and arming
-    /// the second listening socket.
-    passive_arm_delay: bool,
     quit: bool,
     last_activity: Instant,
 }
@@ -202,7 +201,6 @@ impl<'a> Session<'a> {
             pending: None,
             transfer: None,
             passive_requested: false,
-            passive_arm_delay: false,
             quit: false,
             last_activity: Instant::now(),
         }
@@ -231,6 +229,9 @@ pub struct FtpServer {
     /// Listening slots; a slot is `None` only while its socket is the session.
     controls: [Option<TcpSocket<'static>>; CONTROL_SLOTS],
     session: Option<Session<'static>>,
+    /// When a slot started refusing a second client with 421 + FIN; its
+    /// teardown is left alone for `REFUSE_GRACE` so the reply arrives.
+    refusing_since: [Option<Instant>; CONTROL_SLOTS],
     /// The fixed passive listener is armed for this session.
     data_listening: bool,
     ip: Option<Ipv4Address>,
@@ -267,6 +268,7 @@ impl FtpServer {
             controls,
             data,
             session: None,
+            refusing_since: [None; CONTROL_SLOTS],
             data_listening: false,
             ip: None,
             stats: FtpStats::default(),
@@ -377,6 +379,7 @@ impl FtpServer {
             };
             match standby.state() {
                 State::Closed => {
+                    self.refusing_since[index] = None;
                     // listen() is idempotent on an already-listening socket.
                     let _ = poll_once(standby.accept(CONTROL_PORT));
                 }
@@ -394,10 +397,24 @@ impl FtpServer {
                         session.reply("220 RATPUTER SD");
                         self.session = Some(session);
                         promoted = true;
+                    } else if self
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.quit || !session.control.may_recv())
+                    {
+                        // A client reconnecting right after QUIT, while the
+                        // previous session is still closing: keep this
+                        // connection waiting; it is promoted once the slot
+                        // frees. Aborting it here was silent: re-listening
+                        // the slot before the next network poll dropped the
+                        // RST, and the client waited for a banner forever.
                     } else {
-                        // A second control connection during an active session:
-                        // single-client policy, do not hold the socket.
-                        standby.abort();
+                        // A second concurrent client (single-client policy):
+                        // refuse explicitly and close with FIN, not a bare
+                        // abort the peer may never hear about.
+                        let _ = poll_once(standby.write(b"421 Only one FTP client at a time\r\n"));
+                        standby.close();
+                        self.refusing_since[index] = Some(Instant::now());
                     }
                 }
                 // SYN|ACK in flight; leave the handshake alone.
@@ -408,7 +425,15 @@ impl FtpServer {
                 | State::FinWait1
                 | State::FinWait2
                 | State::CloseWait => {
-                    standby.abort();
+                    if self.refusing_since[index].is_some_and(|since| {
+                        Instant::now() - since
+                            < esp_hal::time::Duration::from_secs(REFUSE_GRACE_SECS)
+                    }) {
+                        // Let the 421 and FIN reach the refused client.
+                    } else {
+                        self.refusing_since[index] = None;
+                        standby.abort();
+                    }
                 }
                 _ => {}
             }
@@ -567,27 +592,31 @@ impl FtpServer {
 
     fn poll_data(&mut self, volume: &SdVolume, session: &mut Session) {
         // Queue 227/229 into the established control socket *before* putting
-        // the second socket into Listen, then keep one full network poll
-        // between those two events.
+        // the second socket into Listen: arming the data listener first can
+        // keep the control reply from progressing. Arm it in the same poll
+        // that moved the reply into control's TCP TX buffer, i.e. before the
+        // next network poll transmits it. An extra FTP poll of delay here let
+        // the reply reach the client first whenever other work (an SFTP card
+        // chunk) ran between polls, and the client's data SYN was refused.
         if session.passive_requested && !self.data_listening {
             if !session.out.is_empty() {
                 return;
             }
-            if session.passive_arm_delay {
-                session.passive_arm_delay = false;
-                return;
-            }
-            match self.data.state() {
-                State::Closed => {
-                    let _ = poll_once(self.data.accept(DATA_PORT));
-                    self.data_listening = true;
-                }
+            // smoltcp cannot listen from teardown states; abort() returns the
+            // socket to Closed at once, so it can be armed in this same poll.
+            if matches!(
+                self.data.state(),
                 State::TimeWait
-                | State::LastAck
-                | State::FinWait1
-                | State::FinWait2
-                | State::CloseWait => self.data.abort(),
-                _ => {}
+                    | State::LastAck
+                    | State::FinWait1
+                    | State::FinWait2
+                    | State::CloseWait
+            ) {
+                self.data.abort();
+            }
+            if self.data.state() == State::Closed {
+                let _ = poll_once(self.data.accept(DATA_PORT));
+                self.data_listening = true;
             }
         }
 
@@ -1058,7 +1087,6 @@ impl FtpServer {
                     session.pending = None;
                     self.abort_data();
                     session.passive_requested = true;
-                    session.passive_arm_delay = true;
                     let [a, b, c, d] = ip.octets();
                     session.reply(&format!(
                         "227 Entering Passive Mode ({a},{b},{c},{d},{},{})",
@@ -1073,7 +1101,6 @@ impl FtpServer {
                     session.pending = None;
                     self.abort_data();
                     session.passive_requested = true;
-                    session.passive_arm_delay = true;
                     session.reply(&format!("229 (|||{DATA_PORT}|)"));
                 }
                 None => session.reply("425 No IP yet"),
