@@ -1,0 +1,95 @@
+From: RATPUTER <noreply@ratputer.invalid>
+Subject: [PATCH 0001] Let a server end a session channel (exit-status, EOF, CLOSE)
+
+Upstream sunset 0.6.0 only answers a peer's EOF/CLOSE: a server cannot
+finish an `exec` command or a shell `exit` by itself, so OpenSSH waits
+forever. Add `Runner::close_channel(chan, exit_status)`, which sends the
+optional `exit-status` request, EOF and CLOSE through the existing request
+and packet machinery. The peer's CLOSE reply is handled as before.
+
+diff --git a/src/channel.rs b/src/channel.rs
+index a136e97..2110ed3 100644
+--- a/src/channel.rs
++++ b/src/channel.rs
+@@ -294,6 +294,34 @@ impl Channels {
+         }
+     }
+ 
++    /// RATPUTER PATCH: end a channel from this side.
++    ///
++    /// Upstream only answers a peer's EOF/CLOSE, so a server could not end
++    /// an `exec` command or a shell `exit`. Sends `exit-status` (session
++    /// channels, when given), then EOF and CLOSE. The peer's CLOSE reply is
++    /// handled as usual; the application still calls `channel_done()`.
++    pub(crate) fn finish(
++        &mut self,
++        num: ChanNum,
++        exit_status: Option<u32>,
++        s: &mut TrafSend,
++    ) -> Result<()> {
++        let ch = self.get_mut(num)?;
++        if ch.sent_close {
++            return Ok(());
++        }
++        if let (Some(status), ChanType::Session) = (exit_status, &ch.ty) {
++            Req::ExitStatus(status).send(ch, s)?;
++        }
++        if !ch.sent_eof {
++            s.send(packets::ChannelEof { num: ch.send_num()? })?;
++            ch.sent_eof = true;
++        }
++        s.send(packets::ChannelClose { num: ch.send_num()? })?;
++        ch.sent_close = true;
++        Ok(())
++    }
++
+     fn dispatch_open(
+         &mut self,
+         p: &ChannelOpen<'_>,
+@@ -648,8 +676,9 @@ pub enum Req<'a> {
+     Pty(Pty),
+     WinChange(packets::WinChange),
+     Break(packets::Break),
++    // RATPUTER PATCH: servers report a command's exit status.
++    ExitStatus(u32),
+     // Signal,
+-    // ExitStatus,
+     // ExitSignal,
+ }
+ 
+@@ -678,6 +707,9 @@ impl Req<'_> {
+             }),
+             Req::WinChange(rt) => ChannelReqType::WinChange(rt),
+             Req::Break(rt) => ChannelReqType::Break(rt),
++            Req::ExitStatus(status) => {
++                ChannelReqType::ExitStatus(packets::ExitStatus { status })
++            }
+         };
+ 
+         let p = ChannelRequest {
+diff --git a/src/runner.rs b/src/runner.rs
+index 8f5568e..4fa154b 100644
+--- a/src/runner.rs
++++ b/src/runner.rs
+@@ -681,6 +681,21 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
+         self.conn.channels.valid_send(chan.0, dt)
+     }
+ 
++    /// RATPUTER PATCH: close a channel from this side.
++    ///
++    /// Sends `exit-status` (if `Some`, session channels only), EOF and
++    /// CLOSE. Call `channel_done()` afterwards as usual.
++    pub fn close_channel(
++        &mut self,
++        chan: &ChanHandle,
++        exit_status: Option<u32>,
++    ) -> Result<()> {
++        let mut s = self.traf_out.sender(&mut self.keys);
++        self.conn.channels.finish(chan.0, exit_status, &mut s)?;
++        self.wake();
++        Ok(())
++    }
++
+     /// Must be called when an application has finished with a channel.
+     ///
+     /// Channel numbers will not be re-used without calling this, so

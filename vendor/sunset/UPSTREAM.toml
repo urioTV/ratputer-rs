@@ -1,0 +1,8 @@
+# Source provenance for the vendored sunset crate.
+# Update this file only through tools/update-sunset.sh.
+repository = "https://github.com/mkj/sunset"
+crate = "sunset"
+version = "0.6.0"
+tag = "sunset-0.6.0"
+commit = "cb7fbe2c7ba0258a2e9c853668495cc6fc93d502"
+crate_sha256 = "3b52312b804ac95f10d3963f6ef5889117ad678bd6ce977be4aa4cf491bad78f"
